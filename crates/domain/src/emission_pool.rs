@@ -65,11 +65,7 @@ impl EmitRewardCmd {
     pub const COMMAND: &'static str = EMIT_REWARD;
 
     /// Build a command emitting `amount` $MADE from `pool_id` to `recipient_id`.
-    pub fn new(
-        pool_id: impl Into<String>,
-        recipient_id: impl Into<String>,
-        amount: u64,
-    ) -> Self {
+    pub fn new(pool_id: impl Into<String>, recipient_id: impl Into<String>, amount: u64) -> Self {
         Self {
             pool_id: pool_id.into(),
             recipient_id: recipient_id.into(),
