@@ -16,7 +16,11 @@
 //!    the player's collection at validation time; an Outfit referencing a card
 //!    the player no longer owns is illegal.
 //!
-//! Two commands are implemented. [`RemoveCardFromOutfit`]
+//! Three commands are implemented. [`AddCardToOutfit`] (`AddCardToOutfitCmd`)
+//! adds a card to the Outfit, enforcing every invariant (copy caps and class
+//! legality among them) so the addition keeps the deck legal, and on success
+//! emits [`Event::CardAddedToOutfit`] (`card.added.to.outfit`).
+//! [`RemoveCardFromOutfit`]
 //! (`RemoveCardFromOutfitCmd`) removes a card from the Outfit, enforcing every
 //! invariant, and on success emits [`Event::CardRemovedFromOutfit`]
 //! (`card.removed.from.outfit`). [`ValidateOutfit`] (`ValidateOutfitCmd`) runs
@@ -38,6 +42,9 @@ const AGGREGATE_TYPE: &str = "Outfit";
 
 /// The `RemoveCardFromOutfitCmd` command name [`Outfit::execute`] recognizes.
 const REMOVE_CARD_FROM_OUTFIT: &str = "RemoveCardFromOutfitCmd";
+
+/// The `AddCardToOutfitCmd` command name [`Outfit::execute`] recognizes.
+const ADD_CARD_TO_OUTFIT: &str = "AddCardToOutfitCmd";
 
 /// The `ValidateOutfitCmd` command name [`Outfit::execute`] recognizes.
 const VALIDATE_OUTFIT: &str = "ValidateOutfitCmd";
@@ -79,6 +86,43 @@ impl RemoveCardFromOutfit {
         // Serialization of a plain data struct to a Vec cannot fail here.
         let payload =
             serde_json::to_vec(self).expect("RemoveCardFromOutfit is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The `AddCardToOutfitCmd` payload: which card is added to which Outfit. Field
+/// names use the deckbuilding service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`AddCardToOutfit::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`Outfit::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddCardToOutfit {
+    /// The Outfit the card is added to; must name this Outfit, and must be
+    /// non-empty.
+    pub outfit_id: String,
+    /// The card being added; must be non-empty.
+    pub card_id: String,
+}
+
+impl AddCardToOutfit {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = ADD_CARD_TO_OUTFIT;
+
+    /// Build a command adding `card_id` to `outfit_id`.
+    pub fn new(outfit_id: impl Into<String>, card_id: impl Into<String>) -> Self {
+        Self {
+            outfit_id: outfit_id.into(),
+            card_id: card_id.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`Outfit::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("AddCardToOutfit is always serializable");
         Command::with_payload(Self::COMMAND, payload)
     }
 }
@@ -126,6 +170,16 @@ pub struct CardRemovedFromOutfit {
     pub card_id: String,
 }
 
+/// The card that was added, carried by [`Event::CardAddedToOutfit`] and thus by
+/// the emitted `card.added.to.outfit` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardAddedToOutfit {
+    /// The Outfit the card was added to.
+    pub outfit_id: String,
+    /// The card that was added.
+    pub card_id: String,
+}
+
 /// The Outfit that passed full legality validation, carried by
 /// [`Event::OutfitValidated`] and thus by the emitted `outfit.validated` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +191,8 @@ pub struct OutfitValidated {
 /// Domain events emitted by [`Outfit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// A card was added to the Outfit.
+    CardAddedToOutfit(CardAddedToOutfit),
     /// A card was removed from the Outfit.
     CardRemovedFromOutfit(CardRemovedFromOutfit),
     /// The Outfit passed full 30-card legality validation.
@@ -146,6 +202,7 @@ pub enum Event {
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
+            Event::CardAddedToOutfit(_) => "card.added.to.outfit",
             Event::CardRemovedFromOutfit(_) => "card.removed.from.outfit",
             Event::OutfitValidated(_) => "outfit.validated",
         }
@@ -310,6 +367,46 @@ impl Outfit {
         Ok(())
     }
 
+    /// Handle `AddCardToOutfitCmd`: verify the command carries a valid outfit id
+    /// (naming this Outfit) and card id, enforce every invariant (exactly 30
+    /// cards, own-class-or-Neutral, copy caps, and owned-at-validation time) so
+    /// the addition keeps the deck legal, and emit [`Event::CardAddedToOutfit`].
+    fn add_card(&mut self, cmd: AddCardToOutfit) -> Result<Vec<Event>, DomainError> {
+        // A valid outfitId and cardId must be supplied.
+        if cmd.outfit_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "outfit '{}' requires a valid outfitId to add a card",
+                self.id
+            )));
+        }
+        if cmd.card_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "outfit '{}' requires a valid cardId to add a card",
+                self.id
+            )));
+        }
+        // The command must name the Outfit it is dispatched to.
+        if cmd.outfit_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets outfit '{}' but this aggregate is outfit '{}'",
+                cmd.outfit_id, self.id
+            )));
+        }
+
+        // Enforce every invariant before recording the addition.
+        self.ensure_exactly_thirty()?;
+        self.ensure_only_own_class_or_neutral()?;
+        self.ensure_within_copy_limits()?;
+        self.ensure_all_cards_owned()?;
+
+        let event = Event::CardAddedToOutfit(CardAddedToOutfit {
+            outfit_id: cmd.outfit_id,
+            card_id: cmd.card_id,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
     /// Handle `RemoveCardFromOutfitCmd`: verify the command carries a valid
     /// outfit id (naming this Outfit) and card id, enforce every invariant
     /// (exactly 30 cards, own-class-or-Neutral, copy caps, and owned-at-validation
@@ -395,6 +492,15 @@ impl Aggregate for Outfit {
 
     fn execute(&mut self, command: Command) -> Result<Vec<Self::Event>, DomainError> {
         match command.name.as_str() {
+            ADD_CARD_TO_OUTFIT => {
+                let cmd: AddCardToOutfit =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed AddCardToOutfitCmd payload: {e}"
+                        ))
+                    })?;
+                self.add_card(cmd)
+            }
             REMOVE_CARD_FROM_OUTFIT => {
                 let cmd: RemoveCardFromOutfit =
                     serde_json::from_slice(&command.payload).map_err(|e| {
@@ -710,5 +816,136 @@ mod tests {
         assert_eq!(command.name, RemoveCardFromOutfit::COMMAND);
         let decoded: RemoveCardFromOutfit = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    /// A command adding card `c-01` to outfit `o-01`.
+    fn valid_add_cmd() -> AddCardToOutfit {
+        AddCardToOutfit::new("o-01", "c-01")
+    }
+
+    // Scenario: Successfully execute AddCardToOutfitCmd.
+    #[test]
+    fn adds_and_emits_card_added_event() {
+        let mut outfit = ready_outfit();
+
+        let events = outfit
+            .execute(valid_add_cmd().into_command())
+            .expect("valid addition should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "card.added.to.outfit");
+        match &events[0] {
+            Event::CardAddedToOutfit(added) => {
+                assert_eq!(added.outfit_id, "o-01");
+                assert_eq!(added.card_id, "c-01");
+            }
+            other => panic!("expected CardAddedToOutfit, got {other:?}"),
+        }
+        // The Outfit recorded the event.
+        assert_eq!(outfit.version(), 1);
+        assert_eq!(outfit.uncommitted_events().len(), 1);
+        assert_eq!(
+            outfit.uncommitted_events()[0].event_type(),
+            "card.added.to.outfit"
+        );
+    }
+
+    // Scenario: AddCardToOutfitCmd rejected — an Outfit contains exactly 30 cards
+    // to be legal for saving/play.
+    #[test]
+    fn add_rejects_when_not_exactly_thirty_cards() {
+        let mut outfit = ready_outfit();
+        // A deck of any size other than 30 is illegal for saving/play.
+        outfit.set_card_count(31);
+
+        let err = outfit
+            .execute(valid_add_cmd().into_command())
+            .expect_err("an Outfit that is not exactly 30 cards must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // Scenario: AddCardToOutfitCmd rejected — an Outfit may include only cards of
+    // its own class plus Neutral cards.
+    #[test]
+    fn add_rejects_when_card_outside_own_class() {
+        let mut outfit = ready_outfit();
+        // The deck includes a card of a foreign class.
+        outfit.set_only_own_class_or_neutral(false);
+
+        let err = outfit
+            .execute(valid_add_cmd().into_command())
+            .expect_err("an Outfit with a foreign-class card must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // Scenario: AddCardToOutfitCmd rejected — at most 2 copies of any card (1 copy
+    // for Legendary) may be included.
+    #[test]
+    fn add_rejects_when_copy_cap_exceeded() {
+        let mut outfit = ready_outfit();
+        // The deck exceeds a card's copy cap.
+        outfit.set_within_copy_limits(false);
+
+        let err = outfit
+            .execute(valid_add_cmd().into_command())
+            .expect_err("an Outfit exceeding a copy cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // Scenario: AddCardToOutfitCmd rejected — every card in the Outfit must be
+    // owned in the player's collection at validation time.
+    #[test]
+    fn add_rejects_when_card_not_owned() {
+        let mut outfit = ready_outfit();
+        // The deck references a card the player does not own.
+        outfit.set_all_cards_owned(false);
+
+        let err = outfit
+            .execute(valid_add_cmd().into_command())
+            .expect_err("an Outfit referencing an unowned card must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // An add command naming a different Outfit is rejected before any invariant
+    // runs.
+    #[test]
+    fn add_rejects_command_for_a_different_outfit() {
+        let mut outfit = ready_outfit();
+        let cmd = AddCardToOutfit::new("o-99", "c-01");
+
+        let err = outfit
+            .execute(cmd.into_command())
+            .expect_err("a command for another outfit must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // Add commands missing any required field are rejected.
+    #[test]
+    fn add_rejects_command_with_missing_fields() {
+        for cmd in [
+            AddCardToOutfit::new("   ", "c-01"),
+            AddCardToOutfit::new("o-01", "   "),
+        ] {
+            let mut outfit = ready_outfit();
+            let err = outfit
+                .execute(cmd.into_command())
+                .expect_err("a command with a missing field must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(outfit.version(), 0);
+        }
+    }
+
+    #[test]
+    fn add_command_payload_round_trips() {
+        let cmd = valid_add_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, AddCardToOutfit::COMMAND);
+        let decoded: AddCardToOutfit = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_add_cmd());
     }
 }
