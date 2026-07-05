@@ -20,10 +20,14 @@
 //!    [`MAX_LEADERBOARD_ENTRIES`] (1000) and requires no login; a leaderboard
 //!    larger than the cap is inconsistent.
 //!
-//! The only command implemented so far is [`SnapshotSeason`]
-//! (`SnapshotSeasonCmd`): it freezes the final standings at season end,
-//! enforcing every invariant, and on success emits [`Event::SeasonSnapshotted`]
-//! (`season.snapshotted`). This module is hand-written (it no longer uses
+//! Two commands are implemented. [`SnapshotSeason`] (`SnapshotSeasonCmd`)
+//! freezes the final standings at season end, enforcing every invariant, and on
+//! success emits [`Event::SeasonSnapshotted`] (`season.snapshotted`).
+//! [`DistributeSeasonRewards`] (`DistributeSeasonRewardsCmd`) then grants the
+//! one-time rewards drawn from that immutable snapshot — it requires the
+//! snapshot to have been taken and rewards not yet distributed, enforces the
+//! same invariants, and on success emits [`Event::SeasonRewardsDistributed`]
+//! (`season.rewards.distributed`). This module is hand-written (it no longer uses
 //! `shared::stub_aggregate!`) but preserves the same public surface — a
 //! [`Season`] aggregate and a [`SeasonRepository`] port — so the persistence
 //! adapters in `crates/mocks` keep compiling unchanged.
@@ -36,8 +40,12 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "Season";
 
-/// The command name [`Season::execute`] recognizes.
+/// The command name [`Season::execute`] recognizes to freeze final standings.
 const SNAPSHOT_SEASON: &str = "SnapshotSeasonCmd";
+
+/// The command name [`Season::execute`] recognizes to grant one-time rewards
+/// from the end-of-season snapshot.
+const DISTRIBUTE_SEASON_REWARDS: &str = "DistributeSeasonRewardsCmd";
 
 /// A season runs on a fixed cadence of this many weeks. A season whose length
 /// does not match is off-cadence and inconsistent.
@@ -92,6 +100,46 @@ impl SnapshotSeason {
     }
 }
 
+/// The `DistributeSeasonRewardsCmd` payload: grant one-time rewards from the
+/// end-of-season snapshot. Field names are the ranked service's `camelCase`
+/// schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`DistributeSeasonRewards::into_command`], or decode it from a command
+/// payload via [`serde_json`] inside [`Season::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DistributeSeasonRewards {
+    /// Identity of the season whose rewards are being distributed; must name the
+    /// season this aggregate records, and must be non-empty.
+    pub season_id: String,
+    /// Identity of the frozen end-of-season snapshot that is the basis for
+    /// rewards; must be non-empty.
+    pub snapshot_id: String,
+}
+
+impl DistributeSeasonRewards {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = DISTRIBUTE_SEASON_REWARDS;
+
+    /// Build a command distributing `season_id`'s rewards from `snapshot_id`.
+    pub fn new(season_id: impl Into<String>, snapshot_id: impl Into<String>) -> Self {
+        Self {
+            season_id: season_id.into(),
+            snapshot_id: snapshot_id.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`Season::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload =
+            serde_json::to_vec(self).expect("DistributeSeasonRewards is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The frozen final standings, carried by [`Event::SeasonSnapshotted`] and thus
 /// by the emitted `season.snapshotted` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,18 +150,32 @@ pub struct SeasonSnapshotted {
     pub leaderboard_size: u32,
 }
 
+/// The one-time reward grant drawn from the snapshot, carried by
+/// [`Event::SeasonRewardsDistributed`] and thus by the emitted
+/// `season.rewards.distributed` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeasonRewardsDistributed {
+    /// The season whose rewards were distributed.
+    pub season_id: String,
+    /// The frozen snapshot that was the basis for the distribution.
+    pub snapshot_id: String,
+}
+
 /// Domain events emitted by [`Season`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// The final standings were frozen at season end: the snapshot is now
     /// immutable and is the basis for reward distribution.
     SeasonSnapshotted(SeasonSnapshotted),
+    /// The one-time season rewards were distributed from the immutable snapshot.
+    SeasonRewardsDistributed(SeasonRewardsDistributed),
 }
 
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::SeasonSnapshotted(_) => "season.snapshotted",
+            Event::SeasonRewardsDistributed(_) => "season.rewards.distributed",
         }
     }
 }
@@ -259,6 +321,21 @@ impl Season {
         Ok(())
     }
 
+    /// Snapshot-as-basis invariant (the distribution side of snapshot
+    /// immutability): the end-of-season snapshot is the basis for rewards, so
+    /// rewards cannot be distributed until the snapshot has been taken. A season
+    /// still [`SeasonStatus::Open`] has no immutable snapshot to reward from.
+    fn ensure_snapshot_taken(&self) -> Result<(), DomainError> {
+        if self.status != SeasonStatus::Snapshotted {
+            return Err(DomainError::InvariantViolation(format!(
+                "season '{}' has no end-of-season snapshot yet; the immutable snapshot is the \
+                 basis for rewards and must be taken before they are distributed",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
     /// Reward-once invariant: rewards are distributed exactly once per eligible
     /// player per season, and the snapshot is their basis — so it must be taken
     /// before any distribution. Snapshotting after rewards have gone out would
@@ -335,6 +412,55 @@ impl Season {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `DistributeSeasonRewardsCmd`: verify the command targets this season
+    /// with a valid identity and carries a valid snapshotId, enforce every
+    /// invariant (cadence & singularity, snapshot-as-basis, reward-once, soft
+    /// reset at open, and leaderboard cap), grant the one-time rewards from the
+    /// immutable snapshot, and emit [`Event::SeasonRewardsDistributed`].
+    fn distribute_season_rewards(
+        &mut self,
+        cmd: DistributeSeasonRewards,
+    ) -> Result<Vec<Event>, DomainError> {
+        // A valid seasonId must be supplied.
+        if cmd.season_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "season '{}' requires a valid seasonId to distribute rewards",
+                self.id
+            )));
+        }
+        // A valid snapshotId (the basis for rewards) must be supplied.
+        if cmd.snapshot_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "season '{}' requires a valid snapshotId to distribute rewards",
+                self.id
+            )));
+        }
+        // The command must name the season this aggregate actually records.
+        if cmd.season_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets season '{}' but this aggregate records '{}'",
+                cmd.season_id, self.id
+            )));
+        }
+
+        // Enforce every invariant before granting rewards.
+        self.ensure_cadence_and_single_open()?;
+        self.ensure_snapshot_taken()?;
+        self.ensure_rewards_not_distributed()?;
+        self.ensure_soft_reset_applied()?;
+        self.ensure_leaderboard_within_cap()?;
+
+        let event = Event::SeasonRewardsDistributed(SeasonRewardsDistributed {
+            season_id: cmd.season_id,
+            snapshot_id: cmd.snapshot_id,
+        });
+        // Grant the one-time rewards: mark them distributed so a second attempt
+        // is rejected by the reward-once invariant.
+        self.rewards_distributed = true;
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for Season {
@@ -354,6 +480,15 @@ impl Aggregate for Season {
                         ))
                     })?;
                 self.snapshot_season(cmd)
+            }
+            DISTRIBUTE_SEASON_REWARDS => {
+                let cmd: DistributeSeasonRewards = serde_json::from_slice(&command.payload)
+                    .map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed DistributeSeasonRewardsCmd payload: {e}"
+                        ))
+                    })?;
+                self.distribute_season_rewards(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -407,6 +542,7 @@ mod tests {
                 assert_eq!(snapshot.season_id, "s-01");
                 assert_eq!(snapshot.leaderboard_size, MAX_LEADERBOARD_ENTRIES);
             }
+            other => panic!("expected SeasonSnapshotted, got {other:?}"),
         }
         // The season recorded the event and is now frozen.
         assert_eq!(season.status(), SeasonStatus::Snapshotted);
@@ -552,5 +688,189 @@ mod tests {
         assert_eq!(command.name, SnapshotSeason::COMMAND);
         let decoded: SnapshotSeason = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // --- DistributeSeasonRewardsCmd ---
+
+    /// A rewards-ready season `s-01`: its end-of-season snapshot is taken, it is
+    /// on the 12-week cadence, the sole open season, rewards not yet distributed,
+    /// soft reset applied at open, and a full-but-capped leaderboard. Tests mutate
+    /// one aspect at a time to drive a specific rejection.
+    fn rewards_ready_season() -> Season {
+        let mut season = Season::new("s-01");
+        // The snapshot is the basis for rewards, so it must already be taken.
+        season.set_status(SeasonStatus::Snapshotted);
+        season.set_cadence(SEASON_CADENCE_WEEKS, 1);
+        season.set_rewards_distributed(false);
+        season.set_soft_reset_applied(true);
+        season.set_leaderboard_size(MAX_LEADERBOARD_ENTRIES);
+        season
+    }
+
+    /// A command distributing `s-01`'s rewards from snapshot `snap-01`.
+    fn valid_rewards_cmd() -> DistributeSeasonRewards {
+        DistributeSeasonRewards::new("s-01", "snap-01")
+    }
+
+    // Scenario: Successfully execute DistributeSeasonRewardsCmd.
+    #[test]
+    fn distributes_and_emits_rewards_distributed_event() {
+        let mut season = rewards_ready_season();
+
+        let events = season
+            .execute(valid_rewards_cmd().into_command())
+            .expect("valid distribution should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "season.rewards.distributed");
+        match &events[0] {
+            Event::SeasonRewardsDistributed(distributed) => {
+                assert_eq!(distributed.season_id, "s-01");
+                assert_eq!(distributed.snapshot_id, "snap-01");
+            }
+            other => panic!("expected SeasonRewardsDistributed, got {other:?}"),
+        }
+        // The season recorded the event and rewards are now marked distributed.
+        assert_eq!(season.version(), 1);
+        assert_eq!(season.uncommitted_events().len(), 1);
+        assert_eq!(
+            season.uncommitted_events()[0].event_type(),
+            "season.rewards.distributed"
+        );
+
+        // Reward-once: a second distribution is now rejected.
+        let err = season
+            .execute(valid_rewards_cmd().into_command())
+            .expect_err("a second distribution must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // Scenario: rejected — a season runs on a 12-week cadence (off-cadence length).
+    #[test]
+    fn rewards_rejected_when_off_cadence() {
+        let mut season = rewards_ready_season();
+        season.set_cadence(SEASON_CADENCE_WEEKS - 4, 1);
+
+        let err = season
+            .execute(valid_rewards_cmd().into_command())
+            .expect_err("an off-cadence season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — only one season is open at a time.
+    #[test]
+    fn rewards_rejected_when_multiple_seasons_open() {
+        let mut season = rewards_ready_season();
+        season.set_cadence(SEASON_CADENCE_WEEKS, 2);
+
+        let err = season
+            .execute(valid_rewards_cmd().into_command())
+            .expect_err("a non-sole open season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — the end-of-season snapshot is immutable once taken and
+    // is the basis for rewards (here the snapshot has not been taken yet).
+    #[test]
+    fn rewards_rejected_when_snapshot_not_taken() {
+        let mut season = rewards_ready_season();
+        // Still Open: there is no immutable snapshot to reward from.
+        season.set_status(SeasonStatus::Open);
+
+        let err = season
+            .execute(valid_rewards_cmd().into_command())
+            .expect_err("distributing before the snapshot is taken must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — season rewards are distributed exactly once per
+    // eligible player per season.
+    #[test]
+    fn rewards_rejected_when_already_distributed() {
+        let mut season = rewards_ready_season();
+        season.set_rewards_distributed(true);
+
+        let err = season
+            .execute(valid_rewards_cmd().into_command())
+            .expect_err("a duplicate distribution must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — a soft reset is applied to standings at season open.
+    #[test]
+    fn rewards_rejected_when_soft_reset_not_applied() {
+        let mut season = rewards_ready_season();
+        season.set_soft_reset_applied(false);
+
+        let err = season
+            .execute(valid_rewards_cmd().into_command())
+            .expect_err("a missing season-open soft reset must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — the public leaderboard exposes at most the top 1000.
+    #[test]
+    fn rewards_rejected_when_leaderboard_exceeds_cap() {
+        let mut season = rewards_ready_season();
+        season.set_leaderboard_size(MAX_LEADERBOARD_ENTRIES + 1);
+
+        let err = season
+            .execute(valid_rewards_cmd().into_command())
+            .expect_err("an over-cap leaderboard must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // A rewards command naming a different season is rejected.
+    #[test]
+    fn rewards_rejected_for_a_different_season() {
+        let mut season = rewards_ready_season();
+        let cmd = DistributeSeasonRewards::new("s-99", "snap-01");
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a command for another season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // A rewards command with no seasonId is rejected.
+    #[test]
+    fn rewards_rejected_without_a_season_id() {
+        let mut season = rewards_ready_season();
+        let cmd = DistributeSeasonRewards::new("   ", "snap-01");
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a missing seasonId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // A rewards command with no snapshotId is rejected.
+    #[test]
+    fn rewards_rejected_without_a_snapshot_id() {
+        let mut season = rewards_ready_season();
+        let cmd = DistributeSeasonRewards::new("s-01", "   ");
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a missing snapshotId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    #[test]
+    fn rewards_command_payload_round_trips() {
+        let cmd = valid_rewards_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, DistributeSeasonRewards::COMMAND);
+        let decoded: DistributeSeasonRewards = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_rewards_cmd());
     }
 }
