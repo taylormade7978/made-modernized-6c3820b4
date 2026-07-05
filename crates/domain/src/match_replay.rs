@@ -14,8 +14,11 @@
 //! 4. **Reconnect contract** — a reconnecting client is served only events
 //!    *strictly after* its last acknowledged sequence number.
 //!
-//! The only command implemented so far is [`RequestEventsSince`]
-//! (`RequestEventsSinceCmd`): it validates all four invariants and, when the
+//! Two commands are implemented. [`AppendEvent`] (`AppendEventCmd`) signs and
+//! appends the next match event at the current sequence number, emitting
+//! [`Event::Appended`] (`event.appended`); it is the only *write* path into the
+//! log and enforces all four invariants before mutating. [`RequestEventsSince`]
+//! (`RequestEventsSinceCmd`) validates all four invariants and, when the
 //! replay is sound, serves the tail of the log and emits [`Event::Resynced`]
 //! (`replay.resynced`). This module is hand-written (it no longer uses
 //! `shared::stub_aggregate!`) but preserves the same public surface — a
@@ -200,6 +203,74 @@ impl MatchReplay {
         Ok(())
     }
 
+    /// Handle `AppendEventCmd`: sign and append the next match event at the
+    /// current sequence number, emitting [`Event::Appended`].
+    ///
+    /// This is the only write path into the log, so it enforces every invariant
+    /// before mutating: the existing log must already be sound (ordered, its
+    /// seal intact, deterministic), the replay must be open (an immutable sealed
+    /// replay cannot be appended to), and the signed sequence number must sit
+    /// strictly after the high-water mark *and* be exactly the contiguous next
+    /// sequence — no gaps, reorders, or replays of already-served events.
+    fn append_event(&mut self, request: AppendEvent) -> Result<Vec<Event>, DomainError> {
+        // The command must name the match this replay actually records.
+        if request.match_id != self.match_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets match '{}' but this replay records '{}'",
+                request.match_id, self.match_id
+            )));
+        }
+
+        // The existing log must be sound before we extend it.
+        self.ensure_ordered()?;
+        self.ensure_seal_intact()?;
+        self.ensure_deterministic()?;
+
+        // Immutability: a sealed replay is frozen and can never be appended to.
+        if self.sealed {
+            return Err(DomainError::InvariantViolation(format!(
+                "replay '{}' is sealed and cannot be appended to",
+                self.id
+            )));
+        }
+
+        let high_water = self.high_water_sequence();
+
+        // Reconnect contract: only an event strictly after the high-water mark
+        // may be signed — re-signing an already-recorded sequence is a reorder.
+        if request.sequence_number <= high_water {
+            return Err(DomainError::InvariantViolation(format!(
+                "append sequence {} is not strictly after the high-water mark {}",
+                request.sequence_number, high_water
+            )));
+        }
+
+        // Ordering: the signed sequence must be exactly the contiguous next
+        // sequence, leaving no gap in the strictly-increasing log.
+        let expected = high_water + 1;
+        if request.sequence_number != expected {
+            return Err(DomainError::InvariantViolation(format!(
+                "append sequence {} is not contiguous: expected the next sequence {expected}",
+                request.sequence_number
+            )));
+        }
+
+        // Sign and append, keeping the determinism digest in sync so the log
+        // still replays byte-for-byte to its expected final state.
+        self.log.push(RecordedEvent {
+            sequence: expected,
+            state_delta: request.event_payload,
+        });
+        self.expected_final_digest = self.replay_digest();
+
+        let event = Event::Appended {
+            match_id: self.match_id.clone(),
+            sequence: expected,
+        };
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
     /// Handle `RequestEventsSinceCmd`: verify the replay is sound, then serve
     /// every event strictly after the client's last acknowledged sequence and
     /// emit [`Event::Resynced`].
@@ -244,6 +315,90 @@ impl MatchReplay {
         };
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
+    }
+}
+
+/// Typed form of the `AppendEventCmd` command.
+///
+/// A recorder signs the next match event into the log at the current sequence
+/// number. Like [`RequestEventsSince`], it owns its own wire encoding because
+/// the [`shared`] kernel carries command payloads as opaque bytes. The encoding
+/// is `"<matchId>:<sequenceNumber>:<eventPayload>"`; the two numeric fields are
+/// parsed from the right so a match id may itself contain colons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendEvent {
+    /// The match whose log is being appended to.
+    pub match_id: String,
+    /// The sequence number being signed; must be the contiguous next sequence.
+    pub sequence_number: u64,
+    /// The event's opaque contribution to the deterministic replay digest
+    /// (its `state_delta` in the recorded log).
+    pub event_payload: u64,
+}
+
+impl AppendEvent {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = "AppendEventCmd";
+
+    /// Build an append of `event_payload` at `sequence_number` for `match_id`.
+    pub fn new(match_id: impl Into<String>, sequence_number: u64, event_payload: u64) -> Self {
+        Self {
+            match_id: match_id.into(),
+            sequence_number,
+            event_payload,
+        }
+    }
+
+    /// Encode this append as a dispatchable [`Command`].
+    pub fn into_command(self) -> Command {
+        let payload = format!(
+            "{}:{}:{}",
+            self.match_id, self.sequence_number, self.event_payload
+        )
+        .into_bytes();
+        Command::with_payload(Self::COMMAND, payload)
+    }
+
+    /// Decode a command payload of the form
+    /// `"<matchId>:<sequenceNumber>:<eventPayload>"`.
+    fn decode(payload: &[u8]) -> Result<Self, DomainError> {
+        let text = std::str::from_utf8(payload).map_err(|_| {
+            DomainError::InvariantViolation("AppendEventCmd payload is not UTF-8".to_string())
+        })?;
+        // Peel the two numeric fields off the right so a match id may itself
+        // contain colons.
+        let (rest, payload_str) = text.rsplit_once(':').ok_or_else(|| {
+            DomainError::InvariantViolation(
+                "AppendEventCmd payload must be '<matchId>:<sequenceNumber>:<eventPayload>'"
+                    .to_string(),
+            )
+        })?;
+        let (match_id, seq_str) = rest.rsplit_once(':').ok_or_else(|| {
+            DomainError::InvariantViolation(
+                "AppendEventCmd payload must be '<matchId>:<sequenceNumber>:<eventPayload>'"
+                    .to_string(),
+            )
+        })?;
+        let sequence_number = seq_str.parse::<u64>().map_err(|_| {
+            DomainError::InvariantViolation(format!(
+                "AppendEventCmd sequence number '{seq_str}' is not a valid number"
+            ))
+        })?;
+        let event_payload = payload_str.parse::<u64>().map_err(|_| {
+            DomainError::InvariantViolation(format!(
+                "AppendEventCmd event payload '{payload_str}' is not a valid number"
+            ))
+        })?;
+        if match_id.is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "AppendEventCmd requires a non-empty matchId".to_string(),
+            ));
+        }
+        Ok(Self {
+            match_id: match_id.to_string(),
+            sequence_number,
+            event_payload,
+        })
     }
 }
 
@@ -313,6 +468,14 @@ impl RequestEventsSince {
 /// Domain events emitted by [`MatchReplay`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// The next match event was signed and appended to the log: it names the
+    /// match and the sequence number the event was recorded at.
+    Appended {
+        /// The match whose log grew.
+        match_id: String,
+        /// The sequence number assigned to the appended event.
+        sequence: u64,
+    },
     /// The replay was resynced for a reconnecting client: it names the match,
     /// the sequence the client resumed after, and the sequence numbers served
     /// (all strictly greater than `since_sequence`).
@@ -329,6 +492,7 @@ pub enum Event {
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
+            Event::Appended { .. } => "event.appended",
             Event::Resynced { .. } => "replay.resynced",
         }
     }
@@ -343,6 +507,10 @@ impl Aggregate for MatchReplay {
 
     fn execute(&mut self, command: Command) -> Result<Vec<Self::Event>, DomainError> {
         match command.name.as_str() {
+            AppendEvent::COMMAND => {
+                let request = AppendEvent::decode(&command.payload)?;
+                self.append_event(request)
+            }
             RequestEventsSince::COMMAND => {
                 let request = RequestEventsSince::decode(&command.payload)?;
                 self.request_events_since(request)
@@ -366,13 +534,132 @@ mod tests {
 
     /// A sound, sealed replay of three contiguous events for match `m-1`.
     fn valid_replay() -> MatchReplay {
+        let mut replay = open_replay();
+        replay.seal();
+        replay
+    }
+
+    /// A sound, *open* (unsealed) replay of three contiguous events for match
+    /// `m-1` — ready to accept an `AppendEventCmd` at sequence 4.
+    fn open_replay() -> MatchReplay {
         let mut replay = MatchReplay::new("m-1");
         replay.seed_from(7);
         replay.record_event(10).unwrap();
         replay.record_event(20).unwrap();
         replay.record_event(30).unwrap();
-        replay.seal();
         replay
+    }
+
+    // Scenario: Successfully execute AppendEventCmd.
+    #[test]
+    fn appends_and_emits_event_appended_event() {
+        let mut replay = open_replay();
+
+        let events = replay
+            .execute(AppendEvent::new("m-1", 4, 40).into_command())
+            .expect("valid append should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "event.appended");
+        match &events[0] {
+            Event::Appended { match_id, sequence } => {
+                assert_eq!(match_id, "m-1");
+                assert_eq!(*sequence, 4);
+            }
+            other => panic!("expected Appended, got {other:?}"),
+        }
+        // The event was appended to the log and recorded on the aggregate root.
+        assert_eq!(replay.high_water_sequence(), 4);
+        assert_eq!(replay.log().len(), 4);
+        assert_eq!(replay.uncommitted_events().len(), 1);
+        assert_eq!(replay.version(), 1);
+    }
+
+    // Scenario: rejected — events must be contiguous, monotonically increasing;
+    // no gaps or reorders.
+    #[test]
+    fn append_rejected_when_log_is_not_contiguously_ordered() {
+        let mut replay = open_replay();
+        // Corrupt the existing log so it is no longer contiguously ordered.
+        replay.log[1].sequence = 5;
+
+        let err = replay
+            .execute(AppendEvent::new("m-1", 4, 40).into_command())
+            .expect_err("append onto a non-contiguous log must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // Scenario: rejected — a gap in the signed sequence is a reorder/gap.
+    #[test]
+    fn append_rejected_when_sequence_leaves_a_gap() {
+        let mut replay = open_replay();
+        // The next contiguous sequence is 4; signing 6 would leave a gap.
+        let err = replay
+            .execute(AppendEvent::new("m-1", 6, 40).into_command())
+            .expect_err("a gap in the signed sequence must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // Scenario: rejected — the log is append-only and immutable once written;
+    // sealed replays cannot be mutated.
+    #[test]
+    fn append_rejected_when_replay_is_sealed() {
+        let mut replay = valid_replay(); // sealed at three events
+
+        let err = replay
+            .execute(AppendEvent::new("m-1", 4, 40).into_command())
+            .expect_err("appending to a sealed replay must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        // The sealed log was not mutated.
+        assert_eq!(replay.log().len(), 3);
+    }
+
+    // Scenario: rejected — replaying the log from its seed must reproduce
+    // byte-identical final GameSession state (determinism contract).
+    #[test]
+    fn append_rejected_when_replay_is_non_deterministic() {
+        let mut replay = open_replay();
+        // Corrupt the expected final digest so replaying no longer reproduces it.
+        replay.expected_final_digest = replay.expected_final_digest.wrapping_add(1);
+
+        let err = replay
+            .execute(AppendEvent::new("m-1", 4, 40).into_command())
+            .expect_err("append onto a non-deterministic replay must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // Scenario: rejected — a reconnecting client is served only events strictly
+    // after its last acknowledged sequence number (no re-signing a recorded one).
+    #[test]
+    fn append_rejected_when_sequence_is_not_strictly_after_high_water() {
+        let mut replay = open_replay();
+        // Sequence 3 is already recorded; re-signing it is not strictly after
+        // the high-water mark of 3.
+        let err = replay
+            .execute(AppendEvent::new("m-1", 3, 40).into_command())
+            .expect_err("re-signing a recorded sequence must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // The command must name the match this replay actually records.
+    #[test]
+    fn append_rejected_when_match_id_mismatches() {
+        let mut replay = open_replay();
+
+        let err = replay
+            .execute(AppendEvent::new("other-match", 4, 40).into_command())
+            .expect_err("append targeting a different match must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn append_command_payload_round_trips() {
+        // A match id containing a colon still round-trips: the two numeric
+        // fields are parsed off the right.
+        let command = AppendEvent::new("m:42", 7, 99).into_command();
+        assert_eq!(command.name, AppendEvent::COMMAND);
+        let decoded = AppendEvent::decode(&command.payload).unwrap();
+        assert_eq!(decoded, AppendEvent::new("m:42", 7, 99));
     }
 
     // Scenario: Successfully execute RequestEventsSinceCmd.
@@ -397,6 +684,7 @@ mod tests {
                 // Only events strictly after sequence 1 are served.
                 assert_eq!(served_sequences, &[2, 3]);
             }
+            other => panic!("expected Resynced, got {other:?}"),
         }
         // The event was recorded on the aggregate root.
         assert_eq!(replay.uncommitted_events().len(), 1);
