@@ -21,7 +21,7 @@
 //!    repeated abandonment; the recorded penalty must match the doubling
 //!    schedule for the number of abandonments.
 //!
-//! Three commands are implemented. [`ApplyRankFloorProtection`]
+//! Four commands are implemented. [`ApplyRankFloorProtection`]
 //! (`ApplyRankFloorProtectionCmd`) pins the visible rank at the reached tier
 //! floor so a loss cannot demote the player below it, enforcing every invariant,
 //! and on success emits [`Event::RankFloorProtected`] (`ranked.rank.floor.protected`).
@@ -29,6 +29,12 @@
 //! suspected smurf that has reached [`SMURF_ELEVATION_MATCHES`] (20) matches —
 //! into the next bracket, enforcing the same rest invariants, and on success
 //! emits [`Event::SmurfElevated`] (`smurf.elevated`).
+//! [`RecordMatchResult`] (`RecordMatchResultCmd`) ingests a completed rated match
+//! and recomputes the hidden Glicko-2 estimate (rating, RD, volatility) from the
+//! outcome and the opponent's rating — honoring invariant 1, that ratings are
+//! recalculated after *every* rated match — and on success emits both
+//! [`Event::MatchResultRecorded`] (`match.result.recorded`) and
+//! [`Event::RatingRecalculated`] (`rating.recalculated`).
 //! [`ApplyDisconnectPenalty`] (`ApplyDisconnectPenaltyCmd`) charges an escalating
 //! penalty for an abandonment — doubling the prior charge — enforcing every
 //! invariant (the disconnect-escalation invariant confirming the existing ledger
@@ -58,6 +64,9 @@ const ELEVATE_SMURF: &str = "ElevateSmurfCmd";
 /// escalating disconnect penalty for an abandonment.
 const APPLY_DISCONNECT_PENALTY: &str = "ApplyDisconnectPenaltyCmd";
 
+/// The `RecordMatchResultCmd` name [`RankedStanding::execute`] recognizes.
+const RECORD_MATCH_RESULT: &str = "RecordMatchResultCmd";
+
 /// Stars per tier: the visible rank advances through each tier with three stars,
 /// after which the player promotes to the next tier. A live win streak may add
 /// at most one *bonus* star on top of these.
@@ -69,6 +78,25 @@ pub const SMURF_ELEVATION_MATCHES: u32 = 20;
 /// The base disconnect penalty (in rating points) charged for a first
 /// abandonment. Each further abandonment *doubles* the penalty.
 pub const BASE_DISCONNECT_PENALTY: u32 = 5;
+
+/// Glicko-2 scale factor: the constant `173.7178` that maps the human-readable
+/// rating scale (centered at 1500) to and from the internal Glicko-2 scale on
+/// which the update is computed.
+const GLICKO2_SCALE: f64 = 173.7178;
+
+/// Glicko-2 system constant `τ` (tau), constraining how much volatility may move
+/// in a single update. `0.5` is the value the Glicko-2 paper recommends for most
+/// competitive settings.
+const GLICKO2_TAU: f64 = 0.5;
+
+/// Assumed rating deviation (RD) of the opponent for a single rated match. A
+/// `RecordMatchResultCmd` carries only the opponent's rating, so the update
+/// treats the opponent as reasonably well-established at this RD.
+const ASSUMED_OPPONENT_RD: f64 = 50.0;
+
+/// Convergence tolerance for the Illinois root-finding iteration that solves for
+/// the new Glicko-2 volatility.
+const GLICKO2_CONVERGENCE: f64 = 1e-6;
 
 /// Visible rank tiers, ordered lowest → highest along the competitive ladder.
 ///
@@ -128,6 +156,32 @@ impl Tier {
             Tier::Contender => Tier::Champion,
             Tier::Champion => Tier::Legend,
             Tier::Legend => Tier::Legend,
+        }
+    }
+}
+
+/// The outcome of a completed rated match, from the perspective of the standing
+/// whose rating is being recomputed. Maps to the Glicko-2 score `s`: a win
+/// scores `1.0`, a draw `0.5`, and a loss `0.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum MatchOutcome {
+    /// The player won the match.
+    Win,
+    /// The match was drawn.
+    Draw,
+    /// The player lost the match.
+    Loss,
+}
+
+impl MatchOutcome {
+    /// The Glicko-2 score `s` for this outcome: `1.0` win, `0.5` draw, `0.0`
+    /// loss.
+    fn score(self) -> f64 {
+        match self {
+            MatchOutcome::Win => 1.0,
+            MatchOutcome::Draw => 0.5,
+            MatchOutcome::Loss => 0.0,
         }
     }
 }
@@ -217,6 +271,61 @@ impl ElevateSmurf {
     pub fn into_command(&self) -> Command {
         // Serialization of a plain data struct to a Vec cannot fail here.
         let payload = serde_json::to_vec(self).expect("ElevateSmurf is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The `RecordMatchResultCmd` payload: a completed rated match to ingest into a
+/// standing. Field names are the ladder service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`RecordMatchResult::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`RankedStanding::execute`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordMatchResult {
+    /// Identity of the standing recording the result; must name the standing
+    /// this aggregate records.
+    pub standing_id: String,
+    /// The player this standing belongs to. Must be non-empty and must match the
+    /// standing's own player.
+    pub player_id: String,
+    /// Identity of the completed match. Must be non-empty.
+    pub match_id: String,
+    /// The outcome of the match for this player (win / draw / loss).
+    pub outcome: MatchOutcome,
+    /// The opponent's (human-scale) Glicko-2 rating. Must be a finite, positive
+    /// number so the recompute is well-defined.
+    pub opponent_rating: f64,
+}
+
+impl RecordMatchResult {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = RECORD_MATCH_RESULT;
+
+    /// Build a command recording `outcome` against an opponent rated
+    /// `opponent_rating` for `match_id`, on `standing_id` for `player_id`.
+    pub fn new(
+        standing_id: impl Into<String>,
+        player_id: impl Into<String>,
+        match_id: impl Into<String>,
+        outcome: MatchOutcome,
+        opponent_rating: f64,
+    ) -> Self {
+        Self {
+            standing_id: standing_id.into(),
+            player_id: player_id.into(),
+            match_id: match_id.into(),
+            outcome,
+            opponent_rating,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`RankedStanding::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("RecordMatchResult is always serializable");
         Command::with_payload(Self::COMMAND, payload)
     }
 }
@@ -314,8 +423,41 @@ pub struct DisconnectPenaltyApplied {
     pub abandonments: u32,
 }
 
-/// Domain events emitted by [`RankedStanding`].
+/// A completed rated match ingested into a standing, carried by
+/// [`Event::MatchResultRecorded`] and thus by the emitted `match.result.recorded`
+/// event.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchResultRecorded {
+    /// The standing the result was recorded on.
+    pub standing_id: String,
+    /// The player the standing belongs to.
+    pub player_id: String,
+    /// The completed match this result came from.
+    pub match_id: String,
+    /// The outcome recorded for the player.
+    pub outcome: MatchOutcome,
+}
+
+/// The recomputed Glicko-2 estimate, carried by [`Event::RatingRecalculated`]
+/// and thus by the emitted `rating.recalculated` event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RatingRecalculated {
+    /// The standing whose rating was recomputed.
+    pub standing_id: String,
+    /// The player the standing belongs to.
+    pub player_id: String,
+    /// The new hidden Glicko-2 rating.
+    pub rating: f64,
+    /// The new hidden Glicko-2 rating deviation (RD).
+    pub rating_deviation: f64,
+    /// The new hidden Glicko-2 volatility.
+    pub volatility: f64,
+    /// The rated-match count the new estimate reflects (it is now fresh).
+    pub rated_matches: u32,
+}
+
+/// Domain events emitted by [`RankedStanding`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// The visible rank was pinned at the reached tier floor: a subsequent loss
     /// cannot demote the player below it.
@@ -325,6 +467,10 @@ pub enum Event {
     SmurfElevated(SmurfElevated),
     /// An escalating disconnect penalty was charged for an abandonment.
     DisconnectPenaltyApplied(DisconnectPenaltyApplied),
+    /// A completed rated match was recorded on the standing.
+    MatchResultRecorded(MatchResultRecorded),
+    /// The hidden Glicko-2 estimate (rating, RD, volatility) was recomputed.
+    RatingRecalculated(RatingRecalculated),
 }
 
 impl DomainEvent for Event {
@@ -333,6 +479,8 @@ impl DomainEvent for Event {
             Event::RankFloorProtected(_) => "ranked.rank.floor.protected",
             Event::SmurfElevated(_) => "smurf.elevated",
             Event::DisconnectPenaltyApplied(_) => "disconnect.penalty.applied",
+            Event::MatchResultRecorded(_) => "match.result.recorded",
+            Event::RatingRecalculated(_) => "rating.recalculated",
         }
     }
 }
@@ -346,7 +494,7 @@ impl DomainEvent for Event {
 /// standing's competitive state: the owning player, the hidden Glicko-2 skill
 /// estimate and how fresh it is, the visible tier/stars and reached floor, the
 /// match count and smurf status, and the disconnect-penalty ledger. Its
-/// `execute` handles [`ApplyRankFloorProtectionCmd`].
+/// `execute` handles ranked-standing commands.
 ///
 /// A fresh standing from [`RankedStanding::new`] sits at the ladder's entry
 /// (Block, no stars) with a default, freshly-synced Glicko-2 estimate; the
@@ -815,6 +963,174 @@ impl RankedStanding {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Solve the Glicko-2 volatility update equation for the new volatility using
+    /// the Illinois variant of regula-falsi, exactly as specified in Glickman's
+    /// Glicko-2 paper. `phi` is the pre-update deviation, `v` the estimated
+    /// variance, and `delta` the estimated rating change, all on the Glicko-2
+    /// scale.
+    fn recompute_volatility(sigma: f64, phi: f64, v: f64, delta: f64) -> f64 {
+        let tau = GLICKO2_TAU;
+        let a = (sigma * sigma).ln();
+        // f(x) whose root (in x = ln σ'²) gives the new volatility.
+        let f = |x: f64| {
+            let ex = x.exp();
+            let num = ex * (delta * delta - phi * phi - v - ex);
+            let den = 2.0 * (phi * phi + v + ex).powi(2);
+            num / den - (x - a) / (tau * tau)
+        };
+
+        // Bracket the root: A below, B above.
+        let mut big_a = a;
+        let mut big_b = if delta * delta > phi * phi + v {
+            (delta * delta - phi * phi - v).ln()
+        } else {
+            let mut k = 1.0;
+            while f(a - k * tau) < 0.0 {
+                k += 1.0;
+            }
+            a - k * tau
+        };
+
+        let mut f_a = f(big_a);
+        let mut f_b = f(big_b);
+        while (big_b - big_a).abs() > GLICKO2_CONVERGENCE {
+            let c = big_a + (big_a - big_b) * f_a / (f_b - f_a);
+            let f_c = f(c);
+            if f_c * f_b <= 0.0 {
+                big_a = big_b;
+                f_a = f_b;
+            } else {
+                f_a /= 2.0;
+            }
+            big_b = c;
+            f_b = f_c;
+        }
+
+        (big_a / 2.0).exp()
+    }
+
+    /// Run one Glicko-2 rating period against a single opponent, returning the new
+    /// `(rating, rating_deviation, volatility)` on the human-readable scale.
+    ///
+    /// Implements the standard Glicko-2 update (Glickman, 2013): convert to the
+    /// internal scale, weigh the opponent via `g(φ)`/`E`, solve for the new
+    /// volatility, contract the deviation, shift the rating, and convert back.
+    fn recompute_rating(&self, outcome: MatchOutcome, opponent_rating: f64) -> (f64, f64, f64) {
+        // Step 2: onto the Glicko-2 scale (μ, φ), centered at 1500.
+        let mu = (self.rating - 1500.0) / GLICKO2_SCALE;
+        let phi = self.rating_deviation / GLICKO2_SCALE;
+        let mu_j = (opponent_rating - 1500.0) / GLICKO2_SCALE;
+        let phi_j = ASSUMED_OPPONENT_RD / GLICKO2_SCALE;
+
+        // Step 3: g(φ) dampens by opponent uncertainty; E is the expected score.
+        let g = 1.0
+            / (1.0 + 3.0 * phi_j * phi_j / (std::f64::consts::PI * std::f64::consts::PI)).sqrt();
+        let e = 1.0 / (1.0 + (-g * (mu - mu_j)).exp());
+        let s = outcome.score();
+
+        // Step 4/5: estimated variance v and rating change delta.
+        let v = 1.0 / (g * g * e * (1.0 - e));
+        let delta = v * g * (s - e);
+
+        // Step 6: new volatility via the iterative solver.
+        let sigma_prime = Self::recompute_volatility(self.volatility, phi, v, delta);
+
+        // Step 7/8: pre-rating-period deviation, then contract with new evidence.
+        let phi_star = (phi * phi + sigma_prime * sigma_prime).sqrt();
+        let phi_prime = 1.0 / (1.0 / (phi_star * phi_star) + 1.0 / v).sqrt();
+
+        // Step 8: shift the rating by the observed-minus-expected score.
+        let mu_prime = mu + phi_prime * phi_prime * g * (s - e);
+
+        // Step 9: back to the human-readable scale.
+        (
+            GLICKO2_SCALE * mu_prime + 1500.0,
+            GLICKO2_SCALE * phi_prime,
+            sigma_prime,
+        )
+    }
+
+    /// Handle `RecordMatchResultCmd`: verify the command targets this standing and
+    /// its player with a valid match and opponent rating, enforce every invariant
+    /// as a precondition (ratings freshness, visible-rank shape, floor validity,
+    /// smurf elevation, and disconnect escalation), ingest the rated match,
+    /// recompute the hidden Glicko-2 estimate, and emit both
+    /// [`Event::MatchResultRecorded`] and [`Event::RatingRecalculated`].
+    fn record_match_result(&mut self, cmd: RecordMatchResult) -> Result<Vec<Event>, DomainError> {
+        // The command must name the standing this aggregate actually records.
+        if cmd.standing_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets standing '{}' but this aggregate records '{}'",
+                cmd.standing_id, self.id
+            )));
+        }
+        // A valid, matching player must be supplied.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "standing '{}' requires a valid playerId to record a match result",
+                self.id
+            )));
+        }
+        if cmd.player_id != self.player_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command names player '{}' but standing '{}' belongs to '{}'",
+                cmd.player_id, self.id, self.player_id
+            )));
+        }
+        // A valid match identity and opponent rating must be supplied.
+        if cmd.match_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "standing '{}' requires a valid matchId to record a match result",
+                self.id
+            )));
+        }
+        if !cmd.opponent_rating.is_finite() || cmd.opponent_rating <= 0.0 {
+            return Err(DomainError::InvariantViolation(format!(
+                "standing '{}' requires a finite, positive opponentRating but got {}",
+                self.id, cmd.opponent_rating
+            )));
+        }
+
+        // Enforce every invariant on the standing's state *before* recording the
+        // new match — the estimate being ingested must itself be consistent.
+        self.ensure_ratings_recalculated()?;
+        self.ensure_visible_rank_wellformed()?;
+        self.ensure_floor_protection_valid()?;
+        self.ensure_smurf_elevated()?;
+        self.ensure_disconnect_penalty_escalates()?;
+
+        // Recompute the Glicko-2 estimate from the outcome and opponent rating.
+        let (rating, rating_deviation, volatility) =
+            self.recompute_rating(cmd.outcome, cmd.opponent_rating);
+
+        // Ingest the rated match: the counters advance and the fresh estimate is
+        // synced to the new count, upholding the ratings-freshness invariant.
+        self.rated_matches += 1;
+        self.matches_played += 1;
+        self.rating = rating;
+        self.rating_deviation = rating_deviation;
+        self.volatility = volatility;
+        self.ratings_synced_at = self.rated_matches;
+
+        let recorded = Event::MatchResultRecorded(MatchResultRecorded {
+            standing_id: cmd.standing_id.clone(),
+            player_id: cmd.player_id.clone(),
+            match_id: cmd.match_id,
+            outcome: cmd.outcome,
+        });
+        let recalculated = Event::RatingRecalculated(RatingRecalculated {
+            standing_id: cmd.standing_id,
+            player_id: cmd.player_id,
+            rating,
+            rating_deviation,
+            volatility,
+            rated_matches: self.rated_matches,
+        });
+        self.root.record(Box::new(recorded.clone()));
+        self.root.record(Box::new(recalculated.clone()));
+        Ok(vec![recorded, recalculated])
+    }
 }
 
 impl Aggregate for RankedStanding {
@@ -842,6 +1158,15 @@ impl Aggregate for RankedStanding {
                     ))
                 })?;
                 self.elevate_smurf(cmd)
+            }
+            RECORD_MATCH_RESULT => {
+                let cmd: RecordMatchResult =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed RecordMatchResultCmd payload: {e}"
+                        ))
+                    })?;
+                self.record_match_result(cmd)
             }
             APPLY_DISCONNECT_PENALTY => {
                 let cmd: ApplyDisconnectPenalty = serde_json::from_slice(&command.payload)
@@ -1514,5 +1839,180 @@ mod tests {
         assert_eq!(command.name, ApplyDisconnectPenalty::COMMAND);
         let decoded: ApplyDisconnectPenalty = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_disconnect_cmd());
+    }
+
+    // ----- RecordMatchResultCmd (S-27) -----------------------------------
+
+    /// A result-ready standing: same consistent state as [`ready_standing`],
+    /// reused because `RecordMatchResultCmd` enforces the identical five
+    /// invariants as preconditions before ingesting a match.
+    fn result_ready_standing() -> RankedStanding {
+        ready_standing()
+    }
+
+    /// A command recording a win against a 1600-rated opponent on `r-01` for
+    /// player `p-1`.
+    fn valid_result_cmd() -> RecordMatchResult {
+        RecordMatchResult::new("r-01", "p-1", "m-1", MatchOutcome::Win, 1600.0)
+    }
+
+    // Scenario: Successfully execute RecordMatchResultCmd — a match.result.recorded
+    // event and a rating.recalculated event are emitted.
+    #[test]
+    fn records_result_and_emits_recorded_and_recalculated_events() {
+        let mut standing = result_ready_standing();
+        let before_matches = standing.rated_matches;
+
+        let events = standing
+            .execute(valid_result_cmd().into_command())
+            .expect("valid match result should succeed");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type(), "match.result.recorded");
+        assert_eq!(events[1].event_type(), "rating.recalculated");
+        match &events[0] {
+            Event::MatchResultRecorded(recorded) => {
+                assert_eq!(recorded.standing_id, "r-01");
+                assert_eq!(recorded.player_id, "p-1");
+                assert_eq!(recorded.match_id, "m-1");
+                assert_eq!(recorded.outcome, MatchOutcome::Win);
+            }
+            other => panic!("expected MatchResultRecorded, got {other:?}"),
+        }
+        match &events[1] {
+            Event::RatingRecalculated(recalc) => {
+                assert_eq!(recalc.standing_id, "r-01");
+                assert_eq!(recalc.rated_matches, before_matches + 1);
+                // A win raises the rating and shrinks the deviation.
+                assert!(recalc.rating > 1620.0);
+                assert!(recalc.rating_deviation < 80.0);
+                assert!(recalc.volatility > 0.0);
+            }
+            other => panic!("expected RatingRecalculated, got {other:?}"),
+        }
+        // Both events were recorded and the estimate stays fresh for the next
+        // match (ratings_synced_at now equals the new rated_matches).
+        assert_eq!(standing.rated_matches, before_matches + 1);
+        assert_eq!(standing.version(), 2);
+        assert_eq!(standing.uncommitted_events().len(), 2);
+        standing
+            .ensure_ratings_recalculated()
+            .expect("estimate must be fresh after recording");
+    }
+
+    // A loss lowers the rating.
+    #[test]
+    fn a_loss_lowers_the_rating() {
+        let mut standing = result_ready_standing();
+        let cmd = RecordMatchResult::new("r-01", "p-1", "m-2", MatchOutcome::Loss, 1600.0);
+
+        standing
+            .execute(cmd.into_command())
+            .expect("a recorded loss should succeed");
+
+        assert!(standing.rating() < 1620.0);
+    }
+
+    // Scenario: rejected — Glicko-2 rating, RD, and volatility are recalculated
+    // after every rated match.
+    #[test]
+    fn record_rejects_when_ratings_are_stale() {
+        let mut standing = result_ready_standing();
+        // The estimate lags the matches already played.
+        standing.set_ratings(1620.0, 80.0, 0.059, 10, 9);
+
+        let err = standing
+            .execute(valid_result_cmd().into_command())
+            .expect_err("a stale Glicko-2 estimate must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — visible rank advances through tiers Block→Legend with
+    // 3 stars per tier; a win streak grants a bonus star.
+    #[test]
+    fn record_rejects_malformed_visible_rank() {
+        let mut standing = result_ready_standing();
+        standing.set_visible_rank(Tier::Corner, STARS_PER_TIER + 1, false, 0);
+
+        let err = standing
+            .execute(valid_result_cmd().into_command())
+            .expect_err("a tier over its star cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — rank-floor protection prevents demotion below a reached
+    // tier floor (anti-tilt applies to Block/Corner).
+    #[test]
+    fn record_rejects_when_below_floor() {
+        let mut standing = result_ready_standing();
+        // Current tier Block sits below the reached Corner floor.
+        standing.set_visible_rank(Tier::Block, 2, false, 0);
+
+        let err = standing
+            .execute(valid_result_cmd().into_command())
+            .expect_err("a standing below its floor must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — a suspected smurf is auto-elevated to a higher bracket
+    // after 20 matches.
+    #[test]
+    fn record_rejects_unelevated_smurf() {
+        let mut standing = result_ready_standing();
+        standing.set_smurf_state(SMURF_ELEVATION_MATCHES, true, false);
+
+        let err = standing
+            .execute(valid_result_cmd().into_command())
+            .expect_err("an un-elevated suspected smurf must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — disconnect penalties escalate (doubling) on repeated
+    // abandonment.
+    #[test]
+    fn record_rejects_penalty_off_doubling_schedule() {
+        let mut standing = result_ready_standing();
+        // Three abandonments owe BASE·4 under doubling; charging BASE·3 breaks it.
+        standing.set_disconnect_ledger(3, BASE_DISCONNECT_PENALTY * 3);
+
+        let err = standing
+            .execute(valid_result_cmd().into_command())
+            .expect_err("a penalty off the doubling schedule must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // A result for the wrong standing / player / with a missing match or a
+    // non-finite opponent rating is rejected before any state changes.
+    #[test]
+    fn record_rejects_bad_targets_and_inputs() {
+        for cmd in [
+            RecordMatchResult::new("r-99", "p-1", "m-1", MatchOutcome::Win, 1600.0),
+            RecordMatchResult::new("r-01", "p-other", "m-1", MatchOutcome::Win, 1600.0),
+            RecordMatchResult::new("r-01", "   ", "m-1", MatchOutcome::Win, 1600.0),
+            RecordMatchResult::new("r-01", "p-1", "  ", MatchOutcome::Win, 1600.0),
+            RecordMatchResult::new("r-01", "p-1", "m-1", MatchOutcome::Win, 0.0),
+            RecordMatchResult::new("r-01", "p-1", "m-1", MatchOutcome::Win, f64::NAN),
+        ] {
+            let mut standing = result_ready_standing();
+            let err = standing
+                .execute(cmd.into_command())
+                .expect_err("a malformed target/input must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(standing.version(), 0);
+        }
+    }
+
+    #[test]
+    fn record_command_payload_round_trips() {
+        let cmd = valid_result_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, RecordMatchResult::COMMAND);
+        let decoded: RecordMatchResult = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_result_cmd());
     }
 }
