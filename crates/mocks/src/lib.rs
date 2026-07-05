@@ -72,6 +72,12 @@ in_memory_repo!(
     domain::card_definition::CardDefinitionRepository
 );
 in_memory_repo!(
+    /// In-memory adapter for [`domain::card_token::CardTokenRepository`].
+    InMemoryCardTokenRepository,
+    domain::card_token::CardToken,
+    domain::card_token::CardTokenRepository
+);
+in_memory_repo!(
     /// In-memory adapter for [`domain::boss_definition::BossDefinitionRepository`].
     InMemoryBossDefinitionRepository,
     domain::boss_definition::BossDefinition,
@@ -166,6 +172,7 @@ mod tests {
             domain::card_definition::CardDefinition::new("c"),
             "CardDefinition"
         );
+        assert_unknown!(domain::card_token::CardToken::new("ct"), "CardToken");
         assert_unknown!(
             domain::boss_definition::BossDefinition::new("b"),
             "BossDefinition"
@@ -216,6 +223,11 @@ mod tests {
             &mut InMemoryCardDefinitionRepository::new(),
             "c",
             domain::card_definition::CardDefinition::new("c"),
+        );
+        round_trip(
+            &mut InMemoryCardTokenRepository::new(),
+            "ct",
+            domain::card_token::CardToken::new("ct"),
         );
         round_trip(
             &mut InMemoryBossDefinitionRepository::new(),
