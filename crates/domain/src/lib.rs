@@ -11,6 +11,7 @@ pub mod card_definition;
 pub mod expansion_set;
 pub mod match_replay;
 pub mod matchmaking_ticket;
+pub mod outfit;
 pub mod player_collection;
 pub mod ranked_standing;
 pub mod season;
