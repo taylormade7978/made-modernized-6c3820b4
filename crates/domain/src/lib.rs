@@ -8,6 +8,7 @@
 
 pub mod boss_definition;
 pub mod card_definition;
+pub mod card_pack;
 pub mod expansion_set;
 pub mod match_replay;
 pub mod matchmaking_ticket;
