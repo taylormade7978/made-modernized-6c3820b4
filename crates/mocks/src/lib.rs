@@ -101,6 +101,12 @@ in_memory_repo!(
     domain::season::Season,
     domain::season::SeasonRepository
 );
+in_memory_repo!(
+    /// In-memory adapter for [`domain::player_collection::PlayerCollectionRepository`].
+    InMemoryPlayerCollectionRepository,
+    domain::player_collection::PlayerCollection,
+    domain::player_collection::PlayerCollectionRepository
+);
 
 #[cfg(test)]
 mod tests {
@@ -171,6 +177,10 @@ mod tests {
             "RankedStanding"
         );
         assert_unknown!(domain::season::Season::new("s"), "Season");
+        assert_unknown!(
+            domain::player_collection::PlayerCollection::new("p"),
+            "PlayerCollection"
+        );
     }
 
     /// Exercise every mock repository through its contract so the whole
@@ -221,6 +231,11 @@ mod tests {
             &mut InMemorySeasonRepository::new(),
             "s",
             domain::season::Season::new("s"),
+        );
+        round_trip(
+            &mut InMemoryPlayerCollectionRepository::new(),
+            "p",
+            domain::player_collection::PlayerCollection::new("p"),
         );
     }
 }
