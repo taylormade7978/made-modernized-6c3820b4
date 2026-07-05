@@ -21,7 +21,13 @@
 //! IPFS for a tokenId: it validates the target token, the metadata record
 //! (name, cost, art URL, effect ref), and the serialized edition's serial
 //! number, enforces the same four invariants, and on success emits
-//! [`Event::MetadataStaged`] (`metadata.staged`). This module is hand-written
+//! [`Event::MetadataStaged`] (`metadata.staged`).
+//!
+//! [`LinkWalletCmd`] (`LinkWalletCmd`) links a custodial/WalletConnect wallet to
+//! a player for a serialized cosmetic edition, geo-checked by jurisdiction: it
+//! validates the target token, the player, the wallet address, the jurisdiction,
+//! and the serial number, enforces the same four invariants, and on success
+//! emits [`Event::WalletLinked`] (`wallet.linked`). This module is hand-written
 //! (it does not use `shared::stub_aggregate!`) but preserves the same public
 //! surface as the scaffolded contexts: a [`CardToken`] aggregate and a
 //! [`CardTokenRepository`] port.
@@ -41,6 +47,10 @@ const MINT_CARD_TOKEN: &str = "MintCardTokenCmd";
 /// The command name [`CardToken::execute`] recognizes to pin (stage) a card's
 /// metadata record to IPFS for a tokenId.
 const STAGE_METADATA: &str = "StageMetadataCmd";
+
+/// The command name [`CardToken::execute`] recognizes to link a
+/// custodial/WalletConnect wallet to a player for a serialized cosmetic edition.
+const LINK_WALLET: &str = "LinkWalletCmd";
 
 /// The `MintCardTokenCmd` payload: which token is being minted, which staged
 /// IPFS metadata record it resolves to, and the serialized cosmetic edition's
@@ -198,6 +208,77 @@ pub struct MetadataStaged {
     pub serial_number: String,
 }
 
+/// The `LinkWalletCmd` payload: which token's cosmetic edition is being linked,
+/// the player receiving the link, the custodial/WalletConnect wallet address,
+/// the geo-check jurisdiction, and the serialized cosmetic edition's serial
+/// number. Field names use the token marketplace's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`LinkWalletCmd::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`CardToken::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkWalletCmd {
+    /// The ERC-1155 token whose cosmetic edition is being linked; must name this
+    /// CardToken.
+    pub token_id: String,
+    /// The player the wallet is being linked to.
+    pub player_id: String,
+    /// The custodial/WalletConnect wallet address being linked.
+    pub wallet_address: String,
+    /// The jurisdiction the link is geo-checked against.
+    pub jurisdiction: String,
+    /// Unique, non-reusable serial number for the cosmetic edition.
+    pub serial_number: String,
+}
+
+impl LinkWalletCmd {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = LINK_WALLET;
+
+    /// Build a command linking `wallet_address` to `player_id` for `token_id`'s
+    /// cosmetic edition `serial_number`, geo-checked against `jurisdiction`.
+    pub fn new(
+        token_id: impl Into<String>,
+        player_id: impl Into<String>,
+        wallet_address: impl Into<String>,
+        jurisdiction: impl Into<String>,
+        serial_number: impl Into<String>,
+    ) -> Self {
+        Self {
+            token_id: token_id.into(),
+            player_id: player_id.into(),
+            wallet_address: wallet_address.into(),
+            jurisdiction: jurisdiction.into(),
+            serial_number: serial_number.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`CardToken::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("LinkWalletCmd is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The wallet link that was recorded, carried by [`Event::WalletLinked`] and thus
+/// by the emitted `wallet.linked` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletLinked {
+    /// The ERC-1155 token whose cosmetic edition was linked.
+    pub token_id: String,
+    /// The player the wallet was linked to.
+    pub player_id: String,
+    /// The custodial/WalletConnect wallet address that was linked.
+    pub wallet_address: String,
+    /// The jurisdiction the link was geo-checked against.
+    pub jurisdiction: String,
+    /// Serialized cosmetic edition serial number.
+    pub serial_number: String,
+}
+
 /// Domain events emitted by [`CardToken`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -205,6 +286,9 @@ pub enum Event {
     CardTokenMinted(CardTokenMinted),
     /// A card's IPFS metadata record was staged (pinned) for its tokenId.
     MetadataStaged(MetadataStaged),
+    /// A custodial/WalletConnect wallet was linked to a player for a cosmetic
+    /// edition.
+    WalletLinked(WalletLinked),
 }
 
 impl DomainEvent for Event {
@@ -212,6 +296,7 @@ impl DomainEvent for Event {
         match self {
             Event::CardTokenMinted(_) => "card.token.minted",
             Event::MetadataStaged(_) => "metadata.staged",
+            Event::WalletLinked(_) => "wallet.linked",
         }
     }
 }
@@ -439,6 +524,66 @@ impl CardToken {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `LinkWalletCmd`: verify the command carries a valid tokenId
+    /// (naming this CardToken), playerId, wallet address, jurisdiction, and
+    /// serial number; enforce every token marketplace invariant; mark the serial
+    /// number consumed; and emit [`Event::WalletLinked`].
+    fn link_wallet(&mut self, cmd: LinkWalletCmd) -> Result<Vec<Event>, DomainError> {
+        if cmd.token_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires a valid tokenId to link a wallet",
+                self.id
+            )));
+        }
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires a valid playerId to link a wallet",
+                self.id
+            )));
+        }
+        if cmd.wallet_address.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires a valid walletAddress to link a wallet",
+                self.id
+            )));
+        }
+        if cmd.jurisdiction.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires a valid jurisdiction to geo-check the wallet link",
+                self.id
+            )));
+        }
+        if cmd.serial_number.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires a valid serialNumber to link a wallet",
+                self.id
+            )));
+        }
+        if cmd.token_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets card token '{}' but this aggregate is card token '{}'",
+                cmd.token_id, self.id
+            )));
+        }
+
+        self.ensure_ownership_verified_server_authoritatively()?;
+        self.ensure_ipfs_metadata_record_resolvable()?;
+        self.ensure_serial_number_unused(&cmd.serial_number)?;
+        self.ensure_on_chain_ownership_verified_for_render()?;
+
+        self.used_serial_numbers.push(cmd.serial_number.clone());
+
+        let event = Event::WalletLinked(WalletLinked {
+            token_id: cmd.token_id,
+            player_id: cmd.player_id,
+            wallet_address: cmd.wallet_address,
+            jurisdiction: cmd.jurisdiction,
+            serial_number: cmd.serial_number,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for CardToken {
@@ -467,6 +612,12 @@ impl Aggregate for CardToken {
                         ))
                     })?;
                 self.stage_metadata(cmd)
+            }
+            LINK_WALLET => {
+                let cmd: LinkWalletCmd = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed LinkWalletCmd payload: {e}"))
+                })?;
+                self.link_wallet(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -813,5 +964,138 @@ mod tests {
         assert_eq!(command.name, StageMetadataCmd::COMMAND);
         let decoded: StageMetadataCmd = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_stage_cmd());
+    }
+
+    // ---- LinkWalletCmd (S-62) -----------------------------------------------
+
+    /// A command linking wallet `0xWALLET` to player `player-7` for `token-01`'s
+    /// cosmetic edition `SN-0001`, geo-checked against jurisdiction `US-CA`.
+    fn valid_link_cmd() -> LinkWalletCmd {
+        LinkWalletCmd::new("token-01", "player-7", "0xWALLET", "US-CA", "SN-0001")
+    }
+
+    // Scenario: Successfully execute LinkWalletCmd.
+    #[test]
+    fn links_wallet_and_emits_wallet_linked_event() {
+        let mut token = ready_token();
+
+        let events = token
+            .execute(valid_link_cmd().into_command())
+            .expect("valid link should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "wallet.linked");
+        match &events[0] {
+            Event::WalletLinked(linked) => {
+                assert_eq!(linked.token_id, "token-01");
+                assert_eq!(linked.player_id, "player-7");
+                assert_eq!(linked.wallet_address, "0xWALLET");
+                assert_eq!(linked.jurisdiction, "US-CA");
+                assert_eq!(linked.serial_number, "SN-0001");
+            }
+            other => panic!("expected WalletLinked, got {other:?}"),
+        }
+        assert_eq!(token.version(), 1);
+        assert_eq!(token.uncommitted_events().len(), 1);
+        assert_eq!(token.uncommitted_events()[0].event_type(), "wallet.linked");
+    }
+
+    // Scenario: rejected - Ownership is verified server-authoritatively at match
+    // start; client-asserted ownership is never trusted.
+    #[test]
+    fn link_rejects_when_ownership_not_server_authoritative() {
+        let mut token = ready_token();
+        token.set_ownership_verified_server_authoritatively(false);
+
+        let err = token
+            .execute(valid_link_cmd().into_command())
+            .expect_err("client-asserted ownership must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Scenario: rejected - Every tokenId maps to a resolvable IPFS metadata
+    // record (name, cost, art URL, effect ref).
+    #[test]
+    fn link_rejects_when_ipfs_metadata_record_is_not_resolvable() {
+        let mut token = ready_token();
+        token.set_ipfs_metadata_record_resolvable(false);
+
+        let err = token
+            .execute(valid_link_cmd().into_command())
+            .expect_err("unresolvable staged metadata must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Scenario: rejected - Serialized cosmetic editions carry a unique,
+    // non-reusable serial number.
+    #[test]
+    fn link_rejects_when_serial_number_was_already_used() {
+        let mut token = ready_token();
+        token.record_used_serial_number("SN-0001");
+
+        let err = token
+            .execute(valid_link_cmd().into_command())
+            .expect_err("a reused serial number must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Scenario: rejected - A cosmetic renders on-face only after verified
+    // on-chain ownership.
+    #[test]
+    fn link_rejects_when_on_chain_ownership_not_verified_for_render() {
+        let mut token = ready_token();
+        token.set_on_chain_ownership_verified_for_render(false);
+
+        let err = token
+            .execute(valid_link_cmd().into_command())
+            .expect_err("unverified on-chain ownership must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // A link command naming a different CardToken is rejected before any
+    // invariant runs.
+    #[test]
+    fn link_rejects_command_for_a_different_token() {
+        let mut token = ready_token();
+        let cmd = LinkWalletCmd::new("token-99", "player-7", "0xWALLET", "US-CA", "SN-0001");
+
+        let err = token
+            .execute(cmd.into_command())
+            .expect_err("a command for another token must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Link commands missing any required field are rejected.
+    #[test]
+    fn link_rejects_command_with_missing_fields() {
+        let cmds = [
+            LinkWalletCmd::new("   ", "player-7", "0xWALLET", "US-CA", "SN-0001"),
+            LinkWalletCmd::new("token-01", "   ", "0xWALLET", "US-CA", "SN-0001"),
+            LinkWalletCmd::new("token-01", "player-7", "   ", "US-CA", "SN-0001"),
+            LinkWalletCmd::new("token-01", "player-7", "0xWALLET", "   ", "SN-0001"),
+            LinkWalletCmd::new("token-01", "player-7", "0xWALLET", "US-CA", "   "),
+        ];
+        for cmd in cmds {
+            let mut token = ready_token();
+            let err = token
+                .execute(cmd.into_command())
+                .expect_err("a command with a missing field must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(token.version(), 0);
+        }
+    }
+
+    #[test]
+    fn link_command_payload_round_trips() {
+        let cmd = valid_link_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, LinkWalletCmd::COMMAND);
+        let decoded: LinkWalletCmd = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_link_cmd());
     }
 }
