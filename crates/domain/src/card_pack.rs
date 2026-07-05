@@ -17,11 +17,15 @@
 //!    rules are honored across a player's openings; a pack whose roll violates
 //!    those rules may not be revealed.
 //!
-//! The only command implemented so far is [`RevealPackContents`]
-//! (`RevealPackContentsCmd`): it finalizes and surfaces the rolled contents for
+//! Two commands are implemented. [`OpenPack`] (`OpenPackCmd`) rolls a pack's
+//! contents from the seeded table for a player — given a packId, playerId, and
+//! raritySeed it enforces every invariant, marks the pack opened, and on success
+//! emits [`Event::PackOpened`] (`pack.opened`). [`RevealPackContents`]
+//! (`RevealPackContentsCmd`) then finalizes and surfaces the rolled contents for
 //! granting, enforcing every invariant, and on success emits
-//! [`Event::PackContentsRevealed`] (`pack.contents.revealed`). This module is
-//! hand-written (it does not use `shared::stub_aggregate!`) but preserves the
+//! [`Event::PackContentsRevealed`] (`pack.contents.revealed`). Both commands
+//! re-check the same three invariants against the aggregate's state. This module
+//! is hand-written (it does not use `shared::stub_aggregate!`) but preserves the
 //! same public surface — a [`CardPack`] aggregate and a [`CardPackRepository`]
 //! port — so any persistence adapters compile against it unchanged, exactly like
 //! its sibling [`Order`](crate::order).
@@ -34,8 +38,53 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "CardPack";
 
-/// The command name [`CardPack::execute`] recognizes.
+/// The command name that opens a pack, rolling its contents from the seeded
+/// table.
+const OPEN_PACK: &str = "OpenPackCmd";
+
+/// The command name that reveals an opened pack's rolled contents for granting.
 const REVEAL_PACK_CONTENTS: &str = "RevealPackContentsCmd";
+
+/// The `OpenPackCmd` payload: which CardPack is being opened, for which player,
+/// and the raritySeed that drives the roll from the seeded RNG table. Field names
+/// use the shop service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`OpenPack::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`CardPack::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenPack {
+    /// The CardPack being opened; must name this CardPack, and must be non-empty.
+    pub pack_id: String,
+    /// The player opening the pack; must be non-empty.
+    pub player_id: String,
+    /// The seed driving the roll from the seeded RNG table; must be non-zero (a
+    /// zero seed models an unseeded, and thus invalid, roll).
+    pub rarity_seed: u64,
+}
+
+impl OpenPack {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = OPEN_PACK;
+
+    /// Build a command opening `pack_id` for `player_id` with `rarity_seed`.
+    pub fn new(pack_id: impl Into<String>, player_id: impl Into<String>, rarity_seed: u64) -> Self {
+        Self {
+            pack_id: pack_id.into(),
+            player_id: player_id.into(),
+            rarity_seed,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`CardPack::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("OpenPack is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
 
 /// The `RevealPackContentsCmd` payload: which CardPack is being revealed. Field
 /// names use the shop service's `camelCase` schema.
@@ -71,6 +120,18 @@ impl RevealPackContents {
     }
 }
 
+/// The pack that was opened, carried by [`Event::PackOpened`] and thus by the
+/// emitted `pack.opened` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackOpened {
+    /// The CardPack that was opened.
+    pub pack_id: String,
+    /// The player that opened it.
+    pub player_id: String,
+    /// The seed the contents were rolled from.
+    pub rarity_seed: u64,
+}
+
 /// The pack whose contents were revealed, carried by
 /// [`Event::PackContentsRevealed`] and thus by the emitted
 /// `pack.contents.revealed` event.
@@ -83,6 +144,8 @@ pub struct PackContentsRevealed {
 /// Domain events emitted by [`CardPack`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// The pack was opened and its contents rolled from the seeded table.
+    PackOpened(PackOpened),
     /// The pack's rolled contents were finalized and surfaced for granting.
     PackContentsRevealed(PackContentsRevealed),
 }
@@ -90,6 +153,7 @@ pub enum Event {
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
+            Event::PackOpened(_) => "pack.opened",
             Event::PackContentsRevealed(_) => "pack.contents.revealed",
         }
     }
@@ -214,6 +278,59 @@ impl CardPack {
         Ok(())
     }
 
+    /// Handle `OpenPackCmd`: verify the command carries a valid packId (naming
+    /// this CardPack), a valid playerId, and a valid raritySeed; enforce every
+    /// invariant (seeded RNG / fixed rarity distribution, opened-exactly-once, and
+    /// duplicate-protection / pity); mark the pack opened; and emit
+    /// [`Event::PackOpened`].
+    fn open_pack(&mut self, cmd: OpenPack) -> Result<Vec<Event>, DomainError> {
+        // A valid packId must be supplied.
+        if cmd.pack_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card pack '{}' requires a valid packId to open",
+                self.id
+            )));
+        }
+        // The command must name the CardPack it is dispatched to.
+        if cmd.pack_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets card pack '{}' but this aggregate is card pack '{}'",
+                cmd.pack_id, self.id
+            )));
+        }
+        // A valid playerId must be supplied.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card pack '{}' requires a valid playerId to open",
+                self.id
+            )));
+        }
+        // A valid (non-zero, i.e. seeded) raritySeed must be supplied.
+        if cmd.rarity_seed == 0 {
+            return Err(DomainError::InvariantViolation(format!(
+                "card pack '{}' requires a valid raritySeed to open; a zero seed is unseeded",
+                self.id
+            )));
+        }
+
+        // Enforce every invariant before recording the open.
+        self.ensure_contents_from_seeded_rng()?;
+        self.ensure_not_already_opened()?;
+        self.ensure_duplicate_protection_honored()?;
+
+        // Mark the pack opened so a repeated open is rejected by the
+        // opened-exactly-once invariant — revealed contents are immutable.
+        self.already_opened = true;
+
+        let event = Event::PackOpened(PackOpened {
+            pack_id: cmd.pack_id,
+            player_id: cmd.player_id,
+            rarity_seed: cmd.rarity_seed,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
     /// Handle `RevealPackContentsCmd`: verify the command carries a valid packId
     /// (naming this CardPack), enforce every invariant (seeded RNG / fixed rarity
     /// distribution, opened-exactly-once, and duplicate-protection / pity), mark
@@ -260,6 +377,12 @@ impl Aggregate for CardPack {
 
     fn execute(&mut self, command: Command) -> Result<Vec<Self::Event>, DomainError> {
         match command.name.as_str() {
+            OPEN_PACK => {
+                let cmd: OpenPack = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed OpenPackCmd payload: {e}"))
+                })?;
+                self.open_pack(cmd)
+            }
             REVEAL_PACK_CONTENTS => {
                 let cmd: RevealPackContents =
                     serde_json::from_slice(&command.payload).map_err(|e| {
@@ -302,6 +425,154 @@ mod tests {
         RevealPackContents::new("cp-01")
     }
 
+    /// A command opening card pack `cp-01` for player `p-01` with a seeded roll.
+    fn valid_open_cmd() -> OpenPack {
+        OpenPack::new("cp-01", "p-01", 42)
+    }
+
+    // Scenario: Successfully execute OpenPackCmd.
+    #[test]
+    fn opens_and_emits_pack_opened_event() {
+        let mut pack = ready_pack();
+
+        let events = pack
+            .execute(valid_open_cmd().into_command())
+            .expect("valid open should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "pack.opened");
+        match &events[0] {
+            Event::PackOpened(opened) => {
+                assert_eq!(opened.pack_id, "cp-01");
+                assert_eq!(opened.player_id, "p-01");
+                assert_eq!(opened.rarity_seed, 42);
+            }
+            other => panic!("expected PackOpened, got {other:?}"),
+        }
+        // The CardPack recorded the event and is now marked opened.
+        assert_eq!(pack.version(), 1);
+        assert_eq!(pack.uncommitted_events().len(), 1);
+        assert_eq!(pack.uncommitted_events()[0].event_type(), "pack.opened");
+    }
+
+    // Scenario: rejected — Pack contents are drawn from a seeded RNG table with a
+    // fixed rarity distribution.
+    #[test]
+    fn open_rejects_when_contents_not_from_seeded_rng() {
+        let mut pack = ready_pack();
+        // The roll came from outside the seeded RNG table / a tampered distribution.
+        pack.set_contents_from_seeded_rng(false);
+
+        let err = pack
+            .execute(valid_open_cmd().into_command())
+            .expect_err("a pack rolled outside the seeded RNG table must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pack.version(), 0);
+    }
+
+    // Scenario: rejected — A pack may be opened exactly once; revealed contents
+    // are immutable.
+    #[test]
+    fn open_rejects_when_already_opened() {
+        let mut pack = ready_pack();
+        // The pack has already been opened once.
+        pack.set_already_opened(true);
+
+        let err = pack
+            .execute(valid_open_cmd().into_command())
+            .expect_err("an already-opened pack must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pack.version(), 0);
+    }
+
+    // Opened-exactly-once in practice: a second open of the same pack is rejected
+    // because the first marked it opened (revealed contents immutable).
+    #[test]
+    fn open_rejects_a_repeated_open_of_the_same_pack() {
+        let mut pack = ready_pack();
+
+        pack.execute(valid_open_cmd().into_command())
+            .expect("first open should succeed");
+        // The pack is asked to open a second time.
+        let err = pack
+            .execute(valid_open_cmd().into_command())
+            .expect_err("a repeated open must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        // Still exactly one recorded event — contents are immutable.
+        assert_eq!(pack.version(), 1);
+        assert_eq!(pack.uncommitted_events().len(), 1);
+    }
+
+    // Scenario: rejected — Duplicate-protection / pity rules are honored across a
+    // player's openings.
+    #[test]
+    fn open_rejects_when_duplicate_protection_violated() {
+        let mut pack = ready_pack();
+        // The roll violates duplicate-protection / pity rules.
+        pack.set_duplicate_protection_honored(false);
+
+        let err = pack
+            .execute(valid_open_cmd().into_command())
+            .expect_err("a roll violating duplicate-protection / pity rules must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pack.version(), 0);
+    }
+
+    // A command naming a different CardPack is rejected before any invariant runs.
+    #[test]
+    fn open_rejects_command_for_a_different_pack() {
+        let mut pack = ready_pack();
+        let cmd = OpenPack::new("cp-99", "p-01", 42);
+
+        let err = pack
+            .execute(cmd.into_command())
+            .expect_err("a command for another pack must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pack.version(), 0);
+    }
+
+    // Commands missing the required packId are rejected.
+    #[test]
+    fn open_rejects_command_with_missing_pack_id() {
+        let mut pack = ready_pack();
+        let err = pack
+            .execute(OpenPack::new("   ", "p-01", 42).into_command())
+            .expect_err("a command with a missing packId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pack.version(), 0);
+    }
+
+    // Commands missing the required playerId are rejected.
+    #[test]
+    fn open_rejects_command_with_missing_player_id() {
+        let mut pack = ready_pack();
+        let err = pack
+            .execute(OpenPack::new("cp-01", "   ", 42).into_command())
+            .expect_err("a command with a missing playerId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pack.version(), 0);
+    }
+
+    // Commands with an unseeded (zero) raritySeed are rejected.
+    #[test]
+    fn open_rejects_command_with_invalid_rarity_seed() {
+        let mut pack = ready_pack();
+        let err = pack
+            .execute(OpenPack::new("cp-01", "p-01", 0).into_command())
+            .expect_err("a command with a zero raritySeed must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pack.version(), 0);
+    }
+
+    #[test]
+    fn open_command_payload_round_trips() {
+        let cmd = valid_open_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, OpenPack::COMMAND);
+        let decoded: OpenPack = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_open_cmd());
+    }
+
     // Scenario: Successfully execute RevealPackContentsCmd.
     #[test]
     fn reveals_and_emits_pack_contents_revealed_event() {
@@ -317,6 +588,7 @@ mod tests {
             Event::PackContentsRevealed(revealed) => {
                 assert_eq!(revealed.pack_id, "cp-01");
             }
+            other => panic!("expected PackContentsRevealed, got {other:?}"),
         }
         // The CardPack recorded the event.
         assert_eq!(pack.version(), 1);
