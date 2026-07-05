@@ -18,11 +18,14 @@
 //!    Outfit if it is present (quantity ≥ 1) in the collection; a base card at
 //!    quantity zero cannot carry a cosmetic.
 //!
-//! Two commands are implemented:
+//! Three commands are implemented:
 //!
 //! - [`EquipCosmetic`] (`EquipCosmeticCmd`): equips a cosmetic skin onto an
 //!   owned base card, enforcing every invariant, and on success emits
 //!   [`Event::CosmeticEquipped`] (`cosmetic.equipped`).
+//! - [`UnequipCosmetic`] (`UnequipCosmeticCmd`): removes the equipped cosmetic
+//!   from an owned base card, enforcing every invariant, and on success emits
+//!   [`Event::CosmeticUnequipped`] (`cosmetic.unequipped`).
 //! - [`GrantCards`] (`GrantCardsCmd`): adds cards to the collection from packs,
 //!   rewards, or fulfillment, enforcing every invariant, and on success emits
 //!   [`Event::CardsGranted`] (`cards.granted`).
@@ -42,6 +45,7 @@ const AGGREGATE_TYPE: &str = "PlayerCollection";
 
 /// The command names [`PlayerCollection::execute`] recognizes.
 const EQUIP_COSMETIC: &str = "EquipCosmeticCmd";
+const UNEQUIP_COSMETIC: &str = "UnequipCosmeticCmd";
 const GRANT_CARDS: &str = "GrantCardsCmd";
 
 /// The `EquipCosmeticCmd` payload: which player equips which cosmetic skin onto
@@ -86,6 +90,49 @@ impl EquipCosmetic {
     pub fn into_command(&self) -> Command {
         // Serialization of a plain data struct to a Vec cannot fail here.
         let payload = serde_json::to_vec(self).expect("EquipCosmetic is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The `UnequipCosmeticCmd` payload: which player removes the equipped cosmetic
+/// skin from which owned base card. Field names use the collection service's
+/// `camelCase` schema.
+///
+/// Unlike [`EquipCosmetic`] there is no `cosmeticSkinRef`: unequipping clears
+/// whatever cosmetic the base card currently carries, so only the owning player
+/// and the target base card need to be named.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`UnequipCosmetic::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`PlayerCollection::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnequipCosmetic {
+    /// Identity of the player removing the skin; must name the player this
+    /// collection belongs to, and must be non-empty.
+    pub player_id: String,
+    /// The owned base card the cosmetic skin is removed from; must be non-empty.
+    pub base_card_id: String,
+}
+
+impl UnequipCosmetic {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = UNEQUIP_COSMETIC;
+
+    /// Build a command removing the equipped cosmetic from `base_card_id` for
+    /// `player_id`.
+    pub fn new(player_id: impl Into<String>, base_card_id: impl Into<String>) -> Self {
+        Self {
+            player_id: player_id.into(),
+            base_card_id: base_card_id.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`PlayerCollection::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("UnequipCosmetic is always serializable");
         Command::with_payload(Self::COMMAND, payload)
     }
 }
@@ -176,6 +223,16 @@ pub struct CosmeticEquipped {
     pub cosmetic_skin_ref: String,
 }
 
+/// The cosmetic that was removed, carried by [`Event::CosmeticUnequipped`] and
+/// thus by the emitted `cosmetic.unequipped` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CosmeticUnequipped {
+    /// The player who removed the skin.
+    pub player_id: String,
+    /// The owned base card the skin was removed from.
+    pub base_card_id: String,
+}
+
 /// The cards that were granted, carried by [`Event::CardsGranted`] and thus by
 /// the emitted `cards.granted` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +250,8 @@ pub struct CardsGranted {
 pub enum Event {
     /// A cosmetic skin was equipped onto an owned base card.
     CosmeticEquipped(CosmeticEquipped),
+    /// The equipped cosmetic skin was removed from an owned base card.
+    CosmeticUnequipped(CosmeticUnequipped),
     /// Cards were granted to the collection from a pack, reward, or fulfillment.
     CardsGranted(CardsGranted),
 }
@@ -201,6 +260,7 @@ impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::CosmeticEquipped(_) => "cosmetic.equipped",
+            Event::CosmeticUnequipped(_) => "cosmetic.unequipped",
             Event::CardsGranted(_) => "cards.granted",
         }
     }
@@ -406,6 +466,46 @@ impl PlayerCollection {
         Ok(vec![event])
     }
 
+    /// Handle `UnequipCosmeticCmd`: verify the command carries a valid player id
+    /// (naming this collection's player) and base card id, enforce every
+    /// invariant (server-authoritative, owned base card, non-negative quantity,
+    /// and present-for-inclusion), and emit [`Event::CosmeticUnequipped`].
+    fn unequip_cosmetic(&mut self, cmd: UnequipCosmetic) -> Result<Vec<Event>, DomainError> {
+        // A valid playerId and baseCardId must be supplied.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "collection '{}' requires a valid playerId to unequip a cosmetic",
+                self.id
+            )));
+        }
+        if cmd.base_card_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "collection '{}' requires a valid baseCardId to unequip a cosmetic",
+                self.id
+            )));
+        }
+        // The command must name the player this collection actually belongs to.
+        if cmd.player_id != self.player_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets player '{}' but this collection belongs to '{}'",
+                cmd.player_id, self.player_id
+            )));
+        }
+
+        // Enforce every invariant before recording the unequip.
+        self.ensure_server_resolved()?;
+        self.ensure_owns_base_card(&cmd.base_card_id)?;
+        self.ensure_quantity_non_negative(&cmd.base_card_id)?;
+        self.ensure_present_for_inclusion(&cmd.base_card_id)?;
+
+        let event = Event::CosmeticUnequipped(CosmeticUnequipped {
+            player_id: cmd.player_id,
+            base_card_id: cmd.base_card_id,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
     /// Handle `GrantCardsCmd`: verify the command carries a valid player id
     /// (naming this collection's player), a source, and at least one well-formed
     /// card grant, enforce every collection invariant (server-authoritative,
@@ -488,6 +588,15 @@ impl Aggregate for PlayerCollection {
                     ))
                 })?;
                 self.equip_cosmetic(cmd)
+            }
+            UNEQUIP_COSMETIC => {
+                let cmd: UnequipCosmetic =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed UnequipCosmeticCmd payload: {e}"
+                        ))
+                    })?;
+                self.unequip_cosmetic(cmd)
             }
             GRANT_CARDS => {
                 let cmd: GrantCards = serde_json::from_slice(&command.payload).map_err(|e| {
@@ -670,6 +779,137 @@ mod tests {
         assert_eq!(command.name, EquipCosmetic::COMMAND);
         let decoded: EquipCosmetic = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // ---- UnequipCosmeticCmd (S-38) ----------------------------------------
+
+    /// A command removing the equipped cosmetic from base card `c-01` for `p-01`.
+    fn valid_unequip_cmd() -> UnequipCosmetic {
+        UnequipCosmetic::new("p-01", "c-01")
+    }
+
+    // Scenario: Successfully execute UnequipCosmeticCmd.
+    #[test]
+    fn unequips_and_emits_cosmetic_unequipped_event() {
+        let mut collection = ready_collection();
+
+        let events = collection
+            .execute(valid_unequip_cmd().into_command())
+            .expect("valid unequip should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "cosmetic.unequipped");
+        match &events[0] {
+            Event::CosmeticUnequipped(unequipped) => {
+                assert_eq!(unequipped.player_id, "p-01");
+                assert_eq!(unequipped.base_card_id, "c-01");
+            }
+            other => panic!("expected CosmeticUnequipped, got {other:?}"),
+        }
+        // The collection recorded the event.
+        assert_eq!(collection.version(), 1);
+        assert_eq!(collection.uncommitted_events().len(), 1);
+        assert_eq!(
+            collection.uncommitted_events()[0].event_type(),
+            "cosmetic.unequipped"
+        );
+    }
+
+    // Scenario: rejected — a card may only be included in an Outfit if it is
+    // present (qty ≥ 1) in the collection.
+    #[test]
+    fn unequip_rejects_when_base_card_not_present() {
+        let mut collection = ready_collection();
+        // Owned, but at quantity zero — present-for-inclusion requires qty ≥ 1.
+        collection.set_base_card_quantity(0);
+
+        let err = collection
+            .execute(valid_unequip_cmd().into_command())
+            .expect_err("an at-quantity-zero base card must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // Scenario: rejected — owned card quantities are always non-negative.
+    #[test]
+    fn unequip_rejects_when_quantity_negative() {
+        let mut collection = ready_collection();
+        // A negative owned quantity is a corrupt state.
+        collection.set_base_card_quantity(-1);
+
+        let err = collection
+            .execute(valid_unequip_cmd().into_command())
+            .expect_err("a negative owned quantity must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // Scenario: rejected — a cosmetic skin may only be equipped onto a base card
+    // the player actually owns.
+    #[test]
+    fn unequip_rejects_when_base_card_not_owned() {
+        let mut collection = ready_collection();
+        // The base card the skin targets is not in the collection at all.
+        collection.set_base_card_in_collection(false);
+
+        let err = collection
+            .execute(valid_unequip_cmd().into_command())
+            .expect_err("unequipping from an unowned base card must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // Scenario: rejected — cosmetic equips are resolved server-side and never
+    // trusted from the client.
+    #[test]
+    fn unequip_rejects_when_client_asserted() {
+        let mut collection = ready_collection();
+        // The unequip was asserted by the client, not resolved server-side.
+        collection.set_server_resolved(false);
+
+        let err = collection
+            .execute(valid_unequip_cmd().into_command())
+            .expect_err("a client-asserted unequip must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // A command naming a different player is rejected before any invariant runs.
+    #[test]
+    fn unequip_rejects_command_for_a_different_player() {
+        let mut collection = ready_collection();
+        let cmd = UnequipCosmetic::new("p-99", "c-01");
+
+        let err = collection
+            .execute(cmd.into_command())
+            .expect_err("a command for another player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // Commands missing any required field are rejected.
+    #[test]
+    fn unequip_rejects_command_with_missing_fields() {
+        for cmd in [
+            UnequipCosmetic::new("   ", "c-01"),
+            UnequipCosmetic::new("p-01", "   "),
+        ] {
+            let mut collection = ready_collection();
+            let err = collection
+                .execute(cmd.into_command())
+                .expect_err("a command with a missing field must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(collection.version(), 0);
+        }
+    }
+
+    #[test]
+    fn unequip_command_payload_round_trips() {
+        let cmd = valid_unequip_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, UnequipCosmetic::COMMAND);
+        let decoded: UnequipCosmetic = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_unequip_cmd());
     }
 
     // ---- GrantCardsCmd (S-36) ---------------------------------------------
