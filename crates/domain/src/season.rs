@@ -20,10 +20,12 @@
 //!    [`MAX_LEADERBOARD_ENTRIES`] (1000) and requires no login; a leaderboard
 //!    larger than the cap is inconsistent.
 //!
-//! The only command implemented so far is [`SnapshotSeason`]
-//! (`SnapshotSeasonCmd`): it freezes the final standings at season end,
-//! enforcing every invariant, and on success emits [`Event::SeasonSnapshotted`]
-//! (`season.snapshotted`). This module is hand-written (it no longer uses
+//! Two commands are implemented. [`OpenSeason`] (`OpenSeasonCmd`) starts a new
+//! season and applies its soft reset to standings, and on success emits
+//! [`Event::SeasonOpened`] (`season.opened`). [`SnapshotSeason`]
+//! (`SnapshotSeasonCmd`) freezes the final standings at season end and on
+//! success emits [`Event::SeasonSnapshotted`] (`season.snapshotted`). Both
+//! enforce every invariant. This module is hand-written (it no longer uses
 //! `shared::stub_aggregate!`) but preserves the same public surface — a
 //! [`Season`] aggregate and a [`SeasonRepository`] port — so the persistence
 //! adapters in `crates/mocks` keep compiling unchanged.
@@ -36,8 +38,11 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "Season";
 
-/// The command name [`Season::execute`] recognizes.
+/// The `SnapshotSeasonCmd` command name [`Season::execute`] recognizes.
 const SNAPSHOT_SEASON: &str = "SnapshotSeasonCmd";
+
+/// The `OpenSeasonCmd` command name [`Season::execute`] recognizes.
+const OPEN_SEASON: &str = "OpenSeasonCmd";
 
 /// A season runs on a fixed cadence of this many weeks. A season whose length
 /// does not match is off-cadence and inconsistent.
@@ -92,6 +97,64 @@ impl SnapshotSeason {
     }
 }
 
+/// The `OpenSeasonCmd` payload: start a new season and apply its soft reset. The
+/// field names are the ranked service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`OpenSeason::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`Season::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenSeason {
+    /// Identity of the season being opened; must name the season this aggregate
+    /// records, and must be non-empty.
+    pub season_id: String,
+    /// When the season starts. Must be a non-empty date; carried onto the
+    /// emitted `season.opened` event.
+    pub start_date: String,
+    /// The soft-reset policy to apply to standings at open. A soft reset is
+    /// applied to standings at season open, so this must be non-empty.
+    pub soft_reset_policy: String,
+}
+
+impl OpenSeason {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = OPEN_SEASON;
+
+    /// Build a command opening `season_id` on `start_date` with `soft_reset_policy`.
+    pub fn new(
+        season_id: impl Into<String>,
+        start_date: impl Into<String>,
+        soft_reset_policy: impl Into<String>,
+    ) -> Self {
+        Self {
+            season_id: season_id.into(),
+            start_date: start_date.into(),
+            soft_reset_policy: soft_reset_policy.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`Season::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("OpenSeason is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The details of a freshly opened season, carried by [`Event::SeasonOpened`]
+/// and thus by the emitted `season.opened` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeasonOpened {
+    /// The season that was opened.
+    pub season_id: String,
+    /// When the season starts.
+    pub start_date: String,
+    /// The soft-reset policy applied to standings at open.
+    pub soft_reset_policy: String,
+}
+
 /// The frozen final standings, carried by [`Event::SeasonSnapshotted`] and thus
 /// by the emitted `season.snapshotted` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +168,8 @@ pub struct SeasonSnapshotted {
 /// Domain events emitted by [`Season`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// A new season was started and its soft reset applied to standings.
+    SeasonOpened(SeasonOpened),
     /// The final standings were frozen at season end: the snapshot is now
     /// immutable and is the basis for reward distribution.
     SeasonSnapshotted(SeasonSnapshotted),
@@ -113,6 +178,7 @@ pub enum Event {
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
+            Event::SeasonOpened(_) => "season.opened",
             Event::SeasonSnapshotted(_) => "season.snapshotted",
         }
     }
@@ -299,6 +365,62 @@ impl Season {
         Ok(())
     }
 
+    /// Handle `OpenSeasonCmd`: verify the command targets this season with a
+    /// valid identity, start date, and soft-reset policy, enforce every invariant
+    /// (cadence & singularity, snapshot immutability, reward-once, soft reset at
+    /// open, and leaderboard cap), apply the soft reset, and emit
+    /// [`Event::SeasonOpened`].
+    fn open_season(&mut self, cmd: OpenSeason) -> Result<Vec<Event>, DomainError> {
+        // A valid seasonId must be supplied.
+        if cmd.season_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "season '{}' requires a valid seasonId to open",
+                self.id
+            )));
+        }
+        // The command must name the season this aggregate actually records.
+        if cmd.season_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets season '{}' but this aggregate records '{}'",
+                cmd.season_id, self.id
+            )));
+        }
+        // A valid startDate must be supplied.
+        if cmd.start_date.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "season '{}' requires a valid startDate to open",
+                self.id
+            )));
+        }
+        // A valid softResetPolicy must be supplied: a soft reset is applied to
+        // standings at season open.
+        if cmd.soft_reset_policy.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "season '{}' requires a valid softResetPolicy: a soft reset is applied to \
+                 standings at season open",
+                self.id
+            )));
+        }
+
+        // Enforce every invariant before opening the season.
+        self.ensure_cadence_and_single_open()?;
+        self.ensure_snapshot_not_taken()?;
+        self.ensure_rewards_not_distributed()?;
+        self.ensure_soft_reset_applied()?;
+        self.ensure_leaderboard_within_cap()?;
+
+        let event = Event::SeasonOpened(SeasonOpened {
+            season_id: cmd.season_id,
+            start_date: cmd.start_date,
+            soft_reset_policy: cmd.soft_reset_policy,
+        });
+        // The season is now open with its soft reset applied to standings.
+        self.status = SeasonStatus::Open;
+        self.soft_reset_applied = true;
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
     /// Handle `SnapshotSeasonCmd`: verify the command targets this season with a
     /// valid identity, enforce every invariant (cadence & singularity, snapshot
     /// immutability, reward-once, soft reset at open, and leaderboard cap), freeze
@@ -346,6 +468,12 @@ impl Aggregate for Season {
 
     fn execute(&mut self, command: Command) -> Result<Vec<Self::Event>, DomainError> {
         match command.name.as_str() {
+            OPEN_SEASON => {
+                let cmd: OpenSeason = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed OpenSeasonCmd payload: {e}"))
+                })?;
+                self.open_season(cmd)
+            }
             SNAPSHOT_SEASON => {
                 let cmd: SnapshotSeason =
                     serde_json::from_slice(&command.payload).map_err(|e| {
@@ -407,6 +535,7 @@ mod tests {
                 assert_eq!(snapshot.season_id, "s-01");
                 assert_eq!(snapshot.leaderboard_size, MAX_LEADERBOARD_ENTRIES);
             }
+            other => panic!("expected SeasonSnapshotted, got {other:?}"),
         }
         // The season recorded the event and is now frozen.
         assert_eq!(season.status(), SeasonStatus::Snapshotted);
@@ -552,5 +681,180 @@ mod tests {
         assert_eq!(command.name, SnapshotSeason::COMMAND);
         let decoded: SnapshotSeason = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // ---- OpenSeasonCmd ----
+
+    /// A command opening `s-01` with a valid start date and soft-reset policy.
+    fn valid_open_cmd() -> OpenSeason {
+        OpenSeason::new("s-01", "2026-07-06", "decay-to-floor")
+    }
+
+    // Scenario: Successfully execute OpenSeasonCmd — a valid Season, seasonId,
+    // startDate, and softResetPolicy yield a season.opened event.
+    #[test]
+    fn opens_and_emits_season_opened_event() {
+        let mut season = ready_season();
+
+        let events = season
+            .execute(valid_open_cmd().into_command())
+            .expect("valid open should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "season.opened");
+        match &events[0] {
+            Event::SeasonOpened(opened) => {
+                assert_eq!(opened.season_id, "s-01");
+                assert_eq!(opened.start_date, "2026-07-06");
+                assert_eq!(opened.soft_reset_policy, "decay-to-floor");
+            }
+            other => panic!("expected SeasonOpened, got {other:?}"),
+        }
+        // The season is open with its soft reset applied and recorded the event.
+        assert_eq!(season.status(), SeasonStatus::Open);
+        assert_eq!(season.version(), 1);
+        assert_eq!(season.uncommitted_events().len(), 1);
+        assert_eq!(season.uncommitted_events()[0].event_type(), "season.opened");
+    }
+
+    // Scenario: rejected — a season runs on a 12-week cadence; only one season is
+    // open at a time.
+    #[test]
+    fn open_rejects_when_off_cadence() {
+        let mut season = ready_season();
+        season.set_cadence(SEASON_CADENCE_WEEKS - 4, 1);
+
+        let err = season
+            .execute(valid_open_cmd().into_command())
+            .expect_err("an off-cadence season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    #[test]
+    fn open_rejects_when_multiple_seasons_open() {
+        let mut season = ready_season();
+        season.set_cadence(SEASON_CADENCE_WEEKS, 2);
+
+        let err = season
+            .execute(valid_open_cmd().into_command())
+            .expect_err("opening while another season is open must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — the end-of-season snapshot is immutable once taken.
+    #[test]
+    fn open_rejects_when_already_snapshotted() {
+        let mut season = ready_season();
+        season.set_status(SeasonStatus::Snapshotted);
+
+        let err = season
+            .execute(valid_open_cmd().into_command())
+            .expect_err("opening a snapshotted season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — season rewards are distributed exactly once per
+    // eligible player per season.
+    #[test]
+    fn open_rejects_when_rewards_already_distributed() {
+        let mut season = ready_season();
+        season.set_rewards_distributed(true);
+
+        let err = season
+            .execute(valid_open_cmd().into_command())
+            .expect_err("opening after rewards were distributed must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — a soft reset is applied to standings at season open.
+    #[test]
+    fn open_rejects_when_soft_reset_not_applied() {
+        let mut season = ready_season();
+        season.set_soft_reset_applied(false);
+
+        let err = season
+            .execute(valid_open_cmd().into_command())
+            .expect_err("a missing season-open soft reset must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // The soft-reset invariant is also violated by an empty softResetPolicy: the
+    // reset cannot be applied to standings at open.
+    #[test]
+    fn open_rejects_without_a_soft_reset_policy() {
+        let mut season = ready_season();
+        let cmd = OpenSeason::new("s-01", "2026-07-06", "  ");
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a missing softResetPolicy must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — the public leaderboard exposes at most the top 1000.
+    #[test]
+    fn open_rejects_when_leaderboard_exceeds_cap() {
+        let mut season = ready_season();
+        season.set_leaderboard_size(MAX_LEADERBOARD_ENTRIES + 1);
+
+        let err = season
+            .execute(valid_open_cmd().into_command())
+            .expect_err("an over-cap leaderboard must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // A command naming a different season is rejected.
+    #[test]
+    fn open_rejects_command_for_a_different_season() {
+        let mut season = ready_season();
+        let cmd = OpenSeason::new("s-99", "2026-07-06", "decay-to-floor");
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a command for another season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // A command with no seasonId is rejected.
+    #[test]
+    fn open_rejects_command_without_a_season_id() {
+        let mut season = ready_season();
+        let cmd = OpenSeason::new("   ", "2026-07-06", "decay-to-floor");
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a missing seasonId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // A command with no startDate is rejected.
+    #[test]
+    fn open_rejects_command_without_a_start_date() {
+        let mut season = ready_season();
+        let cmd = OpenSeason::new("s-01", "  ", "decay-to-floor");
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a missing startDate must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    #[test]
+    fn open_command_payload_round_trips() {
+        let cmd = valid_open_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, OpenSeason::COMMAND);
+        let decoded: OpenSeason = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_open_cmd());
     }
 }
