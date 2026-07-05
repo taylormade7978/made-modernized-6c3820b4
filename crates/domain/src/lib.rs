@@ -6,6 +6,7 @@
 //! non-GameSession contexts here keeps the domain layer cohesive while the
 //! GameSession rules stay isolated for their dual native/WASM build.
 
+pub mod battle_pass;
 pub mod boss_definition;
 pub mod card_definition;
 pub mod card_pack;
