@@ -1,20 +1,23 @@
 //! CardDefinition bounded context — the catalog of playable card definitions.
 //!
 //! This is the first bounded context to grow real behavior beyond the
-//! [`shared::stub_aggregate!`] scaffold. It handles two write commands:
-//! [`DefineCardCmd`], which catalogs a new card, and [`ReviseCardCmd`], which
-//! amends an existing card's definition (balance/text). Both validate the
-//! proposed fields against the catalog schema and, when every invariant holds,
-//! emit a [`Event::CardDefined`] (`card.defined`) or [`Event::CardRevised`]
-//! (`card.revised`) event respectively.
+//! [`shared::stub_aggregate!`] scaffold. It handles three write commands:
+//! [`DefineCardCmd`], which catalogs a new card, [`ReviseCardCmd`], which
+//! amends an existing card's definition (balance/text), and
+//! [`DeprecateCardCmd`], which retires a card from legal construction going
+//! forward. Each validates the proposed fields against the catalog schema and,
+//! when every invariant holds, emits a [`Event::CardDefined`] (`card.defined`),
+//! [`Event::CardRevised`] (`card.revised`), or [`Event::CardDeprecated`]
+//! (`card.deprecated`) event respectively.
 //!
 //! The aggregate follows the kernel's `execute(cmd)` port: [`CardDefinition`]
 //! decodes the command's opaque JSON payload into a typed command, parses each
 //! raw field into a value object (so illegal states become unrepresentable past
 //! the boundary), enforces the catalog invariants via the shared
 //! [`validate_card_fields`] check, and records the resulting event on its
-//! [`shared::AggregateRoot`]. Definition and revision run the *same* invariants,
-//! so an amendment can never move a card into an illegal state.
+//! [`shared::AggregateRoot`]. Definition, revision, and deprecation run the
+//! *same* invariants, so neither an amendment nor a retirement can be recorded
+//! against a card that would sit in an illegal state.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +33,10 @@ const DEFINE_CARD: &str = "DefineCardCmd";
 /// The command name [`CardDefinition::execute`] recognizes to amend an existing
 /// card definition (balance/text) and re-validate it.
 const REVISE_CARD: &str = "ReviseCardCmd";
+
+/// The command name [`CardDefinition::execute`] recognizes to retire a card from
+/// legal construction going forward, carrying the reason for the retirement.
+const DEPRECATE_CARD: &str = "DeprecateCardCmd";
 
 /// Effect-script references the game engine has registered. A card's
 /// `effectScriptRef` must resolve to one of these for the definition to be
@@ -265,6 +272,57 @@ impl ReviseCardCmd {
     }
 }
 
+/// The `DeprecateCardCmd` payload: retires a card from legal construction going
+/// forward, together with the `reason` for the retirement.
+///
+/// Like [`ReviseCardCmd`], the command submits the full card definition rather
+/// than just an identity — the aggregate keeps no prior field state to check
+/// against, so the card's current definition travels with the command and is
+/// re-validated against the catalog schema before a `card.deprecated` event is
+/// emitted. Deprecating a card whose definition would not itself be legal is
+/// rejected: retirement must reference a card that is well-formed to begin with.
+///
+/// Field shape mirrors [`ReviseCardCmd`] (so the same value objects and the same
+/// [`validate_card_fields`] invariants apply) plus the mandatory `reason`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeprecateCardCmd {
+    /// Identity of the existing card being retired.
+    pub card_id: String,
+    /// Why the card is being retired; must be non-empty.
+    pub reason: String,
+    /// Current human-readable card name.
+    pub name: String,
+    /// Current Juice cost. Must fall within the legal range for the card's type.
+    pub cost: i64,
+    /// Current class allegiance (one class, or `Neutral`).
+    pub class: String,
+    /// Current card type; one of the five legal types.
+    #[serde(rename = "type")]
+    pub card_type: String,
+    /// Current rarity.
+    pub rarity: String,
+    /// Current keyword tags on the card.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Current effect-script reference; must resolve to a registered effect.
+    pub effect_script_ref: String,
+    /// Per-Outfit copy cap declared on the definition. Required to be `1` for
+    /// [`Rarity::Legendary`]; defaults to `0` when omitted.
+    #[serde(default)]
+    pub copy_cap: u32,
+}
+
+impl DeprecateCardCmd {
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`CardDefinition::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("DeprecateCardCmd is always serializable");
+        Command::with_payload(DEPRECATE_CARD, payload)
+    }
+}
+
 /// The proven-legal value objects produced by [`validate_card_fields`]: the raw
 /// `type`, `class`, and `rarity` strings parsed into their enums once every
 /// catalog invariant holds. Fields carried straight through to the event (name,
@@ -365,6 +423,24 @@ pub struct CardRevised {
     pub copy_cap: u32,
 }
 
+/// A card retired from legal construction, produced once its current definition
+/// has been re-validated. Carried by [`Event::CardDeprecated`] and thus by the
+/// emitted `card.deprecated` event; every definition field is a proven-legal
+/// value object and `reason` records why the card was retired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardDeprecated {
+    pub card_id: String,
+    pub reason: String,
+    pub name: String,
+    pub cost: i64,
+    pub class: CardClass,
+    pub card_type: CardType,
+    pub rarity: Rarity,
+    pub keywords: Vec<String>,
+    pub effect_script_ref: String,
+    pub copy_cap: u32,
+}
+
 /// Domain events emitted by [`CardDefinition`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -372,6 +448,8 @@ pub enum Event {
     CardDefined(CardDefined),
     /// An existing card's amended definition passed re-validation.
     CardRevised(CardRevised),
+    /// A card was retired from legal construction going forward.
+    CardDeprecated(CardDeprecated),
 }
 
 impl DomainEvent for Event {
@@ -379,6 +457,7 @@ impl DomainEvent for Event {
         match self {
             Event::CardDefined(_) => "card.defined",
             Event::CardRevised(_) => "card.revised",
+            Event::CardDeprecated(_) => "card.deprecated",
         }
     }
 }
@@ -494,6 +573,54 @@ impl CardDefinition {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Retire a card from legal construction going forward and, if its current
+    /// definition still holds, record and return the resulting `card.deprecated`
+    /// event.
+    ///
+    /// Deprecation carries the card's current definition and re-checks it against
+    /// the very same catalog invariants as a definition or a revision (via
+    /// [`validate_card_fields`]); a retirement can only be recorded against a
+    /// well-formed card. The `reason` must be non-empty. The first failing check
+    /// short-circuits with a [`DomainError::InvariantViolation`] and no event is
+    /// recorded.
+    fn deprecate_card(&mut self, cmd: DeprecateCardCmd) -> Result<Vec<Event>, DomainError> {
+        if cmd.reason.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a card deprecation must carry a non-empty reason".to_string(),
+            ));
+        }
+
+        let ValidatedCardFields {
+            class,
+            card_type,
+            rarity,
+        } = validate_card_fields(
+            &cmd.name,
+            &cmd.card_type,
+            &cmd.class,
+            &cmd.rarity,
+            cmd.cost,
+            &cmd.effect_script_ref,
+            cmd.copy_cap,
+        )?;
+
+        let event = Event::CardDeprecated(CardDeprecated {
+            card_id: cmd.card_id,
+            reason: cmd.reason,
+            name: cmd.name,
+            cost: cmd.cost,
+            class,
+            card_type,
+            rarity,
+            keywords: cmd.keywords,
+            effect_script_ref: cmd.effect_script_ref,
+            copy_cap: cmd.copy_cap,
+        });
+
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for CardDefinition {
@@ -516,6 +643,15 @@ impl Aggregate for CardDefinition {
                     DomainError::InvariantViolation(format!("malformed ReviseCardCmd payload: {e}"))
                 })?;
                 self.revise_card(cmd)
+            }
+            DEPRECATE_CARD => {
+                let cmd: DeprecateCardCmd =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed DeprecateCardCmd payload: {e}"
+                        ))
+                    })?;
+                self.deprecate_card(cmd)
             }
             _ => Err(DomainError::unknown_command(AGGREGATE_TYPE, command.name)),
         }
@@ -741,6 +877,129 @@ mod tests {
             rarity: "Legendary".to_string(),
             copy_cap: 1,
             ..valid_revise_cmd()
+        };
+        assert!(agg.execute(cmd.into_command()).is_ok());
+    }
+
+    /// A `DeprecateCardCmd` that satisfies every invariant, as a starting point
+    /// tests mutate one field at a time to drive a specific rejection.
+    fn valid_deprecate_cmd() -> DeprecateCardCmd {
+        DeprecateCardCmd {
+            card_id: "card-001".to_string(),
+            reason: "power creep — retired from Standard".to_string(),
+            name: "Getaway Driver".to_string(),
+            cost: 3,
+            class: "Driver".to_string(),
+            card_type: "Operator".to_string(),
+            rarity: "Common".to_string(),
+            keywords: vec!["Fast".to_string()],
+            effect_script_ref: "effect.draw_card".to_string(),
+            copy_cap: 0,
+        }
+    }
+
+    #[test]
+    fn deprecate_card_emits_card_deprecated_event() {
+        let mut agg = CardDefinition::new("card-001");
+        let events = agg.execute(valid_deprecate_cmd().into_command()).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "card.deprecated");
+        assert_eq!(agg.version(), 1);
+        assert_eq!(agg.uncommitted_events().len(), 1);
+        assert_eq!(agg.uncommitted_events()[0].event_type(), "card.deprecated");
+    }
+
+    #[test]
+    fn deprecate_rejects_empty_reason() {
+        let mut agg = CardDefinition::new("card-001");
+        let cmd = DeprecateCardCmd {
+            reason: "   ".to_string(),
+            ..valid_deprecate_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+        assert_eq!(agg.version(), 0);
+    }
+
+    #[test]
+    fn deprecate_rejects_cost_outside_type_range() {
+        let mut agg = CardDefinition::new("card-001");
+        // Operator's legal range is [1, 8]; 9 is out of range.
+        let cmd = DeprecateCardCmd {
+            cost: 9,
+            ..valid_deprecate_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+        assert_eq!(agg.version(), 0);
+    }
+
+    #[test]
+    fn deprecate_rejects_card_claiming_two_classes() {
+        let mut agg = CardDefinition::new("card-001");
+        let cmd = DeprecateCardCmd {
+            class: "Driver/Hacker".to_string(),
+            ..valid_deprecate_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+    }
+
+    #[test]
+    fn deprecate_rejects_unknown_card_type() {
+        let mut agg = CardDefinition::new("card-001");
+        let cmd = DeprecateCardCmd {
+            card_type: "Sidekick".to_string(),
+            ..valid_deprecate_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+    }
+
+    #[test]
+    fn deprecate_rejects_unregistered_effect_script_ref() {
+        let mut agg = CardDefinition::new("card-001");
+        let cmd = DeprecateCardCmd {
+            effect_script_ref: "effect.does_not_exist".to_string(),
+            ..valid_deprecate_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+    }
+
+    #[test]
+    fn deprecate_rejects_legendary_without_copy_cap_of_one() {
+        let mut agg = CardDefinition::new("card-001");
+        let cmd = DeprecateCardCmd {
+            rarity: "Legendary".to_string(),
+            copy_cap: 3,
+            ..valid_deprecate_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+        assert_eq!(agg.version(), 0);
+    }
+
+    #[test]
+    fn deprecate_legendary_with_declared_copy_cap_of_one_is_accepted() {
+        let mut agg = CardDefinition::new("card-legend");
+        let cmd = DeprecateCardCmd {
+            rarity: "Legendary".to_string(),
+            copy_cap: 1,
+            ..valid_deprecate_cmd()
         };
         assert!(agg.execute(cmd.into_command()).is_ok());
     }
