@@ -1,16 +1,20 @@
 //! CardDefinition bounded context — the catalog of playable card definitions.
 //!
 //! This is the first bounded context to grow real behavior beyond the
-//! [`shared::stub_aggregate!`] scaffold. It handles a single write command,
-//! [`DefineCardCmd`], which validates a proposed card against the catalog
-//! schema and, when every invariant holds, emits a [`Event::CardDefined`]
-//! (`card.defined`) event.
+//! [`shared::stub_aggregate!`] scaffold. It handles two write commands:
+//! [`DefineCardCmd`], which catalogs a new card, and [`ReviseCardCmd`], which
+//! amends an existing card's definition (balance/text). Both validate the
+//! proposed fields against the catalog schema and, when every invariant holds,
+//! emit a [`Event::CardDefined`] (`card.defined`) or [`Event::CardRevised`]
+//! (`card.revised`) event respectively.
 //!
 //! The aggregate follows the kernel's `execute(cmd)` port: [`CardDefinition`]
-//! decodes the command's opaque JSON payload into a typed [`DefineCardCmd`],
-//! parses each raw field into a value object (so illegal states become
-//! unrepresentable past the boundary), enforces the catalog invariants, and
-//! records the resulting event on its [`shared::AggregateRoot`].
+//! decodes the command's opaque JSON payload into a typed command, parses each
+//! raw field into a value object (so illegal states become unrepresentable past
+//! the boundary), enforces the catalog invariants via the shared
+//! [`validate_card_fields`] check, and records the resulting event on its
+//! [`shared::AggregateRoot`]. Definition and revision run the *same* invariants,
+//! so an amendment can never move a card into an illegal state.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,8 +24,12 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "CardDefinition";
 
-/// The command name [`CardDefinition::execute`] recognizes.
+/// The command name [`CardDefinition::execute`] recognizes to catalog a new card.
 const DEFINE_CARD: &str = "DefineCardCmd";
+
+/// The command name [`CardDefinition::execute`] recognizes to amend an existing
+/// card definition (balance/text) and re-validate it.
+const REVISE_CARD: &str = "ReviseCardCmd";
 
 /// Effect-script references the game engine has registered. A card's
 /// `effectScriptRef` must resolve to one of these for the definition to be
@@ -212,6 +220,119 @@ impl DefineCardCmd {
     }
 }
 
+/// The `ReviseCardCmd` payload: the complete amended definition for a card that
+/// already exists in the catalog. A revision (balance or text changes) submits
+/// the full revised card rather than a partial patch — the aggregate keeps no
+/// prior field state to merge against — and the whole definition is re-validated
+/// against the catalog schema before a `card.revised` event is emitted.
+///
+/// Field shape mirrors [`DefineCardCmd`] so the same value objects and the same
+/// [`validate_card_fields`] invariants apply to an amendment as to a definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviseCardCmd {
+    /// Identity of the existing card being revised.
+    pub card_id: String,
+    /// Revised human-readable card name.
+    pub name: String,
+    /// Revised Juice cost. Must fall within the legal range for the card's type.
+    pub cost: i64,
+    /// Revised class allegiance (one class, or `Neutral`).
+    pub class: String,
+    /// Revised card type; one of the five legal types.
+    #[serde(rename = "type")]
+    pub card_type: String,
+    /// Revised rarity.
+    pub rarity: String,
+    /// Revised keyword tags on the card.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Revised effect-script reference; must resolve to a registered effect.
+    pub effect_script_ref: String,
+    /// Per-Outfit copy cap declared on the revised definition. Required to be
+    /// `1` for [`Rarity::Legendary`]; defaults to `0` when omitted.
+    #[serde(default)]
+    pub copy_cap: u32,
+}
+
+impl ReviseCardCmd {
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`CardDefinition::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("ReviseCardCmd is always serializable");
+        Command::with_payload(REVISE_CARD, payload)
+    }
+}
+
+/// The proven-legal value objects produced by [`validate_card_fields`]: the raw
+/// `type`, `class`, and `rarity` strings parsed into their enums once every
+/// catalog invariant holds. Fields carried straight through to the event (name,
+/// cost, keywords, …) are not re-wrapped here; only the parsed ones are.
+struct ValidatedCardFields {
+    class: CardClass,
+    card_type: CardType,
+    rarity: Rarity,
+}
+
+/// Enforce every catalog invariant on a card's raw fields, returning the parsed
+/// value objects when they all hold, or the first [`DomainError::InvariantViolation`].
+///
+/// This is the single source of truth for card validity: both
+/// [`CardDefinition::define_card`] (cataloging a new card) and
+/// [`CardDefinition::revise_card`] (amending an existing one) run it, so a
+/// revision is held to exactly the same schema as the original definition.
+fn validate_card_fields(
+    name: &str,
+    raw_card_type: &str,
+    raw_class: &str,
+    raw_rarity: &str,
+    cost: i64,
+    effect_script_ref: &str,
+    copy_cap: u32,
+) -> Result<ValidatedCardFields, DomainError> {
+    if name.trim().is_empty() {
+        return Err(DomainError::InvariantViolation(
+            "a card must have a non-empty name".to_string(),
+        ));
+    }
+
+    // Invariant: exactly one card type (or reject).
+    let card_type = CardType::parse(raw_card_type)?;
+    // Invariant: exactly one class, or Neutral.
+    let class = CardClass::parse(raw_class)?;
+    let rarity = Rarity::parse(raw_rarity)?;
+
+    // Invariant: Juice cost within the legal range for the card's type.
+    let (min, max) = card_type.legal_cost_range();
+    if cost < min || cost > max {
+        return Err(DomainError::InvariantViolation(format!(
+            "a {}'s Juice cost must fall within [{min}, {max}]; got {cost}",
+            card_type.as_str(),
+        )));
+    }
+
+    // Invariant: effect-script reference must resolve to a registered effect.
+    if !REGISTERED_EFFECTS.contains(&effect_script_ref) {
+        return Err(DomainError::InvariantViolation(format!(
+            "effect-script reference '{effect_script_ref}' does not resolve to a registered effect"
+        )));
+    }
+
+    // Invariant: Legendary rarity carries a per-Outfit copy cap of 1.
+    if rarity == Rarity::Legendary && copy_cap != 1 {
+        return Err(DomainError::InvariantViolation(format!(
+            "Legendary rarity carries a per-Outfit copy cap of 1; definition declared {copy_cap}"
+        )));
+    }
+
+    Ok(ValidatedCardFields {
+        class,
+        card_type,
+        rarity,
+    })
+}
+
 /// A validated card definition, produced once every invariant has been checked.
 /// Carried by [`Event::CardDefined`] and thus by the emitted `card.defined`
 /// event; every field is a proven-legal value object.
@@ -228,17 +349,36 @@ pub struct CardDefined {
     pub copy_cap: u32,
 }
 
+/// A validated card revision, produced once every invariant has been re-checked
+/// against the amended fields. Carried by [`Event::CardRevised`] and thus by the
+/// emitted `card.revised` event; every field is a proven-legal value object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardRevised {
+    pub card_id: String,
+    pub name: String,
+    pub cost: i64,
+    pub class: CardClass,
+    pub card_type: CardType,
+    pub rarity: Rarity,
+    pub keywords: Vec<String>,
+    pub effect_script_ref: String,
+    pub copy_cap: u32,
+}
+
 /// Domain events emitted by [`CardDefinition`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A card definition passed validation and was added to the catalog.
     CardDefined(CardDefined),
+    /// An existing card's amended definition passed re-validation.
+    CardRevised(CardRevised),
 }
 
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::CardDefined(_) => "card.defined",
+            Event::CardRevised(_) => "card.revised",
         }
     }
 }
@@ -286,45 +426,60 @@ impl CardDefinition {
     /// value object; the first failure short-circuits with a
     /// [`DomainError::InvariantViolation`].
     fn define_card(&mut self, cmd: DefineCardCmd) -> Result<Vec<Event>, DomainError> {
-        if cmd.name.trim().is_empty() {
-            return Err(DomainError::InvariantViolation(
-                "a card must have a non-empty name".to_string(),
-            ));
-        }
-
-        // Invariant: exactly one card type (or reject).
-        let card_type = CardType::parse(&cmd.card_type)?;
-        // Invariant: exactly one class, or Neutral.
-        let class = CardClass::parse(&cmd.class)?;
-        let rarity = Rarity::parse(&cmd.rarity)?;
-
-        // Invariant: Juice cost within the legal range for the card's type.
-        let (min, max) = card_type.legal_cost_range();
-        if cmd.cost < min || cmd.cost > max {
-            return Err(DomainError::InvariantViolation(format!(
-                "a {}'s Juice cost must fall within [{min}, {max}]; got {}",
-                card_type.as_str(),
-                cmd.cost
-            )));
-        }
-
-        // Invariant: effect-script reference must resolve to a registered effect.
-        if !REGISTERED_EFFECTS.contains(&cmd.effect_script_ref.as_str()) {
-            return Err(DomainError::InvariantViolation(format!(
-                "effect-script reference '{}' does not resolve to a registered effect",
-                cmd.effect_script_ref
-            )));
-        }
-
-        // Invariant: Legendary rarity carries a per-Outfit copy cap of 1.
-        if rarity == Rarity::Legendary && cmd.copy_cap != 1 {
-            return Err(DomainError::InvariantViolation(format!(
-                "Legendary rarity carries a per-Outfit copy cap of 1; definition declared {}",
-                cmd.copy_cap
-            )));
-        }
+        let ValidatedCardFields {
+            class,
+            card_type,
+            rarity,
+        } = validate_card_fields(
+            &cmd.name,
+            &cmd.card_type,
+            &cmd.class,
+            &cmd.rarity,
+            cmd.cost,
+            &cmd.effect_script_ref,
+            cmd.copy_cap,
+        )?;
 
         let event = Event::CardDefined(CardDefined {
+            card_id: cmd.card_id,
+            name: cmd.name,
+            cost: cmd.cost,
+            class,
+            card_type,
+            rarity,
+            keywords: cmd.keywords,
+            effect_script_ref: cmd.effect_script_ref,
+            copy_cap: cmd.copy_cap,
+        });
+
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
+    /// Re-validate an amended card definition and, if it holds, record and
+    /// return the resulting `card.revised` event.
+    ///
+    /// A revision submits the full amended definition; it is checked against the
+    /// very same catalog invariants as an initial definition (via
+    /// [`validate_card_fields`]), so a revision can never move a card into an
+    /// illegal state. The first failing invariant short-circuits with a
+    /// [`DomainError::InvariantViolation`] and no event is recorded.
+    fn revise_card(&mut self, cmd: ReviseCardCmd) -> Result<Vec<Event>, DomainError> {
+        let ValidatedCardFields {
+            class,
+            card_type,
+            rarity,
+        } = validate_card_fields(
+            &cmd.name,
+            &cmd.card_type,
+            &cmd.class,
+            &cmd.rarity,
+            cmd.cost,
+            &cmd.effect_script_ref,
+            cmd.copy_cap,
+        )?;
+
+        let event = Event::CardRevised(CardRevised {
             card_id: cmd.card_id,
             name: cmd.name,
             cost: cmd.cost,
@@ -355,6 +510,12 @@ impl Aggregate for CardDefinition {
                     DomainError::InvariantViolation(format!("malformed DefineCardCmd payload: {e}"))
                 })?;
                 self.define_card(cmd)
+            }
+            REVISE_CARD => {
+                let cmd: ReviseCardCmd = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed ReviseCardCmd payload: {e}"))
+                })?;
+                self.revise_card(cmd)
             }
             _ => Err(DomainError::unknown_command(AGGREGATE_TYPE, command.name)),
         }
@@ -474,6 +635,114 @@ mod tests {
             agg.execute(cmd.into_command()),
             Err(DomainError::InvariantViolation(_))
         ));
+    }
+
+    /// A `ReviseCardCmd` that satisfies every invariant, as a starting point
+    /// tests mutate one field at a time to drive a specific rejection.
+    fn valid_revise_cmd() -> ReviseCardCmd {
+        ReviseCardCmd {
+            card_id: "card-001".to_string(),
+            name: "Getaway Driver".to_string(),
+            cost: 4,
+            class: "Driver".to_string(),
+            card_type: "Operator".to_string(),
+            rarity: "Common".to_string(),
+            keywords: vec!["Fast".to_string(), "Nimble".to_string()],
+            effect_script_ref: "effect.draw_card".to_string(),
+            copy_cap: 0,
+        }
+    }
+
+    #[test]
+    fn revise_card_emits_card_revised_event() {
+        let mut agg = CardDefinition::new("card-001");
+        let events = agg.execute(valid_revise_cmd().into_command()).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "card.revised");
+        assert_eq!(agg.version(), 1);
+        assert_eq!(agg.uncommitted_events().len(), 1);
+        assert_eq!(agg.uncommitted_events()[0].event_type(), "card.revised");
+    }
+
+    #[test]
+    fn revise_rejects_cost_outside_type_range() {
+        let mut agg = CardDefinition::new("card-001");
+        // Operator's legal range is [1, 8]; 9 is out of range.
+        let cmd = ReviseCardCmd {
+            cost: 9,
+            ..valid_revise_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+        assert_eq!(agg.version(), 0);
+    }
+
+    #[test]
+    fn revise_rejects_card_claiming_two_classes() {
+        let mut agg = CardDefinition::new("card-001");
+        let cmd = ReviseCardCmd {
+            class: "Driver/Hacker".to_string(),
+            ..valid_revise_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+    }
+
+    #[test]
+    fn revise_rejects_unknown_card_type() {
+        let mut agg = CardDefinition::new("card-001");
+        let cmd = ReviseCardCmd {
+            card_type: "Sidekick".to_string(),
+            ..valid_revise_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+    }
+
+    #[test]
+    fn revise_rejects_unregistered_effect_script_ref() {
+        let mut agg = CardDefinition::new("card-001");
+        let cmd = ReviseCardCmd {
+            effect_script_ref: "effect.does_not_exist".to_string(),
+            ..valid_revise_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+    }
+
+    #[test]
+    fn revise_rejects_legendary_without_copy_cap_of_one() {
+        let mut agg = CardDefinition::new("card-001");
+        let cmd = ReviseCardCmd {
+            rarity: "Legendary".to_string(),
+            copy_cap: 3,
+            ..valid_revise_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+        assert_eq!(agg.version(), 0);
+    }
+
+    #[test]
+    fn revise_legendary_with_declared_copy_cap_of_one_is_accepted() {
+        let mut agg = CardDefinition::new("card-legend");
+        let cmd = ReviseCardCmd {
+            rarity: "Legendary".to_string(),
+            copy_cap: 1,
+            ..valid_revise_cmd()
+        };
+        assert!(agg.execute(cmd.into_command()).is_ok());
     }
 
     #[test]
