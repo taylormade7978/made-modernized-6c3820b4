@@ -51,6 +51,13 @@
 //! Fatigue to the drawing Boss when it is not. On success it emits *two* events,
 //! [`Event::FatigueDamageDealt`] (`fatigue.damage.dealt`) followed by
 //! [`Event::TurnEnded`] (`turn.ended`).
+//!
+//! [`ResolveCopEvent`] (`ResolveCopEventCmd`) then resolves the Cop Event that
+//! fires when a seat's Heat hits [`HEAT_BOUNDS`]'s upper bound: it validates the
+//! seeded d10 draw ([`COP_EVENT_DIE_SIDES`]) against the turn-holding player,
+//! re-checks the same rules-contract invariants, resets that seat's Heat per the
+//! rules-contract, and on success emits [`Event::CopEventTriggered`]
+//! (`cop.event.triggered`).
 
 use std::ops::RangeInclusive;
 
@@ -79,6 +86,9 @@ const ACTIVATE_HERO_POWER: &str = "ActivateHeroPowerCmd";
 
 /// The `EndTurnCmd` command name [`GameSession::execute`] recognizes.
 const END_TURN: &str = "EndTurnCmd";
+
+/// The `ResolveCopEventCmd` command name [`GameSession::execute`] recognizes.
+const RESOLVE_COP_EVENT: &str = "ResolveCopEventCmd";
 
 /// Heat a player gains each time they play a card. Playing a card always raises
 /// Heat, so a successful [`PlayCard`] emits an accompanying `heat.raised` event.
@@ -110,6 +120,12 @@ pub const FATIGUE_PER_EMPTY_DRAW: i32 = 1;
 /// upper bound immediately triggers a Cop Event, so a *clean* match start must
 /// sit strictly below it (see [`GameSession::ensure_heat_within_bounds`]).
 pub const HEAT_BOUNDS: RangeInclusive<i32> = 0..=10;
+
+/// The seeded Cop Event table is a d10: a Cop Event draw is a face `1..=10`.
+/// Reaching the upper Heat bound triggers a Cop Event, which is then resolved by
+/// drawing from this table; a draw outside `1..=COP_EVENT_DIE_SIDES` is not a
+/// valid d10 result.
+pub const COP_EVENT_DIE_SIDES: u8 = 10;
 
 /// Which of the two players a value refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +503,50 @@ impl EndTurn {
     }
 }
 
+/// The `ResolveCopEventCmd` payload: the match being played, the player whose
+/// Heat hit the Cop-Event threshold, and the seeded d10 draw that selects the Cop
+/// Event from the table. Field names are the match-play schema's `camelCase`.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`ResolveCopEvent::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`GameSession::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveCopEvent {
+    /// Identifier of the match being played; must name the match this session
+    /// records.
+    pub match_id: String,
+    /// Identity of the player resolving the Cop Event; must name one of this
+    /// session's configured Outfits, and it must be that player's turn.
+    pub player_id: String,
+    /// The seeded d10 draw that selects the Cop Event from the table. Must be a
+    /// valid d10 face, `1..=`[`COP_EVENT_DIE_SIDES`].
+    pub rng_draw: u8,
+}
+
+impl ResolveCopEvent {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = RESOLVE_COP_EVENT;
+
+    /// Build a `ResolveCopEventCmd` for `player_id` in `match_id`, resolving the
+    /// Cop Event selected by the seeded d10 `rng_draw`.
+    pub fn new(match_id: impl Into<String>, player_id: impl Into<String>, rng_draw: u8) -> Self {
+        Self {
+            match_id: match_id.into(),
+            player_id: player_id.into(),
+            rng_draw,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`GameSession::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("ResolveCopEvent is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The started match, carried by [`Event::MatchStarted`] and thus by the emitted
 /// `match.started` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,6 +700,26 @@ pub struct TurnEnded {
     pub next_player_juice: u8,
 }
 
+/// A resolved Cop Event, carried by [`Event::CopEventTriggered`] and thus by the
+/// emitted `cop.event.triggered` event. Reaching the upper Heat bound triggers a
+/// Cop Event; resolving the seeded d10 draw applies its effect and resets the
+/// seat's Heat per the rules-contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopEventTriggered {
+    /// The match the Cop Event fired in.
+    pub match_id: String,
+    /// The player identity whose Heat triggered the Cop Event.
+    pub player_id: String,
+    /// The seat that resolved the Cop Event.
+    pub player: Player,
+    /// The seeded d10 draw that selected the Cop Event from the table
+    /// (`1..=`[`COP_EVENT_DIE_SIDES`]).
+    pub rng_draw: u8,
+    /// The seat's Heat after the Cop Event reset it (always within
+    /// [`HEAT_BOUNDS`]; the rules-contract resets it to the lower bound).
+    pub new_heat: i32,
+}
+
 /// Domain events emitted by [`GameSession`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -662,6 +742,9 @@ pub enum Event {
     FatigueDamageDealt(FatigueDamageDealt),
     /// The turn passed from the ending seat to its opponent.
     TurnEnded(TurnEnded),
+    /// A Cop Event (fired when Heat hit the upper bound) was resolved from the
+    /// seeded d10 table, resetting the seat's Heat.
+    CopEventTriggered(CopEventTriggered),
 }
 
 impl DomainEvent for Event {
@@ -676,6 +759,7 @@ impl DomainEvent for Event {
             Event::HeroPowerActivated(_) => "hero_power.activated",
             Event::FatigueDamageDealt(_) => "fatigue.damage.dealt",
             Event::TurnEnded(_) => "turn.ended",
+            Event::CopEventTriggered(_) => "cop.event.triggered",
         }
     }
 }
@@ -1424,6 +1508,73 @@ impl GameSession {
         self.root.record(Box::new(ended.clone()));
         Ok(vec![fatigue, ended])
     }
+
+    /// Cop-Event-draw invariant: the Cop Event is drawn from a seeded d10 table,
+    /// so the draw must be a valid d10 face, `1..=`[`COP_EVENT_DIE_SIDES`].
+    fn ensure_cop_draw_valid(&self, rng_draw: u8) -> Result<(), DomainError> {
+        if !(1..=COP_EVENT_DIE_SIDES).contains(&rng_draw) {
+            return Err(DomainError::InvariantViolation(format!(
+                "rngDraw {rng_draw} is not a valid d10 Cop Event draw; it must be within 1..={COP_EVENT_DIE_SIDES}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Handle `ResolveCopEventCmd`: verify the command targets this match and the
+    /// player whose turn it currently is, validate the seeded d10 draw, enforce
+    /// every match-play invariant against the session's state, reset the seat's
+    /// Heat per the rules-contract, and emit [`Event::CopEventTriggered`].
+    fn resolve_cop_event(&mut self, cmd: ResolveCopEvent) -> Result<Vec<Event>, DomainError> {
+        // The command must name the match this session actually records.
+        if cmd.match_id != self.match_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets match '{}' but this session records '{}'",
+                cmd.match_id, self.match_id
+            )));
+        }
+        // A player must be named, and it must be one of the configured Outfits.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a playerId must be provided".to_string(),
+            ));
+        }
+        let seat = self.seat_for_player(&cmd.player_id)?;
+
+        // The Cop Event is drawn from a seeded d10 table; the draw must be valid.
+        self.ensure_cop_draw_valid(cmd.rng_draw)?;
+
+        // Enforce every match-play invariant before resolving the Cop Event.
+        self.ensure_boards_within_caps()?;
+        self.ensure_heat_within_bounds()?;
+        self.ensure_starting_juice_valid()?;
+        self.ensure_decks_nonempty()?;
+        self.ensure_heists_prereqs_satisfied()?;
+        self.ensure_bosses_alive()?;
+        let turn_player = self.ensure_opening_player_designated()?;
+
+        // Turn-ownership: a Cop Event is resolved only by the player whose turn it is.
+        if seat != turn_player {
+            return Err(DomainError::InvariantViolation(format!(
+                "player '{}' (seat {seat:?}) may not resolve a Cop Event; it is player {turn_player:?}'s turn",
+                cmd.player_id
+            )));
+        }
+
+        // Resolving the Cop Event resets the seat's Heat to the lower bound per
+        // the rules-contract; the result stays within [`HEAT_BOUNDS`].
+        let new_heat = *HEAT_BOUNDS.start();
+        self.outfit_at_mut(seat).starting_heat = new_heat;
+
+        let triggered = Event::CopEventTriggered(CopEventTriggered {
+            match_id: cmd.match_id,
+            player_id: cmd.player_id,
+            player: seat,
+            rng_draw: cmd.rng_draw,
+            new_heat,
+        });
+        self.root.record(Box::new(triggered.clone()));
+        Ok(vec![triggered])
+    }
 }
 
 impl Aggregate for GameSession {
@@ -1475,6 +1626,15 @@ impl Aggregate for GameSession {
                     DomainError::InvariantViolation(format!("malformed EndTurnCmd payload: {e}"))
                 })?;
                 self.end_turn(cmd)
+            }
+            RESOLVE_COP_EVENT => {
+                let cmd: ResolveCopEvent =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed ResolveCopEventCmd payload: {e}"
+                        ))
+                    })?;
+                self.resolve_cop_event(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -2993,5 +3153,271 @@ mod tests {
         assert_eq!(command.name, EndTurn::COMMAND);
         let decoded: EndTurn = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_end_turn());
+    }
+
+    // ---- ResolveCopEventCmd (S-8) ------------------------------------------
+
+    /// A legal `ResolveCopEventCmd` for `m-1`: the turn-holding player `A`
+    /// resolves the Cop Event with a valid seeded d10 draw. Tests mutate one
+    /// aspect at a time to drive a rejection.
+    fn valid_resolve_cop_event() -> ResolveCopEvent {
+        ResolveCopEvent::new("m-1", "m-1-a", 7)
+    }
+
+    // Scenario: Successfully execute ResolveCopEventCmd — a cop.event.triggered
+    // event is emitted and the GameSession state is updated.
+    #[test]
+    fn resolves_cop_event_and_emits_cop_event_triggered_event() {
+        let mut session = valid_session();
+
+        let events = session
+            .execute(valid_resolve_cop_event().into_command())
+            .expect("a valid Cop Event resolution should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "cop.event.triggered");
+        match &events[0] {
+            Event::CopEventTriggered(triggered) => {
+                assert_eq!(triggered.match_id, "m-1");
+                assert_eq!(triggered.player_id, "m-1-a");
+                assert_eq!(triggered.player, Player::A);
+                assert_eq!(triggered.rng_draw, 7);
+                // The rules-contract resets Heat to the lower bound on resolution.
+                assert_eq!(triggered.new_heat, *HEAT_BOUNDS.start());
+            }
+            other => panic!("expected CopEventTriggered, got {other:?}"),
+        }
+        // The single event advances the version and is recorded on the root.
+        assert_eq!(session.version(), 1);
+        assert_eq!(session.uncommitted_events().len(), 1);
+        assert_eq!(
+            session.uncommitted_events()[0].event_type(),
+            "cop.event.triggered"
+        );
+    }
+
+    // A Cop Event draw is a seeded d10; the extreme faces are both valid.
+    #[test]
+    fn resolve_cop_event_accepts_the_d10_bounds() {
+        for draw in [1, COP_EVENT_DIE_SIDES] {
+            let mut session = valid_session();
+            let events = session
+                .execute(ResolveCopEvent::new("m-1", "m-1-a", draw).into_command())
+                .expect("a valid d10 face should resolve");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type(), "cop.event.triggered");
+        }
+    }
+
+    // A draw of 0 is not a valid d10 Cop Event result.
+    #[test]
+    fn resolve_cop_event_rejects_zero_draw() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ResolveCopEvent::new("m-1", "m-1-a", 0).into_command())
+            .expect_err("a zero d10 draw must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A draw beyond the d10 table is not a valid Cop Event result.
+    #[test]
+    fn resolve_cop_event_rejects_out_of_range_draw() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ResolveCopEvent::new("m-1", "m-1-a", COP_EVENT_DIE_SIDES + 1).into_command())
+            .expect_err("a draw beyond the d10 table must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — Juice starts at 1 (hard-capped at 10).
+    #[test]
+    fn resolve_cop_event_rejects_when_starting_juice_is_not_one() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_juice = 3;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_resolve_cop_event().into_command())
+            .expect_err("an illegal opening Juice must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn resolve_cop_event_rejects_when_available_juice_exceeds_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.available_juice = JUICE_CAP + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_resolve_cop_event().into_command())
+            .expect_err("available Juice over the hard cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a board may hold at most 7 Operators and 3 Vehicles.
+    #[test]
+    fn resolve_cop_event_rejects_when_board_exceeds_operator_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.operators = MAX_OPERATORS + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_resolve_cop_event().into_command())
+            .expect_err("an over-capacity board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn resolve_cop_event_rejects_when_board_exceeds_vehicle_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.vehicles = MAX_VEHICLES + 1;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_resolve_cop_event().into_command())
+            .expect_err("an over-capacity vehicle board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — Heat is bounded 0..10 and no state may leave it.
+    #[test]
+    fn resolve_cop_event_rejects_when_heat_leaves_bounds() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_heat = *HEAT_BOUNDS.end() + 1; // Outside [0, 10].
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_resolve_cop_event().into_command())
+            .expect_err("Heat outside its bounds must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a Heist resolves only after its prerequisite queue is
+    // satisfied.
+    #[test]
+    fn resolve_cop_event_rejects_when_heist_resolved_with_outstanding_prereqs() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.heist_resolved = true;
+        outfit.outstanding_heist_prereqs = 2;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_resolve_cop_event().into_command())
+            .expect_err("a Heist resolved with outstanding prereqs must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — drawing from an empty deck deals Fatigue instead of a
+    // card, so a match may not carry a deckless Outfit.
+    #[test]
+    fn resolve_cop_event_rejects_when_deck_is_empty() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.deck_size = 0;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_resolve_cop_event().into_command())
+            .expect_err("an empty deck must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a command is valid only for the player whose turn it
+    // currently is; a resolution by the off-turn player is rejected.
+    #[test]
+    fn resolve_cop_event_rejects_when_not_the_players_turn() {
+        let mut session = valid_session();
+        // Player A holds the turn; player B tries to resolve the Cop Event.
+        let err = session
+            .execute(ResolveCopEvent::new("m-1", "m-1-b", 7).into_command())
+            .expect_err("an off-turn resolution must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A turn-less setup is likewise ill-formed for resolving a Cop Event.
+    #[test]
+    fn resolve_cop_event_rejects_when_no_opening_player_is_designated() {
+        let mut session = valid_session();
+        session.set_opening_player(None);
+
+        let err = session
+            .execute(valid_resolve_cop_event().into_command())
+            .expect_err("a turn-less setup must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a match ends the instant a Boss's HP reaches 0 or
+    // below, so a defeated Boss cannot be carried into a Cop Event resolution.
+    #[test]
+    fn resolve_cop_event_rejects_when_a_boss_is_defeated() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.boss_hp = 0;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_resolve_cop_event().into_command())
+            .expect_err("a defeated Boss must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A resolution must name the match this session records.
+    #[test]
+    fn resolve_cop_event_rejects_when_command_targets_a_different_match() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ResolveCopEvent::new("other-match", "m-1-a", 7).into_command())
+            .expect_err("a mismatched match id must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A resolution must name a configured Outfit.
+    #[test]
+    fn resolve_cop_event_rejects_unknown_player() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ResolveCopEvent::new("m-1", "ghost", 7).into_command())
+            .expect_err("an unknown player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A resolution must identify the player whose Heat triggered the Cop Event.
+    #[test]
+    fn resolve_cop_event_rejects_blank_player_id() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ResolveCopEvent::new("m-1", "  ", 7).into_command())
+            .expect_err("a blank playerId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn resolve_cop_event_command_payload_round_trips() {
+        let cmd = valid_resolve_cop_event();
+        let command = cmd.into_command();
+        assert_eq!(command.name, ResolveCopEvent::COMMAND);
+        let decoded: ResolveCopEvent = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_resolve_cop_event());
     }
 }
