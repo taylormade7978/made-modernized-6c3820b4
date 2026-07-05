@@ -14,13 +14,18 @@
 //!    with the ticket's own player.
 //! 4. **Terminal state** — a cancelled or matched ticket cannot be re-matched.
 //!
-//! Two commands are implemented. [`MatchTickets`] (`MatchTicketsCmd`) pairs this
+//! Three commands are implemented. [`MatchTickets`] (`MatchTicketsCmd`) pairs this
 //! still-queued ticket with one compatible opponent ticket *before* the cap
 //! elapses, enforcing every invariant, and on success emits
 //! [`Event::MatchProposed`] (`match.proposed`). [`FallbackToExhibition`]
 //! (`FallbackToExhibitionCmd`) is its mirror: it routes an unmatched,
 //! still-queued ticket to an exhibition game once the cap *has* elapsed and on
 //! success emits [`Event::FellBackToExhibition`] (`ticket.fell.back.to.exhibition`).
+//! [`CancelTicket`] (`CancelTicketCmd`) withdraws a still-queued ticket from the
+//! queue at the owning player's request — it enforces the same live-ticket
+//! invariants (re-matchable, still within the fallback cap, monotonic bands) plus
+//! ownership (only the ticket's own player may cancel it) and on success emits
+//! [`Event::TicketCancelled`] (`ticket.cancelled`).
 //! This module is hand-written (it no longer uses `shared::stub_aggregate!`) but
 //! preserves the same public surface — a [`MatchmakingTicket`] aggregate and a
 //! [`MatchmakingTicketRepository`] port — so the persistence adapters in
@@ -41,6 +46,10 @@ const MATCH_TICKETS: &str = "MatchTicketsCmd";
 /// The command name [`MatchmakingTicket::execute`] recognizes for exhibition
 /// fallback.
 const FALLBACK_TO_EXHIBITION: &str = "FallbackToExhibitionCmd";
+
+/// The command name [`MatchmakingTicket::execute`] recognizes for withdrawing a
+/// queued ticket at the owning player's request.
+const CANCEL_TICKET: &str = "CancelTicketCmd";
 
 /// Primary Rating search band: matchmaking initially targets opponents within
 /// ±150 Rating. As the ticket ages the band may only widen, never shrink below
@@ -159,6 +168,46 @@ impl MatchTickets {
     }
 }
 
+/// The `CancelTicketCmd` payload: withdraw a still-queued ticket from the queue
+/// at the owning player's request. Field names are the queue's `camelCase`
+/// schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`CancelTicket::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`MatchmakingTicket::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelTicket {
+    /// Identity of the ticket being cancelled; must name the ticket this
+    /// aggregate records.
+    pub ticket_id: String,
+    /// The player requesting the cancellation. A ticket may only be withdrawn by
+    /// its own player, so this must be non-empty and must equal the ticket's
+    /// owner.
+    pub requested_by: String,
+}
+
+impl CancelTicket {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = CANCEL_TICKET;
+
+    /// Build a command withdrawing `ticket_id` at the request of `requested_by`.
+    pub fn new(ticket_id: impl Into<String>, requested_by: impl Into<String>) -> Self {
+        Self {
+            ticket_id: ticket_id.into(),
+            requested_by: requested_by.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`MatchmakingTicket::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("CancelTicket is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The proposed pairing of two tickets, carried by [`Event::MatchProposed`] and
 /// thus by the emitted `match.proposed` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +230,16 @@ pub struct FellBackToExhibition {
     pub exhibition_opponent: String,
 }
 
+/// The withdrawal of a ticket, carried by [`Event::TicketCancelled`] and thus by
+/// the emitted `ticket.cancelled` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketCancelled {
+    /// The ticket that was withdrawn from the queue.
+    pub ticket_id: String,
+    /// The player who requested the cancellation (the ticket's own player).
+    pub requested_by: String,
+}
+
 /// Domain events emitted by [`MatchmakingTicket`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -188,6 +247,8 @@ pub enum Event {
     MatchProposed(MatchProposed),
     /// An unmatched ticket exceeded the cap and was routed to an exhibition game.
     FellBackToExhibition(FellBackToExhibition),
+    /// A queued ticket was withdrawn from the queue at its owner's request.
+    TicketCancelled(TicketCancelled),
 }
 
 impl DomainEvent for Event {
@@ -195,6 +256,7 @@ impl DomainEvent for Event {
         match self {
             Event::MatchProposed(_) => "match.proposed",
             Event::FellBackToExhibition(_) => "ticket.fell.back.to.exhibition",
+            Event::TicketCancelled(_) => "ticket.cancelled",
         }
     }
 }
@@ -408,6 +470,56 @@ impl MatchmakingTicket {
         Ok(())
     }
 
+    /// Ownership invariant for cancellation: a ticket may be withdrawn only by
+    /// its own player. The requester must be named (non-empty) and must equal the
+    /// ticket's owner — this is the cancellation-side reading of the pairing
+    /// invariant ("a ticket relates to exactly one other party and that identity
+    /// is checked against the ticket's own player"): a stranger can never cancel
+    /// another player's ticket.
+    fn ensure_cancel_requested_by_owner(&self, requested_by: &str) -> Result<(), DomainError> {
+        if requested_by.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' cancellation must name the requesting player",
+                self.id
+            )));
+        }
+        if requested_by != self.player_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' may only be cancelled by its own player '{}', not '{}'",
+                self.id, self.player_id, requested_by
+            )));
+        }
+        Ok(())
+    }
+
+    /// Handle `CancelTicketCmd`: verify the command targets this ticket, enforce
+    /// every invariant (re-matchable, still within the fallback cap, monotonic
+    /// bands, and cancellation requested by the ticket's own player), and emit
+    /// [`Event::TicketCancelled`].
+    fn cancel_ticket(&mut self, cmd: CancelTicket) -> Result<Vec<Event>, DomainError> {
+        // The command must name the ticket this aggregate actually records.
+        if cmd.ticket_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets ticket '{}' but this aggregate records '{}'",
+                cmd.ticket_id, self.id
+            )));
+        }
+
+        // Enforce every invariant before withdrawing the ticket.
+        self.ensure_rematchable()?;
+        self.ensure_within_fallback_cap()?;
+        self.ensure_bands_expand_monotonically()?;
+        self.ensure_cancel_requested_by_owner(&cmd.requested_by)?;
+
+        let event = Event::TicketCancelled(TicketCancelled {
+            ticket_id: cmd.ticket_id,
+            requested_by: cmd.requested_by,
+        });
+        self.status = TicketStatus::Cancelled;
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
     /// Handle `MatchTicketsCmd`: verify the command targets this ticket, enforce
     /// every invariant (re-matchable, still within the fallback cap, monotonic
     /// bands, and a single valid opponent ticket owned by another player), and
@@ -493,6 +605,14 @@ impl Aggregate for MatchmakingTicket {
                         ))
                     })?;
                 self.fallback_to_exhibition(cmd)
+            }
+            CANCEL_TICKET => {
+                let cmd: CancelTicket = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!(
+                        "malformed CancelTicketCmd payload: {e}"
+                    ))
+                })?;
+                self.cancel_ticket(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -849,5 +969,162 @@ mod tests {
         assert_eq!(command.name, MatchTickets::COMMAND);
         let decoded: MatchTickets = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_match_cmd());
+    }
+
+    // ----- CancelTicketCmd -------------------------------------------------
+
+    /// A cancellable ticket `t-01` for player `p-self`: actively queued, still
+    /// within the fallback cap (a live ticket the owner may withdraw), at (or
+    /// above) the primary search bands. Tests mutate one aspect at a time to
+    /// drive a specific rejection.
+    fn cancellable_ticket() -> MatchmakingTicket {
+        let mut ticket = MatchmakingTicket::new("t-01");
+        ticket.set_player("p-self");
+        ticket.set_status(TicketStatus::Queued);
+        ticket.set_queued_seconds(30);
+        ticket.set_search_bands(PRIMARY_RATING_BAND + 50, PRIMARY_LEVEL_BAND + 2);
+        ticket
+    }
+
+    /// A command cancelling `t-01` at the request of its owner `p-self`.
+    fn valid_cancel_cmd() -> CancelTicket {
+        CancelTicket::new("t-01", "p-self")
+    }
+
+    // Scenario: Successfully execute CancelTicketCmd.
+    #[test]
+    fn cancels_and_emits_ticket_cancelled_event() {
+        let mut ticket = cancellable_ticket();
+
+        let events = ticket
+            .execute(valid_cancel_cmd().into_command())
+            .expect("valid cancellation should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "ticket.cancelled");
+        match &events[0] {
+            Event::TicketCancelled(cancelled) => {
+                assert_eq!(cancelled.ticket_id, "t-01");
+                assert_eq!(cancelled.requested_by, "p-self");
+            }
+            other => panic!("expected TicketCancelled, got {other:?}"),
+        }
+        // The ticket left the queue and recorded the event.
+        assert_eq!(ticket.status(), TicketStatus::Cancelled);
+        assert_eq!(ticket.version(), 1);
+        assert_eq!(ticket.uncommitted_events().len(), 1);
+        assert_eq!(
+            ticket.uncommitted_events()[0].event_type(),
+            "ticket.cancelled"
+        );
+    }
+
+    // Scenario: rejected — primary targeting is ±150 Rating; secondary is ±5
+    // Level; bands expand monotonically as the ticket ages.
+    #[test]
+    fn cancel_rejects_when_search_band_is_narrower_than_primary() {
+        let mut ticket = cancellable_ticket();
+        // A Rating band narrower than the primary ±150 would mean the bands
+        // shrank rather than expanded monotonically.
+        ticket.set_search_bands(PRIMARY_RATING_BAND - 1, PRIMARY_LEVEL_BAND);
+
+        let err = ticket
+            .execute(valid_cancel_cmd().into_command())
+            .expect_err("a shrunken search band must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a ticket must fall back to exhibition after 5 minutes
+    // of unmatched queueing (past the cap it must fall back, not be cancelled).
+    #[test]
+    fn cancel_rejects_when_fallback_cap_has_elapsed() {
+        let mut ticket = cancellable_ticket();
+        // At the 5-minute cap the ticket must fall back, not be withdrawn.
+        ticket.set_queued_seconds(FALLBACK_CAP_SECONDS);
+
+        let err = ticket
+            .execute(valid_cancel_cmd().into_command())
+            .expect_err("cancelling past the fallback cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a ticket may be paired with exactly one opponent and
+    // never with the ticket's own player (cancellation-side: only the owner may
+    // withdraw the ticket).
+    #[test]
+    fn cancel_rejects_when_requested_by_another_player() {
+        let mut ticket = cancellable_ticket();
+        // A player who does not own the ticket may never cancel it.
+        let cmd = CancelTicket::new("t-01", "p-rival");
+
+        let err = ticket
+            .execute(cmd.into_command())
+            .expect_err("cancellation by a non-owner must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Ownership invariant: the requesting player must be named.
+    #[test]
+    fn cancel_rejects_when_no_requester_is_named() {
+        let mut ticket = cancellable_ticket();
+        let cmd = CancelTicket::new("t-01", "   ");
+
+        let err = ticket
+            .execute(cmd.into_command())
+            .expect_err("a missing requesting player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a cancelled or matched ticket cannot be re-matched.
+    #[test]
+    fn cancel_rejects_when_ticket_is_already_matched() {
+        let mut ticket = cancellable_ticket();
+        // A matched ticket is terminal and can no longer be withdrawn.
+        ticket.set_status(TicketStatus::Matched);
+
+        let err = ticket
+            .execute(valid_cancel_cmd().into_command())
+            .expect_err("cancelling a matched ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    #[test]
+    fn cancel_rejects_when_ticket_is_already_cancelled() {
+        let mut ticket = cancellable_ticket();
+        // A cancelled ticket is terminal and cannot be cancelled again.
+        ticket.set_status(TicketStatus::Cancelled);
+
+        let err = ticket
+            .execute(valid_cancel_cmd().into_command())
+            .expect_err("cancelling an already-cancelled ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // A command naming a different ticket is rejected before any invariant runs.
+    #[test]
+    fn cancel_rejects_command_for_a_different_ticket() {
+        let mut ticket = cancellable_ticket();
+        let cmd = CancelTicket::new("t-99", "p-self");
+
+        let err = ticket
+            .execute(cmd.into_command())
+            .expect_err("a command for another ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    #[test]
+    fn cancel_command_payload_round_trips() {
+        let cmd = valid_cancel_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, CancelTicket::COMMAND);
+        let decoded: CancelTicket = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_cancel_cmd());
     }
 }
