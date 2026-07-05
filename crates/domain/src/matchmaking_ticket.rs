@@ -14,10 +14,13 @@
 //!    with the ticket's own player.
 //! 4. **Terminal state** — a cancelled or matched ticket cannot be re-matched.
 //!
-//! The only command implemented so far is [`FallbackToExhibition`]
-//! (`FallbackToExhibitionCmd`): it routes an unmatched, still-queued ticket to
-//! an exhibition game once the cap has elapsed, enforcing every invariant, and
-//! on success emits [`Event::FellBackToExhibition`] (`ticket.fell.back.to.exhibition`).
+//! Two commands are implemented. [`MatchTickets`] (`MatchTicketsCmd`) pairs this
+//! still-queued ticket with one compatible opponent ticket *before* the cap
+//! elapses, enforcing every invariant, and on success emits
+//! [`Event::MatchProposed`] (`match.proposed`). [`FallbackToExhibition`]
+//! (`FallbackToExhibitionCmd`) is its mirror: it routes an unmatched,
+//! still-queued ticket to an exhibition game once the cap *has* elapsed and on
+//! success emits [`Event::FellBackToExhibition`] (`ticket.fell.back.to.exhibition`).
 //! This module is hand-written (it no longer uses `shared::stub_aggregate!`) but
 //! preserves the same public surface — a [`MatchmakingTicket`] aggregate and a
 //! [`MatchmakingTicketRepository`] port — so the persistence adapters in
@@ -31,7 +34,12 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "MatchmakingTicket";
 
-/// The command name [`MatchmakingTicket::execute`] recognizes.
+/// The command name [`MatchmakingTicket::execute`] recognizes for pairing two
+/// compatible tickets into a proposed match.
+const MATCH_TICKETS: &str = "MatchTicketsCmd";
+
+/// The command name [`MatchmakingTicket::execute`] recognizes for exhibition
+/// fallback.
 const FALLBACK_TO_EXHIBITION: &str = "FallbackToExhibitionCmd";
 
 /// Primary Rating search band: matchmaking initially targets opponents within
@@ -103,6 +111,66 @@ impl FallbackToExhibition {
     }
 }
 
+/// The `MatchTicketsCmd` payload: pair this ticket (`ticket_a`) with exactly one
+/// compatible opponent ticket (`ticket_b`, owned by `opponent_player`) into a
+/// proposed match. Field names are the queue's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`MatchTickets::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`MatchmakingTicket::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchTickets {
+    /// Identity of the ticket being matched; must name the ticket this
+    /// aggregate records.
+    pub ticket_a: String,
+    /// The single opponent ticket paired against `ticket_a`. Must be non-empty
+    /// and distinct from `ticket_a` — a ticket is never paired with itself.
+    pub ticket_b: String,
+    /// The player who owns `ticket_b`. Must not be this ticket's own player: a
+    /// ticket is never paired against its own player.
+    pub opponent_player: String,
+}
+
+impl MatchTickets {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = MATCH_TICKETS;
+
+    /// Build a command pairing `ticket_a` with `ticket_b` (owned by
+    /// `opponent_player`) into a proposed match.
+    pub fn new(
+        ticket_a: impl Into<String>,
+        ticket_b: impl Into<String>,
+        opponent_player: impl Into<String>,
+    ) -> Self {
+        Self {
+            ticket_a: ticket_a.into(),
+            ticket_b: ticket_b.into(),
+            opponent_player: opponent_player.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`MatchmakingTicket::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("MatchTickets is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The proposed pairing of two tickets, carried by [`Event::MatchProposed`] and
+/// thus by the emitted `match.proposed` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchProposed {
+    /// The ticket this proposal originates from.
+    pub ticket_a: String,
+    /// The single opponent ticket it was paired with.
+    pub ticket_b: String,
+    /// The player who owns `ticket_b`.
+    pub opponent_player: String,
+}
+
 /// The exhibition pairing, carried by [`Event::FellBackToExhibition`] and thus by
 /// the emitted `ticket.fell.back.to.exhibition` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +184,8 @@ pub struct FellBackToExhibition {
 /// Domain events emitted by [`MatchmakingTicket`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// Two compatible tickets were paired into a proposed match.
+    MatchProposed(MatchProposed),
     /// An unmatched ticket exceeded the cap and was routed to an exhibition game.
     FellBackToExhibition(FellBackToExhibition),
 }
@@ -123,6 +193,7 @@ pub enum Event {
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
+            Event::MatchProposed(_) => "match.proposed",
             Event::FellBackToExhibition(_) => "ticket.fell.back.to.exhibition",
         }
     }
@@ -261,6 +332,22 @@ impl MatchmakingTicket {
         Ok(())
     }
 
+    /// Fallback-cap invariant, seen from the matching side: a ticket must fall
+    /// back to exhibition once it has gone unmatched for 5 minutes
+    /// ([`FALLBACK_CAP_SECONDS`]), so it can no longer be paired into a normal
+    /// match past that cap. This is the mirror of [`ensure_fallback_cap_elapsed`]
+    /// (`Self::ensure_fallback_cap_elapsed`).
+    fn ensure_within_fallback_cap(&self) -> Result<(), DomainError> {
+        if self.queued_seconds >= FALLBACK_CAP_SECONDS {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' has queued {}s, at or past the {}s (5 minute) cap; it must fall back \
+                 to exhibition rather than be matched",
+                self.id, self.queued_seconds, FALLBACK_CAP_SECONDS
+            )));
+        }
+        Ok(())
+    }
+
     /// Terminal-state invariant: a cancelled or matched ticket cannot be
     /// re-matched; only a queued ticket may fall back to exhibition.
     fn ensure_rematchable(&self) -> Result<(), DomainError> {
@@ -290,6 +377,64 @@ impl MatchmakingTicket {
             )));
         }
         Ok(())
+    }
+
+    /// Pairing invariant for matching: a ticket may be paired with exactly one
+    /// opponent ticket — non-empty and distinct from itself — and never against
+    /// its own player.
+    fn ensure_valid_match_pairing(
+        &self,
+        opponent_ticket: &str,
+        opponent_player: &str,
+    ) -> Result<(), DomainError> {
+        if opponent_ticket.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' must be paired with exactly one opponent ticket",
+                self.id
+            )));
+        }
+        if opponent_ticket == self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' cannot be paired with itself",
+                self.id
+            )));
+        }
+        if opponent_player == self.player_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' may never be paired against its own player '{}'",
+                self.id, self.player_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Handle `MatchTicketsCmd`: verify the command targets this ticket, enforce
+    /// every invariant (re-matchable, still within the fallback cap, monotonic
+    /// bands, and a single valid opponent ticket owned by another player), and
+    /// emit [`Event::MatchProposed`].
+    fn match_tickets(&mut self, cmd: MatchTickets) -> Result<Vec<Event>, DomainError> {
+        // The command must name the ticket this aggregate actually records.
+        if cmd.ticket_a != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets ticket '{}' but this aggregate records '{}'",
+                cmd.ticket_a, self.id
+            )));
+        }
+
+        // Enforce every invariant before proposing any match.
+        self.ensure_rematchable()?;
+        self.ensure_within_fallback_cap()?;
+        self.ensure_bands_expand_monotonically()?;
+        self.ensure_valid_match_pairing(&cmd.ticket_b, &cmd.opponent_player)?;
+
+        let event = Event::MatchProposed(MatchProposed {
+            ticket_a: cmd.ticket_a,
+            ticket_b: cmd.ticket_b,
+            opponent_player: cmd.opponent_player,
+        });
+        self.status = TicketStatus::Matched;
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
     }
 
     /// Handle `FallbackToExhibitionCmd`: verify the command targets this ticket,
@@ -332,6 +477,14 @@ impl Aggregate for MatchmakingTicket {
 
     fn execute(&mut self, command: Command) -> Result<Vec<Self::Event>, DomainError> {
         match command.name.as_str() {
+            MATCH_TICKETS => {
+                let cmd: MatchTickets = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!(
+                        "malformed MatchTicketsCmd payload: {e}"
+                    ))
+                })?;
+                self.match_tickets(cmd)
+            }
             FALLBACK_TO_EXHIBITION => {
                 let cmd: FallbackToExhibition =
                     serde_json::from_slice(&command.payload).map_err(|e| {
@@ -391,6 +544,7 @@ mod tests {
                 assert_eq!(paired.ticket_id, "t-01");
                 assert_eq!(paired.exhibition_opponent, "p-rival");
             }
+            other => panic!("expected FellBackToExhibition, got {other:?}"),
         }
         // The ticket transitioned out of the queue and recorded the event.
         assert_eq!(ticket.status(), TicketStatus::FellBackToExhibition);
@@ -523,5 +677,177 @@ mod tests {
         assert_eq!(command.name, FallbackToExhibition::COMMAND);
         let decoded: FallbackToExhibition = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // ----- MatchTicketsCmd -------------------------------------------------
+
+    /// A matchable ticket `t-01` for player `p-self`: actively queued, still
+    /// well within the fallback cap (so it may be matched rather than forced to
+    /// fall back), at (or above) the primary search bands. Tests mutate one
+    /// aspect at a time to drive a specific rejection.
+    fn matchable_ticket() -> MatchmakingTicket {
+        let mut ticket = MatchmakingTicket::new("t-01");
+        ticket.set_player("p-self");
+        ticket.set_status(TicketStatus::Queued);
+        ticket.set_queued_seconds(30);
+        ticket.set_search_bands(PRIMARY_RATING_BAND + 50, PRIMARY_LEVEL_BAND + 2);
+        ticket
+    }
+
+    /// A command pairing `t-01` with opponent ticket `t-02` owned by `p-rival`.
+    fn valid_match_cmd() -> MatchTickets {
+        MatchTickets::new("t-01", "t-02", "p-rival")
+    }
+
+    // Scenario: Successfully execute MatchTicketsCmd.
+    #[test]
+    fn matches_tickets_and_emits_match_proposed_event() {
+        let mut ticket = matchable_ticket();
+
+        let events = ticket
+            .execute(valid_match_cmd().into_command())
+            .expect("valid match should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "match.proposed");
+        match &events[0] {
+            Event::MatchProposed(proposed) => {
+                assert_eq!(proposed.ticket_a, "t-01");
+                assert_eq!(proposed.ticket_b, "t-02");
+                assert_eq!(proposed.opponent_player, "p-rival");
+            }
+            other => panic!("expected MatchProposed, got {other:?}"),
+        }
+        // The ticket transitioned into a match and recorded the event.
+        assert_eq!(ticket.status(), TicketStatus::Matched);
+        assert_eq!(ticket.version(), 1);
+        assert_eq!(ticket.uncommitted_events().len(), 1);
+        assert_eq!(
+            ticket.uncommitted_events()[0].event_type(),
+            "match.proposed"
+        );
+    }
+
+    // Scenario: rejected — primary targeting is ±150 Rating; secondary is ±5
+    // Level; bands expand monotonically as the ticket ages.
+    #[test]
+    fn match_rejects_when_search_band_is_narrower_than_primary() {
+        let mut ticket = matchable_ticket();
+        // A Level band narrower than the primary ±5 would mean the bands shrank
+        // rather than expanded monotonically.
+        ticket.set_search_bands(PRIMARY_RATING_BAND, PRIMARY_LEVEL_BAND - 1);
+
+        let err = ticket
+            .execute(valid_match_cmd().into_command())
+            .expect_err("a shrunken search band must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a ticket must fall back to exhibition after 5 minutes
+    // of unmatched queueing (so it can no longer be matched past the cap).
+    #[test]
+    fn match_rejects_when_fallback_cap_has_elapsed() {
+        let mut ticket = matchable_ticket();
+        // At the 5-minute cap the ticket must fall back, not be matched.
+        ticket.set_queued_seconds(FALLBACK_CAP_SECONDS);
+
+        let err = ticket
+            .execute(valid_match_cmd().into_command())
+            .expect_err("matching past the fallback cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a ticket may be paired with exactly one opponent and
+    // never with the ticket's own player.
+    #[test]
+    fn match_rejects_when_paired_against_its_own_player() {
+        let mut ticket = matchable_ticket();
+        // The opponent ticket is owned by this ticket's own player.
+        let cmd = MatchTickets::new("t-01", "t-02", "p-self");
+
+        let err = ticket
+            .execute(cmd.into_command())
+            .expect_err("pairing against the ticket's own player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Pairing invariant: exactly one opponent — a ticket cannot be paired with
+    // itself.
+    #[test]
+    fn match_rejects_when_paired_with_itself() {
+        let mut ticket = matchable_ticket();
+        let cmd = MatchTickets::new("t-01", "t-01", "p-rival");
+
+        let err = ticket
+            .execute(cmd.into_command())
+            .expect_err("pairing a ticket with itself must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Pairing invariant: exactly one opponent — an empty opponent ticket is
+    // rejected.
+    #[test]
+    fn match_rejects_when_no_opponent_ticket_is_named() {
+        let mut ticket = matchable_ticket();
+        let cmd = MatchTickets::new("t-01", "   ", "p-rival");
+
+        let err = ticket
+            .execute(cmd.into_command())
+            .expect_err("a missing opponent ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a cancelled or matched ticket cannot be re-matched.
+    #[test]
+    fn match_rejects_when_ticket_is_already_matched() {
+        let mut ticket = matchable_ticket();
+        // A matched ticket is terminal and cannot be re-matched.
+        ticket.set_status(TicketStatus::Matched);
+
+        let err = ticket
+            .execute(valid_match_cmd().into_command())
+            .expect_err("re-matching a matched ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    #[test]
+    fn match_rejects_when_ticket_is_cancelled() {
+        let mut ticket = matchable_ticket();
+        // A cancelled ticket is likewise terminal.
+        ticket.set_status(TicketStatus::Cancelled);
+
+        let err = ticket
+            .execute(valid_match_cmd().into_command())
+            .expect_err("re-matching a cancelled ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // A command naming a different ticket is rejected before any invariant runs.
+    #[test]
+    fn match_rejects_command_for_a_different_ticket() {
+        let mut ticket = matchable_ticket();
+        let cmd = MatchTickets::new("t-99", "t-02", "p-rival");
+
+        let err = ticket
+            .execute(cmd.into_command())
+            .expect_err("a command for another ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    #[test]
+    fn match_command_payload_round_trips() {
+        let cmd = valid_match_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, MatchTickets::COMMAND);
+        let decoded: MatchTickets = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_match_cmd());
     }
 }
