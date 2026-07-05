@@ -31,6 +31,12 @@
 //! the same public surface — a [`GameSession`] aggregate and a
 //! [`GameSessionRepository`] port — so the persistence adapters in
 //! `crates/mocks` and the actix-web server keep compiling unchanged.
+//!
+//! [`DeclareAttack`] (`DeclareAttackCmd`) then declares the turn-holding
+//! player's attacker into a defender, resolves combat simultaneously, and emits
+//! [`Event::CombatResolved`] (`combat.resolved`) followed by
+//! [`Event::BossDefeated`] (`boss.defeated`) when that combat drops the defending
+//! Boss.
 
 use std::ops::RangeInclusive;
 
@@ -50,6 +56,9 @@ const MULLIGAN: &str = "MulliganCmd";
 
 /// The `PlayCardCmd` command name [`GameSession::execute`] recognizes.
 const PLAY_CARD: &str = "PlayCardCmd";
+
+/// The `DeclareAttackCmd` command name [`GameSession::execute`] recognizes.
+const DECLARE_ATTACK: &str = "DeclareAttackCmd";
 
 /// Heat a player gains each time they play a card. Playing a card always raises
 /// Heat, so a successful [`PlayCard`] emits an accompanying `heat.raised` event.
@@ -304,6 +313,58 @@ impl PlayCard {
     }
 }
 
+/// The `DeclareAttackCmd` payload: the match being played, the player declaring
+/// the attack, the attacker they are committing, and the defender being attacked.
+/// Field names are the match-play schema's `camelCase`.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`DeclareAttack::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`GameSession::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclareAttack {
+    /// Identifier of the match being played; must name the match this session
+    /// records.
+    pub match_id: String,
+    /// Identity of the player declaring the attack; must name one of this
+    /// session's configured Outfits, and it must be that player's turn.
+    pub player_id: String,
+    /// The attacking combatant. Must be non-blank.
+    pub attacker_id: String,
+    /// The defending target. Must be non-blank; in this slice it is treated as
+    /// the opposing Boss target that is defeated by the resolved combat.
+    pub defender_id: String,
+}
+
+impl DeclareAttack {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = DECLARE_ATTACK;
+
+    /// Build a `DeclareAttackCmd` for `player_id` in `match_id`, committing
+    /// `attacker_id` against `defender_id`.
+    pub fn new(
+        match_id: impl Into<String>,
+        player_id: impl Into<String>,
+        attacker_id: impl Into<String>,
+        defender_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            match_id: match_id.into(),
+            player_id: player_id.into(),
+            attacker_id: attacker_id.into(),
+            defender_id: defender_id.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`GameSession::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("DeclareAttack is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The started match, carried by [`Event::MatchStarted`] and thus by the emitted
 /// `match.started` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,6 +427,41 @@ pub struct HeatRaised {
     pub new_heat: i32,
 }
 
+/// A completed simultaneous combat resolution, carried by
+/// [`Event::CombatResolved`] and thus by the emitted `combat.resolved` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombatResolved {
+    /// The match the combat happened in.
+    pub match_id: String,
+    /// The player identity that declared the attack.
+    pub attacking_player_id: String,
+    /// The seat that declared the attack.
+    pub attacking_player: Player,
+    /// The attacking combatant.
+    pub attacker_id: String,
+    /// The seat defending against the attack.
+    pub defending_player: Player,
+    /// The defending target.
+    pub defender_id: String,
+}
+
+/// A Boss defeated by resolved combat, carried by [`Event::BossDefeated`] and
+/// thus by the emitted `boss.defeated` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BossDefeated {
+    /// The match the defeat happened in.
+    pub match_id: String,
+    /// The player identity whose Boss was defeated.
+    pub defeated_player_id: String,
+    /// The seat whose Boss was defeated.
+    pub defeated_player: Player,
+    /// The Boss target defeated by combat.
+    pub boss_id: String,
+    /// The winning seat. This command resolves a single attacker into the
+    /// opposing Boss, so exactly one winner is produced.
+    pub winner: Player,
+}
+
 /// Domain events emitted by [`GameSession`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -377,6 +473,10 @@ pub enum Event {
     CardPlayed(CardPlayed),
     /// Playing a card raised the acting player's Heat.
     HeatRaised(HeatRaised),
+    /// A declared attack was resolved simultaneously.
+    CombatResolved(CombatResolved),
+    /// Resolved combat defeated a Boss and ended the match for one winner.
+    BossDefeated(BossDefeated),
 }
 
 impl DomainEvent for Event {
@@ -386,6 +486,8 @@ impl DomainEvent for Event {
             Event::MulliganCompleted(_) => "mulligan.completed",
             Event::CardPlayed(_) => "card.played",
             Event::HeatRaised(_) => "heat.raised",
+            Event::CombatResolved(_) => "combat.resolved",
+            Event::BossDefeated(_) => "boss.defeated",
         }
     }
 }
@@ -530,6 +632,12 @@ impl GameSession {
                     outfit.name, outfit.starting_juice
                 )));
             }
+            if outfit.available_juice > JUICE_CAP {
+                return Err(DomainError::InvariantViolation(format!(
+                    "player {seat:?} Outfit '{}' has available Juice {}, exceeding the hard cap of {JUICE_CAP}",
+                    outfit.name, outfit.available_juice
+                )));
+            }
         }
         Ok(())
     }
@@ -664,6 +772,22 @@ impl GameSession {
         match seat {
             Player::A => &self.player_a,
             Player::B => &self.player_b,
+        }
+    }
+
+    /// Mutable access to the opening Outfit seated at `seat`.
+    fn outfit_at_mut(&mut self, seat: Player) -> &mut OutfitConfig {
+        match seat {
+            Player::A => &mut self.player_a,
+            Player::B => &mut self.player_b,
+        }
+    }
+
+    /// The opposing seat for combat targeting.
+    fn opponent_of(seat: Player) -> Player {
+        match seat {
+            Player::A => Player::B,
+            Player::B => Player::A,
         }
     }
 
@@ -858,6 +982,91 @@ impl GameSession {
         self.root.record(Box::new(raised.clone()));
         Ok(vec![played, raised])
     }
+
+    /// Handle `DeclareAttackCmd`: verify the command targets this match, a real
+    /// turn-holding player, and well-formed attacker/defender references;
+    /// enforce every match-play invariant; resolve combat simultaneously; and
+    /// emit [`Event::CombatResolved`] followed by [`Event::BossDefeated`].
+    fn declare_attack(&mut self, cmd: DeclareAttack) -> Result<Vec<Event>, DomainError> {
+        // The command must name the match this session actually records.
+        if cmd.match_id != self.match_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets match '{}' but this session records '{}'",
+                cmd.match_id, self.match_id
+            )));
+        }
+        // A player must be named, and it must be one of the configured Outfits.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a playerId must be provided".to_string(),
+            ));
+        }
+        let seat = self.seat_for_player(&cmd.player_id)?;
+
+        // Combat must name both sides. The rules engine slice does not yet carry
+        // individual combatant stats, so the target id is the defeated Boss ref.
+        if cmd.attacker_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "an attackerId must be provided".to_string(),
+            ));
+        }
+        if cmd.defender_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a defenderId must be provided".to_string(),
+            ));
+        }
+        let defending_player = Self::opponent_of(seat);
+        let expected_defender_id = self.outfit_at(defending_player).boss_name.clone();
+        if cmd.defender_id != expected_defender_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "defenderId '{}' does not name player {defending_player:?}'s Boss target '{}'",
+                cmd.defender_id, expected_defender_id
+            )));
+        }
+
+        // Enforce every match-play invariant before applying the attack.
+        self.ensure_boards_within_caps()?;
+        self.ensure_heat_within_bounds()?;
+        self.ensure_starting_juice_valid()?;
+        self.ensure_decks_nonempty()?;
+        self.ensure_heists_prereqs_satisfied()?;
+        self.ensure_bosses_alive()?;
+        let turn_player = self.ensure_opening_player_designated()?;
+
+        // Turn-ownership: an attack is declared only by the player whose turn it is.
+        if seat != turn_player {
+            return Err(DomainError::InvariantViolation(format!(
+                "player '{}' (seat {seat:?}) may not declare an attack; it is player {turn_player:?}'s turn",
+                cmd.player_id
+            )));
+        }
+
+        let defeated_player_id = self.outfit_at(defending_player).name.clone();
+
+        let resolved = Event::CombatResolved(CombatResolved {
+            match_id: cmd.match_id.clone(),
+            attacking_player_id: cmd.player_id,
+            attacking_player: seat,
+            attacker_id: cmd.attacker_id,
+            defending_player,
+            defender_id: cmd.defender_id.clone(),
+        });
+        let defeated = Event::BossDefeated(BossDefeated {
+            match_id: cmd.match_id,
+            defeated_player_id,
+            defeated_player: defending_player,
+            boss_id: cmd.defender_id,
+            winner: seat,
+        });
+
+        // Apply the lethal combat result so the aggregate no longer carries a
+        // live defending Boss after emitting the defeat.
+        self.outfit_at_mut(defending_player).boss_hp = 0;
+
+        self.root.record(Box::new(resolved.clone()));
+        self.root.record(Box::new(defeated.clone()));
+        Ok(vec![resolved, defeated])
+    }
 }
 
 impl Aggregate for GameSession {
@@ -886,6 +1095,14 @@ impl Aggregate for GameSession {
                     DomainError::InvariantViolation(format!("malformed PlayCardCmd payload: {e}"))
                 })?;
                 self.play_card(cmd)
+            }
+            DECLARE_ATTACK => {
+                let cmd: DeclareAttack = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!(
+                        "malformed DeclareAttackCmd payload: {e}"
+                    ))
+                })?;
+                self.declare_attack(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -1632,5 +1849,280 @@ mod tests {
         assert_eq!(command.name, PlayCard::COMMAND);
         let decoded: PlayCard = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_play_card());
+    }
+
+    // ---- DeclareAttackCmd (S-5) --------------------------------------------
+
+    /// A legal `DeclareAttackCmd` for `m-1`: the turn-holding player `A`
+    /// commits an attacker into player `B`'s Boss target.
+    fn valid_declare_attack() -> DeclareAttack {
+        DeclareAttack::new("m-1", "m-1-a", "attacker-1", "m-1-b-boss")
+    }
+
+    // Scenario: Successfully execute DeclareAttackCmd — combat.resolved and
+    // boss.defeated are emitted in order.
+    #[test]
+    fn declares_attack_and_emits_combat_resolved_and_boss_defeated_events() {
+        let mut session = valid_session();
+
+        let events = session
+            .execute(valid_declare_attack().into_command())
+            .expect("a valid attack should succeed");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type(), "combat.resolved");
+        assert_eq!(events[1].event_type(), "boss.defeated");
+        match &events[0] {
+            Event::CombatResolved(resolved) => {
+                assert_eq!(resolved.match_id, "m-1");
+                assert_eq!(resolved.attacking_player_id, "m-1-a");
+                assert_eq!(resolved.attacking_player, Player::A);
+                assert_eq!(resolved.attacker_id, "attacker-1");
+                assert_eq!(resolved.defending_player, Player::B);
+                assert_eq!(resolved.defender_id, "m-1-b-boss");
+            }
+            other => panic!("expected CombatResolved, got {other:?}"),
+        }
+        match &events[1] {
+            Event::BossDefeated(defeated) => {
+                assert_eq!(defeated.match_id, "m-1");
+                assert_eq!(defeated.defeated_player_id, "m-1-b");
+                assert_eq!(defeated.defeated_player, Player::B);
+                assert_eq!(defeated.boss_id, "m-1-b-boss");
+                assert_eq!(defeated.winner, Player::A);
+            }
+            other => panic!("expected BossDefeated, got {other:?}"),
+        }
+        assert_eq!(session.version(), 2);
+        assert_eq!(session.uncommitted_events().len(), 2);
+        assert_eq!(
+            session.uncommitted_events()[0].event_type(),
+            "combat.resolved"
+        );
+        assert_eq!(
+            session.uncommitted_events()[1].event_type(),
+            "boss.defeated"
+        );
+
+        let err = session
+            .execute(valid_declare_attack().into_command())
+            .expect_err("a defeated Boss must end the match before another attack");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 2);
+    }
+
+    // Scenario: rejected — Juice starts at 1 and remains hard-capped at 10.
+    #[test]
+    fn declare_attack_rejects_when_starting_juice_is_not_one() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_juice = 3;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_declare_attack().into_command())
+            .expect_err("an illegal opening Juice must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn declare_attack_rejects_when_available_juice_exceeds_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.available_juice = JUICE_CAP + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_declare_attack().into_command())
+            .expect_err("available Juice over the hard cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a board may hold at most 7 Operators and 3 Vehicles.
+    #[test]
+    fn declare_attack_rejects_when_board_exceeds_operator_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.operators = MAX_OPERATORS + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_declare_attack().into_command())
+            .expect_err("an over-capacity board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn declare_attack_rejects_when_board_exceeds_vehicle_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.vehicles = MAX_VEHICLES + 1;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_declare_attack().into_command())
+            .expect_err("an over-capacity vehicle board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — Heat is bounded 0..10 and no state may leave it.
+    #[test]
+    fn declare_attack_rejects_when_heat_leaves_bounds() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_heat = *HEAT_BOUNDS.end() + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_declare_attack().into_command())
+            .expect_err("Heat outside its bounds must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a Heist resolves only after its prerequisite queue is
+    // satisfied.
+    #[test]
+    fn declare_attack_rejects_when_heist_resolved_with_outstanding_prereqs() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.heist_resolved = true;
+        outfit.outstanding_heist_prereqs = 2;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_declare_attack().into_command())
+            .expect_err("a Heist resolved with outstanding prereqs must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — drawing from an empty deck deals Fatigue instead of a
+    // card, so a match may not carry a deckless Outfit.
+    #[test]
+    fn declare_attack_rejects_when_deck_is_empty() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.deck_size = 0;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_declare_attack().into_command())
+            .expect_err("an empty deck must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a command is valid only for the player whose turn it
+    // currently is; an attack by the off-turn player is rejected.
+    #[test]
+    fn declare_attack_rejects_when_not_the_players_turn() {
+        let mut session = valid_session();
+        // Player A holds the turn; player B tries to declare an attack.
+        let err = session
+            .execute(DeclareAttack::new("m-1", "m-1-b", "attacker-1", "m-1-a-boss").into_command())
+            .expect_err("an off-turn attack must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A turn-less setup is likewise ill-formed for an attack.
+    #[test]
+    fn declare_attack_rejects_when_no_opening_player_is_designated() {
+        let mut session = valid_session();
+        session.set_opening_player(None);
+
+        let err = session
+            .execute(valid_declare_attack().into_command())
+            .expect_err("a turn-less setup must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a match ends the instant a Boss's HP reaches 0 or
+    // below, so a defeated Boss cannot be carried into an attack.
+    #[test]
+    fn declare_attack_rejects_when_a_boss_is_defeated() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.boss_hp = 0;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_declare_attack().into_command())
+            .expect_err("a defeated Boss must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An attack must name the match this session records.
+    #[test]
+    fn declare_attack_rejects_when_command_targets_a_different_match() {
+        let mut session = valid_session();
+        let err = session
+            .execute(
+                DeclareAttack::new("other-match", "m-1-a", "attacker-1", "m-1-b-boss")
+                    .into_command(),
+            )
+            .expect_err("a mismatched match id must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An attack must name a configured Outfit.
+    #[test]
+    fn declare_attack_rejects_unknown_player() {
+        let mut session = valid_session();
+        let err = session
+            .execute(DeclareAttack::new("m-1", "ghost", "attacker-1", "m-1-b-boss").into_command())
+            .expect_err("an unknown player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An attack must identify the attacking combatant.
+    #[test]
+    fn declare_attack_rejects_blank_attacker_id() {
+        let mut session = valid_session();
+        let err = session
+            .execute(DeclareAttack::new("m-1", "m-1-a", " ", "m-1-b-boss").into_command())
+            .expect_err("a blank attackerId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An attack must identify the defending target.
+    #[test]
+    fn declare_attack_rejects_blank_defender_id() {
+        let mut session = valid_session();
+        let err = session
+            .execute(DeclareAttack::new("m-1", "m-1-a", "attacker-1", "").into_command())
+            .expect_err("a blank defenderId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An attack that resolves into boss.defeated must target the opposing Boss.
+    #[test]
+    fn declare_attack_rejects_non_opposing_boss_defender_id() {
+        let mut session = valid_session();
+        let err = session
+            .execute(DeclareAttack::new("m-1", "m-1-a", "attacker-1", "target-1").into_command())
+            .expect_err("a non-Boss defenderId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn declare_attack_command_payload_round_trips() {
+        let cmd = valid_declare_attack();
+        let command = cmd.into_command();
+        assert_eq!(command.name, DeclareAttack::COMMAND);
+        let decoded: DeclareAttack = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_declare_attack());
     }
 }
