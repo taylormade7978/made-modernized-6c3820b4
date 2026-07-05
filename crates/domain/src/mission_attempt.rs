@@ -15,7 +15,9 @@
 //! [`ClaimFirstClearReward`] (`ClaimFirstClearRewardCmd`) claims the reward for
 //! a player and mission. [`AdvanceMissionState`] (`AdvanceMissionStateCmd`)
 //! advances the scripted mission state and signals barks/panels at the supplied
-//! trigger. On success the aggregate applies and records the resulting event.
+//! trigger. [`CompleteMission`] (`CompleteMissionCmd`) resolves the mission
+//! outcome and shows the outcome panels. On success the aggregate applies and
+//! records the resulting event.
 
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +31,9 @@ const CLAIM_FIRST_CLEAR_REWARD: &str = "ClaimFirstClearRewardCmd";
 
 /// The command name that advances scripted mission state.
 const ADVANCE_MISSION_STATE: &str = "AdvanceMissionStateCmd";
+
+/// The command name that resolves the mission outcome and shows outcome panels.
+const COMPLETE_MISSION: &str = "CompleteMissionCmd";
 
 /// The `ClaimFirstClearRewardCmd` payload. Field names use the service's
 /// `camelCase` schema.
@@ -98,6 +103,41 @@ impl AdvanceMissionState {
 /// Story-facing alias for the command payload type.
 pub type AdvanceMissionStateCmd = AdvanceMissionState;
 
+/// The `CompleteMissionCmd` payload. Field names use the service's
+/// `camelCase` schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteMission {
+    /// The MissionAttempt being completed; must name this aggregate and must be
+    /// non-empty.
+    pub mission_attempt_id: String,
+    /// The resolved mission outcome to show in the outcome panels; must be
+    /// non-empty.
+    pub outcome: String,
+}
+
+impl CompleteMission {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = COMPLETE_MISSION;
+
+    /// Build a command completing `mission_attempt_id` with `outcome`.
+    pub fn new(mission_attempt_id: impl Into<String>, outcome: impl Into<String>) -> Self {
+        Self {
+            mission_attempt_id: mission_attempt_id.into(),
+            outcome: outcome.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload.
+    pub fn into_command(&self) -> Command {
+        let payload = serde_json::to_vec(self).expect("CompleteMission is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// Story-facing alias for the command payload type.
+pub type CompleteMissionCmd = CompleteMission;
+
 /// The first-clear reward claim carried by [`Event::FirstClearRewardClaimed`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirstClearRewardClaimed {
@@ -118,6 +158,15 @@ pub struct MissionStateAdvanced {
     pub scripted_state_step: u64,
 }
 
+/// The resolved mission outcome carried by [`Event::MissionCompleted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionCompleted {
+    /// The MissionAttempt whose outcome was resolved.
+    pub mission_attempt_id: String,
+    /// The resolved outcome shown in the outcome panels.
+    pub outcome: String,
+}
+
 /// Domain events emitted by [`MissionAttempt`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -125,6 +174,8 @@ pub enum Event {
     FirstClearRewardClaimed(FirstClearRewardClaimed),
     /// Scripted mission state advanced and its trigger-side effects should fire.
     MissionStateAdvanced(MissionStateAdvanced),
+    /// The mission outcome was resolved and its outcome panels should be shown.
+    MissionCompleted(MissionCompleted),
 }
 
 impl DomainEvent for Event {
@@ -132,6 +183,7 @@ impl DomainEvent for Event {
         match self {
             Event::FirstClearRewardClaimed(_) => "first.clear.reward.claimed",
             Event::MissionStateAdvanced(_) => "mission.state.advanced",
+            Event::MissionCompleted(_) => "mission.completed",
         }
     }
 }
@@ -153,6 +205,8 @@ pub struct MissionAttempt {
     /// Current scripted mission state step. Each accepted advance moves this
     /// forward by one.
     scripted_state_step: u64,
+    /// Whether the mission outcome has already been resolved for this attempt.
+    mission_completed: bool,
 }
 
 impl MissionAttempt {
@@ -166,6 +220,7 @@ impl MissionAttempt {
             reprise_rotation_eligible: true,
             scripted_points_satisfied: true,
             scripted_state_step: 0,
+            mission_completed: false,
         }
     }
 
@@ -192,6 +247,11 @@ impl MissionAttempt {
     /// Current scripted mission state step.
     pub fn scripted_state_step(&self) -> u64 {
         self.scripted_state_step
+    }
+
+    /// Whether the mission outcome has been resolved on this attempt.
+    pub fn mission_completed(&self) -> bool {
+        self.mission_completed
     }
 
     /// Model whether the fixed first-clear reward has already been claimed.
@@ -274,6 +334,9 @@ impl MissionAttempt {
             Event::MissionStateAdvanced(advanced) => {
                 self.scripted_state_step = advanced.scripted_state_step;
             }
+            Event::MissionCompleted(_) => {
+                self.mission_completed = true;
+            }
         }
     }
 
@@ -353,6 +416,41 @@ impl MissionAttempt {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `CompleteMissionCmd`.
+    fn complete_mission(&mut self, cmd: CompleteMission) -> Result<Vec<Event>, DomainError> {
+        if cmd.mission_attempt_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "mission attempt '{}' requires a valid missionAttemptId to complete the mission",
+                self.id
+            )));
+        }
+        if cmd.outcome.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "mission attempt '{}' requires a valid outcome to complete the mission",
+                self.id
+            )));
+        }
+        if cmd.mission_attempt_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets mission attempt '{}' but this aggregate is mission attempt '{}'",
+                cmd.mission_attempt_id, self.id
+            )));
+        }
+
+        self.ensure_first_clear_reward_available()?;
+        self.ensure_prologue_predecessor_cleared()?;
+        self.ensure_reprise_rotation_eligible()?;
+        self.ensure_scripted_points_satisfied()?;
+
+        let event = Event::MissionCompleted(MissionCompleted {
+            mission_attempt_id: cmd.mission_attempt_id,
+            outcome: cmd.outcome,
+        });
+        self.apply(&event);
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for MissionAttempt {
@@ -381,6 +479,15 @@ impl Aggregate for MissionAttempt {
                         ))
                     })?;
                 self.advance_mission_state(cmd)
+            }
+            COMPLETE_MISSION => {
+                let cmd: CompleteMission =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed CompleteMissionCmd payload: {e}"
+                        ))
+                    })?;
+                self.complete_mission(cmd)
             }
             _ => Err(DomainError::unknown_command(
                 <Self as Aggregate>::aggregate_type(),
@@ -412,6 +519,10 @@ mod tests {
 
     fn valid_advance_cmd() -> AdvanceMissionState {
         AdvanceMissionState::new("attempt-01", "boss_hp_50")
+    }
+
+    fn valid_complete_cmd() -> CompleteMission {
+        CompleteMission::new("attempt-01", "victory")
     }
 
     // Scenario: Successfully execute ClaimFirstClearRewardCmd.
@@ -703,5 +814,145 @@ mod tests {
         assert_eq!(command.name, ClaimFirstClearReward::COMMAND);
         let decoded: ClaimFirstClearReward = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // Scenario: Successfully execute CompleteMissionCmd.
+    #[test]
+    fn completes_mission_and_emits_event() {
+        let mut attempt = ready_attempt();
+
+        let events = attempt
+            .execute(valid_complete_cmd().into_command())
+            .expect("valid mission completion should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "mission.completed");
+        match &events[0] {
+            Event::MissionCompleted(completed) => {
+                assert_eq!(completed.mission_attempt_id, "attempt-01");
+                assert_eq!(completed.outcome, "victory");
+            }
+            other => panic!("expected MissionCompleted, got {other:?}"),
+        }
+        assert!(attempt.mission_completed());
+        assert_eq!(attempt.version(), 1);
+        assert_eq!(attempt.uncommitted_events().len(), 1);
+        assert_eq!(
+            attempt.uncommitted_events()[0].event_type(),
+            "mission.completed"
+        );
+    }
+
+    // Scenario: CompleteMissionCmd rejected - The fixed $MADE reward for a
+    // mission is granted only on the player's first clear, ever.
+    #[test]
+    fn complete_rejects_when_first_clear_reward_was_already_claimed() {
+        let mut attempt = ready_attempt();
+        attempt.set_first_clear_reward_claimed(true);
+
+        let err = attempt
+            .execute(valid_complete_cmd().into_command())
+            .expect_err(
+                "completing a mission that violates first-clear reward rules must be rejected",
+            );
+
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert!(!attempt.mission_completed());
+        assert_eq!(attempt.version(), 0);
+    }
+
+    // Scenario: CompleteMissionCmd rejected - Prologue missions are gated in
+    // sequence; a mission unlocks only after its predecessor is cleared.
+    #[test]
+    fn complete_rejects_when_prologue_predecessor_is_uncleared() {
+        let mut attempt = ready_attempt();
+        attempt.set_prologue_predecessor_cleared(false);
+
+        let err = attempt
+            .execute(valid_complete_cmd().into_command())
+            .expect_err("completing a mission behind an uncleared predecessor must be rejected");
+
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert!(!attempt.mission_completed());
+        assert_eq!(attempt.version(), 0);
+    }
+
+    // Scenario: CompleteMissionCmd rejected - Only missions in today's Reprise
+    // rotation are eligible for repeat rewards.
+    #[test]
+    fn complete_rejects_when_mission_is_not_in_reprise_rotation() {
+        let mut attempt = ready_attempt();
+        attempt.set_reprise_rotation_eligible(false);
+
+        let err = attempt
+            .execute(valid_complete_cmd().into_command())
+            .expect_err("completing a mission outside today's Reprise rotation must be rejected");
+
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert!(!attempt.mission_completed());
+        assert_eq!(attempt.version(), 0);
+    }
+
+    // Scenario: CompleteMissionCmd rejected - Per-mission special rules and boss
+    // HP-threshold barks fire exactly at their scripted points.
+    #[test]
+    fn complete_rejects_when_scripted_points_are_not_satisfied() {
+        let mut attempt = ready_attempt();
+        attempt.set_scripted_points_satisfied(false);
+
+        let err = attempt
+            .execute(valid_complete_cmd().into_command())
+            .expect_err("completing a mission at the wrong scripted point must be rejected");
+
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert!(!attempt.mission_completed());
+        assert_eq!(attempt.version(), 0);
+    }
+
+    #[test]
+    fn complete_rejects_command_for_a_different_attempt() {
+        let mut attempt = ready_attempt();
+
+        let err = attempt
+            .execute(CompleteMission::new("attempt-99", "victory").into_command())
+            .expect_err("a completion command for another attempt must be rejected");
+
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert!(!attempt.mission_completed());
+        assert_eq!(attempt.version(), 0);
+    }
+
+    #[test]
+    fn complete_rejects_missing_mission_attempt_id() {
+        let mut attempt = ready_attempt();
+
+        let err = attempt
+            .execute(CompleteMission::new("   ", "victory").into_command())
+            .expect_err("missing missionAttemptId must be rejected");
+
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(attempt.version(), 0);
+    }
+
+    #[test]
+    fn complete_rejects_missing_outcome() {
+        let mut attempt = ready_attempt();
+
+        let err = attempt
+            .execute(CompleteMission::new("attempt-01", "   ").into_command())
+            .expect_err("missing outcome must be rejected");
+
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(attempt.version(), 0);
+    }
+
+    #[test]
+    fn complete_command_payload_round_trips() {
+        let cmd = valid_complete_cmd();
+        let command = cmd.into_command();
+
+        assert_eq!(command.name, CompleteMission::COMMAND);
+        let decoded: CompleteMission = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_complete_cmd());
     }
 }
