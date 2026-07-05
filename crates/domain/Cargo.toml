@@ -1,0 +1,13 @@
+[package]
+name = "domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded-context aggregate stubs (MatchReplay, CardDefinition, BossDefinition, ExpansionSet, MatchmakingTicket, RankedStanding, Season) and their repository contracts."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+shared = { workspace = true }

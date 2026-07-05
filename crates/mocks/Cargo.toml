@@ -1,0 +1,15 @@
+[package]
+name = "mocks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-memory mock repository adapters implementing the domain repository contracts, plus the scaffold test suite."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+shared = { workspace = true }
+domain = { workspace = true }
+game-session = { workspace = true }

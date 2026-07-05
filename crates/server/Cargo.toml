@@ -1,0 +1,20 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authoritative WebSocket game server (actix-web + actix-ws). Driving adapter wiring the domain aggregates and mock repositories."
+
+[[bin]]
+name = "made-server"
+path = "src/main.rs"
+
+[dependencies]
+shared = { workspace = true }
+domain = { workspace = true }
+game-session = { workspace = true }
+mocks = { workspace = true }
+actix-web = { workspace = true }
+actix-ws = { workspace = true }
+futures-util = "0.3"

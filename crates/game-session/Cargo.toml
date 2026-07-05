@@ -1,0 +1,23 @@
+[package]
+name = "game-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GameSession aggregate / rules crate. Compiles to WASM via wasm-pack for shared server/client execution."
+
+[lib]
+# cdylib for the wasm-pack build (browser/client); rlib so the actix-web
+# server and the mock repositories can link the same rules on the host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shared = { workspace = true }
+# wasm-bindgen is optional and only pulled in for the `wasm` feature, so the
+# host build (`cargo build --workspace`) stays free of wasm-only dependencies.
+wasm-bindgen = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enabled by wasm-pack: `wasm-pack build crates/game-session -- --features wasm`
+wasm = ["dep:wasm-bindgen"]

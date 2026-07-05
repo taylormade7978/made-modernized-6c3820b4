@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Build all targets (libs, bins, AND test targets) so a broken test
+      # target fails CI here rather than slipping through a plain `cargo build`.
+      - name: Build (all targets)
+        run: cargo build --workspace --all-targets
+
+      - name: Compile test targets
+        run: cargo test --workspace --no-run
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The GameSession rules crate must also compile to WASM for the client.
+      - name: Build GameSession for wasm32
+        run: cargo build -p game-session --features wasm --target wasm32-unknown-unknown
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check

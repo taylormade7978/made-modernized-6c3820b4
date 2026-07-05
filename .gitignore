@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# wasm-pack output
+/crates/game-session/pkg
