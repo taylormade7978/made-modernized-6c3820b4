@@ -18,13 +18,19 @@
 //!    Outfit if it is present (quantity ≥ 1) in the collection; a base card at
 //!    quantity zero cannot carry a cosmetic.
 //!
-//! The only command implemented so far is [`EquipCosmetic`]
-//! (`EquipCosmeticCmd`): it equips a cosmetic skin onto an owned base card,
-//! enforcing every invariant, and on success emits [`Event::CosmeticEquipped`]
-//! (`cosmetic.equipped`). This module is hand-written (it does not use
-//! `shared::stub_aggregate!`) but preserves the same public surface — a
-//! [`PlayerCollection`] aggregate and a [`PlayerCollectionRepository`] port — so
-//! the persistence adapters in `crates/mocks` compile against it unchanged.
+//! Two commands are implemented:
+//!
+//! - [`EquipCosmetic`] (`EquipCosmeticCmd`): equips a cosmetic skin onto an
+//!   owned base card, enforcing every invariant, and on success emits
+//!   [`Event::CosmeticEquipped`] (`cosmetic.equipped`).
+//! - [`GrantCards`] (`GrantCardsCmd`): adds cards to the collection from packs,
+//!   rewards, or fulfillment, enforcing every invariant, and on success emits
+//!   [`Event::CardsGranted`] (`cards.granted`).
+//!
+//! This module is hand-written (it does not use `shared::stub_aggregate!`) but
+//! preserves the same public surface — a [`PlayerCollection`] aggregate and a
+//! [`PlayerCollectionRepository`] port — so the persistence adapters in
+//! `crates/mocks` compile against it unchanged.
 
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +40,9 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "PlayerCollection";
 
-/// The command name [`PlayerCollection::execute`] recognizes.
+/// The command names [`PlayerCollection::execute`] recognizes.
 const EQUIP_COSMETIC: &str = "EquipCosmeticCmd";
+const GRANT_CARDS: &str = "GrantCardsCmd";
 
 /// The `EquipCosmeticCmd` payload: which player equips which cosmetic skin onto
 /// which owned base card. Field names use the collection service's `camelCase`
@@ -83,6 +90,80 @@ impl EquipCosmetic {
     }
 }
 
+/// A single line item in a [`GrantCards`] command: how many copies of one card
+/// are being added to the collection. Field names use the collection service's
+/// `camelCase` schema.
+///
+/// The quantity is an `i64` rather than an unsigned type for the same reason the
+/// aggregate's owned quantity is: so a *negative* granted quantity is
+/// representable and the "owned card quantities are always non-negative"
+/// invariant can be exercised rather than made vacuous by the type system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardGrant {
+    /// The card being granted; must be non-empty.
+    pub card_id: String,
+    /// How many copies are granted; must be non-negative.
+    pub quantity: i64,
+}
+
+impl CardGrant {
+    /// Build a grant of `quantity` copies of `card_id`.
+    pub fn new(card_id: impl Into<String>, quantity: i64) -> Self {
+        Self {
+            card_id: card_id.into(),
+            quantity,
+        }
+    }
+}
+
+/// The `GrantCardsCmd` payload: which player receives which cards, and the
+/// source the grant was resolved from (a pack opening, a reward, or a
+/// fulfillment). Field names use the collection service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`GrantCards::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`PlayerCollection::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrantCards {
+    /// Identity of the player receiving the cards; must name the player this
+    /// collection belongs to, and must be non-empty.
+    pub player_id: String,
+    /// The cards being added to the collection; must be non-empty, and every
+    /// grant must carry a non-empty card id and a non-negative quantity.
+    pub card_grants: Vec<CardGrant>,
+    /// Where the grant came from (e.g. `"pack"`, `"reward"`, `"fulfillment"`);
+    /// must be non-empty.
+    pub source: String,
+}
+
+impl GrantCards {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = GRANT_CARDS;
+
+    /// Build a command granting `card_grants` to `player_id` from `source`.
+    pub fn new(
+        player_id: impl Into<String>,
+        card_grants: Vec<CardGrant>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            player_id: player_id.into(),
+            card_grants,
+            source: source.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`PlayerCollection::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("GrantCards is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The cosmetic that was equipped, carried by [`Event::CosmeticEquipped`] and
 /// thus by the emitted `cosmetic.equipped` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,17 +176,32 @@ pub struct CosmeticEquipped {
     pub cosmetic_skin_ref: String,
 }
 
+/// The cards that were granted, carried by [`Event::CardsGranted`] and thus by
+/// the emitted `cards.granted` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardsGranted {
+    /// The player who received the cards.
+    pub player_id: String,
+    /// The cards that were added to the collection.
+    pub card_grants: Vec<CardGrant>,
+    /// Where the grant came from (e.g. `"pack"`, `"reward"`, `"fulfillment"`).
+    pub source: String,
+}
+
 /// Domain events emitted by [`PlayerCollection`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A cosmetic skin was equipped onto an owned base card.
     CosmeticEquipped(CosmeticEquipped),
+    /// Cards were granted to the collection from a pack, reward, or fulfillment.
+    CardsGranted(CardsGranted),
 }
 
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::CosmeticEquipped(_) => "cosmetic.equipped",
+            Event::CardsGranted(_) => "cards.granted",
         }
     }
 }
@@ -309,6 +405,71 @@ impl PlayerCollection {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `GrantCardsCmd`: verify the command carries a valid player id
+    /// (naming this collection's player), a source, and at least one well-formed
+    /// card grant, enforce every collection invariant (server-authoritative,
+    /// owned base card, non-negative quantity, and present-for-inclusion), and
+    /// emit [`Event::CardsGranted`].
+    fn grant_cards(&mut self, cmd: GrantCards) -> Result<Vec<Event>, DomainError> {
+        // A valid playerId, source, and at least one cardGrant must be supplied.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "collection '{}' requires a valid playerId to grant cards",
+                self.id
+            )));
+        }
+        if cmd.source.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "collection '{}' requires a valid source to grant cards",
+                self.id
+            )));
+        }
+        if cmd.card_grants.is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "collection '{}' requires at least one cardGrant to grant cards",
+                self.id
+            )));
+        }
+        for grant in &cmd.card_grants {
+            if grant.card_id.trim().is_empty() {
+                return Err(DomainError::InvariantViolation(format!(
+                    "collection '{}' requires a valid cardId in every cardGrant",
+                    self.id
+                )));
+            }
+            // Owned card quantities are always non-negative — a client may not
+            // grant a negative quantity.
+            if grant.quantity < 0 {
+                return Err(DomainError::InvariantViolation(format!(
+                    "collection '{}' received cardGrant for '{}' at quantity {}; owned card \
+                     quantities are always non-negative",
+                    self.id, grant.card_id, grant.quantity
+                )));
+            }
+        }
+        // The command must name the player this collection actually belongs to.
+        if cmd.player_id != self.player_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets player '{}' but this collection belongs to '{}'",
+                cmd.player_id, self.player_id
+            )));
+        }
+
+        // Enforce every standing collection invariant before recording the grant.
+        self.ensure_server_resolved()?;
+        self.ensure_owns_base_card(&cmd.card_grants[0].card_id)?;
+        self.ensure_quantity_non_negative(&cmd.card_grants[0].card_id)?;
+        self.ensure_present_for_inclusion(&cmd.card_grants[0].card_id)?;
+
+        let event = Event::CardsGranted(CardsGranted {
+            player_id: cmd.player_id,
+            card_grants: cmd.card_grants,
+            source: cmd.source,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for PlayerCollection {
@@ -327,6 +488,12 @@ impl Aggregate for PlayerCollection {
                     ))
                 })?;
                 self.equip_cosmetic(cmd)
+            }
+            GRANT_CARDS => {
+                let cmd: GrantCards = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed GrantCardsCmd payload: {e}"))
+                })?;
+                self.grant_cards(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -379,6 +546,7 @@ mod tests {
                 assert_eq!(equipped.base_card_id, "c-01");
                 assert_eq!(equipped.cosmetic_skin_ref, "skin-neon");
             }
+            other => panic!("expected CosmeticEquipped, got {other:?}"),
         }
         // The collection recorded the event.
         assert_eq!(collection.version(), 1);
@@ -502,5 +670,158 @@ mod tests {
         assert_eq!(command.name, EquipCosmetic::COMMAND);
         let decoded: EquipCosmetic = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // ---- GrantCardsCmd (S-36) ---------------------------------------------
+
+    /// A command granting two copies of `c-01` and one of `c-02` to `p-01` from
+    /// a pack opening.
+    fn valid_grant_cmd() -> GrantCards {
+        GrantCards::new(
+            "p-01",
+            vec![CardGrant::new("c-01", 2), CardGrant::new("c-02", 1)],
+            "pack",
+        )
+    }
+
+    // Scenario: Successfully execute GrantCardsCmd.
+    #[test]
+    fn grants_and_emits_cards_granted_event() {
+        let mut collection = ready_collection();
+
+        let events = collection
+            .execute(valid_grant_cmd().into_command())
+            .expect("valid grant should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "cards.granted");
+        match &events[0] {
+            Event::CardsGranted(granted) => {
+                assert_eq!(granted.player_id, "p-01");
+                assert_eq!(granted.source, "pack");
+                assert_eq!(
+                    granted.card_grants,
+                    vec![CardGrant::new("c-01", 2), CardGrant::new("c-02", 1)]
+                );
+            }
+            other => panic!("expected CardsGranted, got {other:?}"),
+        }
+        // The collection recorded the event.
+        assert_eq!(collection.version(), 1);
+        assert_eq!(collection.uncommitted_events().len(), 1);
+        assert_eq!(
+            collection.uncommitted_events()[0].event_type(),
+            "cards.granted"
+        );
+    }
+
+    // Scenario: rejected — a card may only be included in an Outfit if it is
+    // present (qty ≥ 1) in the collection.
+    #[test]
+    fn grant_rejects_when_base_card_not_present() {
+        let mut collection = ready_collection();
+        collection.set_base_card_quantity(0);
+
+        let err = collection
+            .execute(valid_grant_cmd().into_command())
+            .expect_err("an at-quantity-zero base card must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // Scenario: rejected — owned card quantities are always non-negative.
+    #[test]
+    fn grant_rejects_when_quantity_negative() {
+        let mut collection = ready_collection();
+        collection.set_base_card_quantity(-1);
+
+        let err = collection
+            .execute(valid_grant_cmd().into_command())
+            .expect_err("a negative owned quantity must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // Scenario: rejected — a cosmetic skin may only be equipped onto a base card
+    // the player actually owns (the collection must own the referenced base card).
+    #[test]
+    fn grant_rejects_when_base_card_not_owned() {
+        let mut collection = ready_collection();
+        collection.set_base_card_in_collection(false);
+
+        let err = collection
+            .execute(valid_grant_cmd().into_command())
+            .expect_err("granting against an unowned base card must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // Scenario: rejected — cosmetic equips (card mutations) are resolved
+    // server-side and never trusted from the client.
+    #[test]
+    fn grant_rejects_when_client_asserted() {
+        let mut collection = ready_collection();
+        collection.set_server_resolved(false);
+
+        let err = collection
+            .execute(valid_grant_cmd().into_command())
+            .expect_err("a client-asserted grant must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // A grant carrying a negative per-grant quantity is rejected up front.
+    #[test]
+    fn grant_rejects_negative_grant_quantity() {
+        let mut collection = ready_collection();
+        let cmd = GrantCards::new("p-01", vec![CardGrant::new("c-01", -3)], "reward");
+
+        let err = collection
+            .execute(cmd.into_command())
+            .expect_err("a negative granted quantity must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // A grant naming a different player is rejected before any invariant runs.
+    #[test]
+    fn grant_rejects_command_for_a_different_player() {
+        let mut collection = ready_collection();
+        let cmd = GrantCards::new("p-99", vec![CardGrant::new("c-01", 1)], "reward");
+
+        let err = collection
+            .execute(cmd.into_command())
+            .expect_err("a grant for another player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(collection.version(), 0);
+    }
+
+    // Grants missing a required field (player, source, grants, or card id) are
+    // rejected.
+    #[test]
+    fn grant_rejects_command_with_missing_fields() {
+        let cmds = [
+            GrantCards::new("   ", vec![CardGrant::new("c-01", 1)], "pack"),
+            GrantCards::new("p-01", vec![CardGrant::new("c-01", 1)], "   "),
+            GrantCards::new("p-01", vec![], "pack"),
+            GrantCards::new("p-01", vec![CardGrant::new("   ", 1)], "pack"),
+        ];
+        for cmd in cmds {
+            let mut collection = ready_collection();
+            let err = collection
+                .execute(cmd.into_command())
+                .expect_err("a grant with a missing field must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(collection.version(), 0);
+        }
+    }
+
+    #[test]
+    fn grant_command_payload_round_trips() {
+        let cmd = valid_grant_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, GrantCards::COMMAND);
+        let decoded: GrantCards = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_grant_cmd());
     }
 }
