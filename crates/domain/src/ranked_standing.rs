@@ -42,9 +42,9 @@
 //! [`Event::DisconnectPenaltyApplied`] (`disconnect.penalty.applied`).
 //! [`AwardStar`] (`AwardStarCmd`) grants a star (plus a streak bonus) on a win,
 //! enforcing the same invariants; it emits [`Event::StarAwarded`]
-//! (`ranked.star.awarded`) and, when the awarded stars fill the tier, also
+//! (`star.awarded`) and, when the awarded stars fill the tier, also
 //! promotes the visible rank and emits [`Event::RankPromoted`]
-//! (`ranked.rank.promoted`).
+//! (`rank.promoted`).
 //! This module is hand-written (it no longer uses `shared::stub_aggregate!`) but
 //! preserves the same public surface — a [`RankedStanding`] aggregate and a
 //! [`RankedStandingRepository`] port — so the persistence adapters in
@@ -476,7 +476,7 @@ pub struct RankFloorProtected {
 }
 
 /// A star (and, when a streak is live, a bonus star) awarded on a win; carried by
-/// [`Event::StarAwarded`] and thus by the emitted `ranked.star.awarded` event.
+/// [`Event::StarAwarded`] and thus by the emitted `star.awarded` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StarAwarded {
     /// The standing credited with the star(s).
@@ -493,7 +493,7 @@ pub struct StarAwarded {
 
 /// A promotion to the next tier, triggered when awarded stars fill the current
 /// tier; carried by [`Event::RankPromoted`] and thus by the emitted
-/// `ranked.rank.promoted` event.
+/// `rank.promoted` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankPromoted {
     /// The standing that was promoted.
@@ -581,8 +581,8 @@ impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::RankFloorProtected(_) => "ranked.rank.floor.protected",
-            Event::StarAwarded(_) => "ranked.star.awarded",
-            Event::RankPromoted(_) => "ranked.rank.promoted",
+            Event::StarAwarded(_) => "star.awarded",
+            Event::RankPromoted(_) => "rank.promoted",
             Event::SmurfElevated(_) => "smurf.elevated",
             Event::DisconnectPenaltyApplied(_) => "disconnect.penalty.applied",
             Event::MatchResultRecorded(_) => "match.result.recorded",
@@ -2253,8 +2253,8 @@ mod tests {
             .expect("awarding a tier-filling star should succeed");
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type(), "ranked.star.awarded");
-        assert_eq!(events[1].event_type(), "ranked.rank.promoted");
+        assert_eq!(events[0].event_type(), "star.awarded");
+        assert_eq!(events[1].event_type(), "rank.promoted");
         match &events[0] {
             Event::StarAwarded(awarded) => {
                 assert_eq!(awarded.standing_id, "r-01");
@@ -2424,7 +2424,7 @@ mod tests {
             .expect("awarding a non-filling star should succeed");
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type(), "ranked.star.awarded");
+        assert_eq!(events[0].event_type(), "star.awarded");
         assert_eq!(standing.tier(), Tier::Corner);
         assert_eq!(standing.version(), 1);
     }
