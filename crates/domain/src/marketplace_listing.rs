@@ -19,9 +19,13 @@
 //! [`Event::ListingCreated`] (`listing.created`). [`CancelListingCmd`]
 //! (`CancelListingCmd`) withdraws an open listing: it validates the listingId,
 //! enforces the same four invariants, and on success emits
-//! [`Event::ListingCancelled`] (`listing.cancelled`). This module is hand-written
-//! (it does not use `shared::stub_aggregate!`) but preserves the same public
-//! surface as the scaffolded contexts: a [`MarketplaceListing`] aggregate and a
+//! [`Event::ListingCancelled`] (`listing.cancelled`). [`PurchaseListingCmd`]
+//! (`PurchaseListingCmd`) buys a listed token, geo-checked by jurisdiction: it
+//! validates the listingId, buyerId, and jurisdiction, enforces the same four
+//! invariants at settlement, and on success emits [`Event::ListingPurchased`]
+//! (`listing.purchased`). This module is hand-written (it does not use
+//! `shared::stub_aggregate!`) but preserves the same public surface as the
+//! scaffolded contexts: a [`MarketplaceListing`] aggregate and a
 //! [`MarketplaceListingRepository`] port.
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +43,10 @@ const CREATE_LISTING: &str = "CreateListingCmd";
 /// The command name [`MarketplaceListing::execute`] recognizes to withdraw an
 /// open listing from $MADE.
 const CANCEL_LISTING: &str = "CancelListingCmd";
+
+/// The command name [`MarketplaceListing::execute`] recognizes to purchase a
+/// listed token in $MADE.
+const PURCHASE_LISTING: &str = "PurchaseListingCmd";
 
 /// The mandated marketplace fee split, in basis points (1 bp = 0.01%). Every
 /// settled trade applies a 5% fee split of 2.5% treasury / 1.5% reward pool /
@@ -182,6 +190,52 @@ impl CancelListingCmd {
     }
 }
 
+/// The `PurchaseListingCmd` payload: which listing to buy, the buyer making the
+/// purchase, and the jurisdiction the purchase is geo-checked against. Field
+/// names use the token marketplace's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`PurchaseListingCmd::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`MarketplaceListing::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseListingCmd {
+    /// The listing being purchased; must name this MarketplaceListing.
+    pub listing_id: String,
+    /// The buyer purchasing the listed token; must be a valid identifier.
+    pub buyer_id: String,
+    /// The jurisdiction the purchase is geo-checked against; must not be
+    /// geo-restricted.
+    pub jurisdiction: String,
+}
+
+impl PurchaseListingCmd {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = PURCHASE_LISTING;
+
+    /// Build a command purchasing `listing_id` for `buyer_id`, geo-checked
+    /// against `jurisdiction`.
+    pub fn new(
+        listing_id: impl Into<String>,
+        buyer_id: impl Into<String>,
+        jurisdiction: impl Into<String>,
+    ) -> Self {
+        Self {
+            listing_id: listing_id.into(),
+            buyer_id: buyer_id.into(),
+            jurisdiction: jurisdiction.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`MarketplaceListing::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("PurchaseListingCmd is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The listing that was created, carried by [`Event::ListingCreated`] and thus
 /// by the emitted `listing.created` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +262,20 @@ pub struct ListingCancelled {
     pub jurisdiction: String,
 }
 
+/// The purchase that settled, carried by [`Event::ListingPurchased`] and thus by
+/// the emitted `listing.purchased` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingPurchased {
+    /// The listing that was purchased.
+    pub listing_id: String,
+    /// The buyer that purchased the listed token.
+    pub buyer_id: String,
+    /// The jurisdiction the purchase was geo-checked against.
+    pub jurisdiction: String,
+    /// The fee schedule applied to the settled trade.
+    pub fee_schedule: FeeSchedule,
+}
+
 /// Domain events emitted by [`MarketplaceListing`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -215,6 +283,8 @@ pub enum Event {
     ListingCreated(ListingCreated),
     /// An open listing was withdrawn from $MADE.
     ListingCancelled(ListingCancelled),
+    /// A listed token was purchased and the trade settled in $MADE.
+    ListingPurchased(ListingPurchased),
 }
 
 impl DomainEvent for Event {
@@ -222,6 +292,7 @@ impl DomainEvent for Event {
         match self {
             Event::ListingCreated(_) => "listing.created",
             Event::ListingCancelled(_) => "listing.cancelled",
+            Event::ListingPurchased(_) => "listing.purchased",
         }
     }
 }
@@ -432,6 +503,52 @@ impl MarketplaceListing {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `PurchaseListingCmd`: verify the command carries a valid listingId
+    /// (naming this MarketplaceListing), buyerId, and jurisdiction; enforce every
+    /// token marketplace invariant at settlement; and emit
+    /// [`Event::ListingPurchased`].
+    fn purchase_listing(&mut self, cmd: PurchaseListingCmd) -> Result<Vec<Event>, DomainError> {
+        if cmd.listing_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "marketplace listing '{}' requires a valid listingId to purchase a listing",
+                self.id
+            )));
+        }
+        if cmd.buyer_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "marketplace listing '{}' requires a valid buyerId to purchase a listing",
+                self.id
+            )));
+        }
+        if cmd.jurisdiction.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "marketplace listing '{}' requires a valid jurisdiction to purchase a listing",
+                self.id
+            )));
+        }
+        if cmd.listing_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets marketplace listing '{}' but this aggregate is marketplace \
+                 listing '{}'",
+                cmd.listing_id, self.id
+            )));
+        }
+
+        self.ensure_seller_owns_listed_token()?;
+        self.ensure_canonical_fee_split()?;
+        self.ensure_settlement_atomic()?;
+        self.ensure_jurisdiction_allowed(&cmd.jurisdiction)?;
+
+        let event = Event::ListingPurchased(ListingPurchased {
+            listing_id: cmd.listing_id,
+            buyer_id: cmd.buyer_id,
+            jurisdiction: cmd.jurisdiction,
+            fee_schedule: self.fee_schedule,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for MarketplaceListing {
@@ -460,6 +577,15 @@ impl Aggregate for MarketplaceListing {
                         ))
                     })?;
                 self.cancel_listing(cmd)
+            }
+            PURCHASE_LISTING => {
+                let cmd: PurchaseListingCmd =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed PurchaseListingCmd payload: {e}"
+                        ))
+                    })?;
+                self.purchase_listing(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -713,5 +839,152 @@ mod tests {
             .expect_err("malformed payload must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(listing.version(), 0);
+    }
+
+    /// A command purchasing listing `listing-01` for buyer `buyer-7`, geo-checked
+    /// against jurisdiction `US`.
+    fn valid_purchase_cmd() -> PurchaseListingCmd {
+        PurchaseListingCmd::new("listing-01", "buyer-7", "US")
+    }
+
+    // Scenario: Successfully execute PurchaseListingCmd.
+    #[test]
+    fn purchases_and_emits_listing_purchased_event() {
+        let mut listing = ready_listing();
+
+        let events = listing
+            .execute(valid_purchase_cmd().into_command())
+            .expect("valid purchase should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "listing.purchased");
+        match &events[0] {
+            Event::ListingPurchased(purchased) => {
+                assert_eq!(purchased.listing_id, "listing-01");
+                assert_eq!(purchased.buyer_id, "buyer-7");
+                assert_eq!(purchased.jurisdiction, "US");
+                assert_eq!(purchased.fee_schedule, FeeSchedule::canonical());
+            }
+            other => panic!("expected ListingPurchased, got {other:?}"),
+        }
+        // The MarketplaceListing recorded the event and advanced its version.
+        assert_eq!(listing.version(), 1);
+        assert_eq!(listing.uncommitted_events().len(), 1);
+        assert_eq!(
+            listing.uncommitted_events()[0].event_type(),
+            "listing.purchased"
+        );
+    }
+
+    // Scenario: rejected - The seller must own the listed token at listing and
+    // at settlement.
+    #[test]
+    fn purchase_rejects_when_seller_does_not_own_listed_token() {
+        let mut listing = ready_listing();
+        listing.set_seller_owns_listed_token(false);
+
+        let err = listing
+            .execute(valid_purchase_cmd().into_command())
+            .expect_err("a seller who does not own the token must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    // Scenario: rejected - Every settled trade applies the 5% fee split: 2.5%
+    // treasury / 1.5% reward pool / 1% burn.
+    #[test]
+    fn purchase_rejects_when_fee_split_is_not_canonical() {
+        let mut listing = ready_listing();
+        // A split that even sums to the correct 500 bps but misallocates the
+        // components is still a violation.
+        listing.set_fee_schedule(FeeSchedule::new(300, 100, 100));
+
+        let err = listing
+            .execute(valid_purchase_cmd().into_command())
+            .expect_err("a non-canonical fee split must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    // Scenario: rejected - A trade settles atomically - token transfer and fee
+    // split succeed or fail together.
+    #[test]
+    fn purchase_rejects_when_settlement_is_not_atomic() {
+        let mut listing = ready_listing();
+        listing.set_settlement_atomic(false);
+
+        let err = listing
+            .execute(valid_purchase_cmd().into_command())
+            .expect_err("non-atomic settlement must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    // Scenario: rejected - Listings and purchases are blocked for geo-restricted
+    // jurisdictions.
+    #[test]
+    fn purchase_rejects_when_jurisdiction_is_geo_restricted() {
+        let mut listing = ready_listing();
+        listing.restrict_jurisdiction("US");
+
+        let err = listing
+            .execute(valid_purchase_cmd().into_command())
+            .expect_err("a purchase from a geo-restricted jurisdiction must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    // A command naming a different listing is rejected before any invariant runs.
+    #[test]
+    fn purchase_rejects_command_for_a_different_listing() {
+        let mut listing = ready_listing();
+        let cmd = PurchaseListingCmd::new("listing-99", "buyer-7", "US");
+
+        let err = listing
+            .execute(cmd.into_command())
+            .expect_err("a command for another listing must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    // Commands missing any required field are rejected.
+    #[test]
+    fn purchase_rejects_command_with_missing_fields() {
+        for cmd in [
+            PurchaseListingCmd::new("   ", "buyer-7", "US"),
+            PurchaseListingCmd::new("listing-01", "   ", "US"),
+            PurchaseListingCmd::new("listing-01", "buyer-7", "   "),
+        ] {
+            let mut listing = ready_listing();
+            let err = listing
+                .execute(cmd.into_command())
+                .expect_err("a command with a missing field must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(listing.version(), 0);
+        }
+    }
+
+    // A malformed payload for PurchaseListingCmd is a domain error, not a panic.
+    #[test]
+    fn rejects_malformed_purchase_listing_payload() {
+        let mut listing = ready_listing();
+
+        let err = listing
+            .execute(Command::with_payload(
+                PURCHASE_LISTING,
+                b"not json".to_vec(),
+            ))
+            .expect_err("malformed payload must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    #[test]
+    fn purchase_command_payload_round_trips() {
+        let cmd = valid_purchase_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, PurchaseListingCmd::COMMAND);
+        let decoded: PurchaseListingCmd = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_purchase_cmd());
     }
 }
