@@ -285,7 +285,9 @@ mod tests {
     #[test]
     fn appends_event_and_emits_event_appended() {
         let mut replay = MatchReplay::new("m");
-        let events = replay.execute(cmd("m", 0, b"seed")).expect("append accepted");
+        let events = replay
+            .execute(cmd("m", 0, b"seed"))
+            .expect("append accepted");
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type(), "event.appended");
