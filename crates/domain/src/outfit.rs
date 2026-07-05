@@ -16,7 +16,7 @@
 //!    the player's collection at validation time; an Outfit referencing a card
 //!    the player no longer owns is illegal.
 //!
-//! Three commands are implemented. [`AddCardToOutfit`] (`AddCardToOutfitCmd`)
+//! Four commands are implemented. [`AddCardToOutfit`] (`AddCardToOutfitCmd`)
 //! adds a card to the Outfit, enforcing every invariant (copy caps and class
 //! legality among them) so the addition keeps the deck legal, and on success
 //! emits [`Event::CardAddedToOutfit`] (`card.added.to.outfit`).
@@ -26,7 +26,10 @@
 //! (`card.removed.from.outfit`). [`ValidateOutfit`] (`ValidateOutfitCmd`) runs
 //! the full 30-card legality validation without mutating the deck — it enforces
 //! the same four invariants and, when the Outfit is legal, emits
-//! [`Event::OutfitValidated`] (`outfit.validated`). This module is hand-written
+//! [`Event::OutfitValidated`] (`outfit.validated`). [`SaveOutfit`]
+//! (`SaveOutfitCmd`) persists a validated, legal Outfit — it enforces the same
+//! four invariants and, when the Outfit is legal, emits [`Event::OutfitSaved`]
+//! (`outfit.saved`). This module is hand-written
 //! (it does not use `shared::stub_aggregate!`) but preserves the same public
 //! surface — an [`Outfit`] aggregate and an [`OutfitRepository`] port — so any
 //! persistence adapters compile against it unchanged, exactly like its sibling
@@ -48,6 +51,9 @@ const ADD_CARD_TO_OUTFIT: &str = "AddCardToOutfitCmd";
 
 /// The `ValidateOutfitCmd` command name [`Outfit::execute`] recognizes.
 const VALIDATE_OUTFIT: &str = "ValidateOutfitCmd";
+
+/// The `SaveOutfitCmd` command name [`Outfit::execute`] recognizes.
+const SAVE_OUTFIT: &str = "SaveOutfitCmd";
 
 /// The number of cards an Outfit must hold, exactly, to be legal for saving/play.
 const LEGAL_OUTFIT_SIZE: i64 = 30;
@@ -160,6 +166,39 @@ impl ValidateOutfit {
     }
 }
 
+/// The `SaveOutfitCmd` payload: which Outfit is being persisted. Field names use
+/// the deckbuilding service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`SaveOutfit::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`Outfit::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveOutfit {
+    /// The Outfit being saved; must name this Outfit, and must be non-empty.
+    pub outfit_id: String,
+}
+
+impl SaveOutfit {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = SAVE_OUTFIT;
+
+    /// Build a command saving `outfit_id`.
+    pub fn new(outfit_id: impl Into<String>) -> Self {
+        Self {
+            outfit_id: outfit_id.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`Outfit::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("SaveOutfit is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The card that was removed, carried by [`Event::CardRemovedFromOutfit`] and
 /// thus by the emitted `card.removed.from.outfit` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +227,15 @@ pub struct OutfitValidated {
     pub outfit_id: String,
 }
 
+/// The Outfit that was persisted after passing full legality validation,
+/// carried by [`Event::OutfitSaved`] and thus by the emitted `outfit.saved`
+/// event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutfitSaved {
+    /// The Outfit that was saved.
+    pub outfit_id: String,
+}
+
 /// Domain events emitted by [`Outfit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -197,6 +245,8 @@ pub enum Event {
     CardRemovedFromOutfit(CardRemovedFromOutfit),
     /// The Outfit passed full 30-card legality validation.
     OutfitValidated(OutfitValidated),
+    /// The Outfit was persisted after passing full legality validation.
+    OutfitSaved(OutfitSaved),
 }
 
 impl DomainEvent for Event {
@@ -205,6 +255,7 @@ impl DomainEvent for Event {
             Event::CardAddedToOutfit(_) => "card.added.to.outfit",
             Event::CardRemovedFromOutfit(_) => "card.removed.from.outfit",
             Event::OutfitValidated(_) => "outfit.validated",
+            Event::OutfitSaved(_) => "outfit.saved",
         }
     }
 }
@@ -481,6 +532,41 @@ impl Outfit {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `SaveOutfitCmd`: verify the command carries a valid outfit id
+    /// (naming this Outfit), run the full 30-card legality validation by
+    /// enforcing every invariant (exactly 30 cards, own-class-or-Neutral, copy
+    /// caps, and owned-at-validation time), and — when the Outfit is legal —
+    /// persist it by emitting [`Event::OutfitSaved`]. Only a validated, legal
+    /// Outfit is saved; any invariant violation rejects the command.
+    fn save(&mut self, cmd: SaveOutfit) -> Result<Vec<Event>, DomainError> {
+        // A valid outfitId must be supplied.
+        if cmd.outfit_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "outfit '{}' requires a valid outfitId to save",
+                self.id
+            )));
+        }
+        // The command must name the Outfit it is dispatched to.
+        if cmd.outfit_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets outfit '{}' but this aggregate is outfit '{}'",
+                cmd.outfit_id, self.id
+            )));
+        }
+
+        // Run the full legality validation before persisting the Outfit.
+        self.ensure_exactly_thirty()?;
+        self.ensure_only_own_class_or_neutral()?;
+        self.ensure_within_copy_limits()?;
+        self.ensure_all_cards_owned()?;
+
+        let event = Event::OutfitSaved(OutfitSaved {
+            outfit_id: cmd.outfit_id,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for Outfit {
@@ -518,6 +604,12 @@ impl Aggregate for Outfit {
                         ))
                     })?;
                 self.validate(cmd)
+            }
+            SAVE_OUTFIT => {
+                let cmd: SaveOutfit = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed SaveOutfitCmd payload: {e}"))
+                })?;
+                self.save(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -947,5 +1039,127 @@ mod tests {
         assert_eq!(command.name, AddCardToOutfit::COMMAND);
         let decoded: AddCardToOutfit = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_add_cmd());
+    }
+
+    /// A command saving outfit `o-01`.
+    fn valid_save_cmd() -> SaveOutfit {
+        SaveOutfit::new("o-01")
+    }
+
+    // Scenario: Successfully execute SaveOutfitCmd.
+    #[test]
+    fn saves_and_emits_outfit_saved_event() {
+        let mut outfit = ready_outfit();
+
+        let events = outfit
+            .execute(valid_save_cmd().into_command())
+            .expect("valid save should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "outfit.saved");
+        match &events[0] {
+            Event::OutfitSaved(saved) => {
+                assert_eq!(saved.outfit_id, "o-01");
+            }
+            other => panic!("expected OutfitSaved, got {other:?}"),
+        }
+        // The Outfit recorded the event.
+        assert_eq!(outfit.version(), 1);
+        assert_eq!(outfit.uncommitted_events().len(), 1);
+        assert_eq!(outfit.uncommitted_events()[0].event_type(), "outfit.saved");
+    }
+
+    // Scenario: SaveOutfitCmd rejected — an Outfit contains exactly 30 cards to
+    // be legal for saving/play.
+    #[test]
+    fn save_rejects_when_not_exactly_thirty_cards() {
+        let mut outfit = ready_outfit();
+        // A deck of any size other than 30 is illegal for saving/play.
+        outfit.set_card_count(29);
+
+        let err = outfit
+            .execute(valid_save_cmd().into_command())
+            .expect_err("an Outfit that is not exactly 30 cards must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // Scenario: SaveOutfitCmd rejected — an Outfit may include only cards of its
+    // own class plus Neutral cards.
+    #[test]
+    fn save_rejects_when_card_outside_own_class() {
+        let mut outfit = ready_outfit();
+        // The deck includes a card of a foreign class.
+        outfit.set_only_own_class_or_neutral(false);
+
+        let err = outfit
+            .execute(valid_save_cmd().into_command())
+            .expect_err("an Outfit with a foreign-class card must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // Scenario: SaveOutfitCmd rejected — at most 2 copies of any card (1 copy for
+    // Legendary) may be included.
+    #[test]
+    fn save_rejects_when_copy_cap_exceeded() {
+        let mut outfit = ready_outfit();
+        // The deck exceeds a card's copy cap.
+        outfit.set_within_copy_limits(false);
+
+        let err = outfit
+            .execute(valid_save_cmd().into_command())
+            .expect_err("an Outfit exceeding a copy cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // Scenario: SaveOutfitCmd rejected — every card in the Outfit must be owned in
+    // the player's collection at validation time.
+    #[test]
+    fn save_rejects_when_card_not_owned() {
+        let mut outfit = ready_outfit();
+        // The deck references a card the player does not own.
+        outfit.set_all_cards_owned(false);
+
+        let err = outfit
+            .execute(valid_save_cmd().into_command())
+            .expect_err("an Outfit referencing an unowned card must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // A save command naming a different Outfit is rejected before any invariant
+    // runs.
+    #[test]
+    fn save_rejects_command_for_a_different_outfit() {
+        let mut outfit = ready_outfit();
+        let cmd = SaveOutfit::new("o-99");
+
+        let err = outfit
+            .execute(cmd.into_command())
+            .expect_err("a command for another outfit must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // A save command with a missing outfitId is rejected.
+    #[test]
+    fn save_rejects_command_with_missing_outfit_id() {
+        let mut outfit = ready_outfit();
+        let err = outfit
+            .execute(SaveOutfit::new("   ").into_command())
+            .expect_err("a command with a missing outfitId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    #[test]
+    fn save_command_payload_round_trips() {
+        let cmd = valid_save_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, SaveOutfit::COMMAND);
+        let decoded: SaveOutfit = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_save_cmd());
     }
 }
