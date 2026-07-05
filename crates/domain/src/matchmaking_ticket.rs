@@ -14,10 +14,13 @@
 //!    with the ticket's own player.
 //! 4. **Terminal state** — a cancelled or matched ticket cannot be re-matched.
 //!
-//! The only command implemented so far is [`FallbackToExhibition`]
-//! (`FallbackToExhibitionCmd`): it routes an unmatched, still-queued ticket to
-//! an exhibition game once the cap has elapsed, enforcing every invariant, and
-//! on success emits [`Event::FellBackToExhibition`] (`ticket.fell.back.to.exhibition`).
+//! Two commands are implemented. [`EnqueueTicket`] (`EnqueueTicketCmd`) places a
+//! player into the ranked queue with the initial primary search bands and, on
+//! success, emits [`Event::TicketEnqueued`] (`ticket.enqueued`). [`FallbackToExhibition`]
+//! (`FallbackToExhibitionCmd`) routes an unmatched, still-queued ticket to an
+//! exhibition game once the cap has elapsed, and on success emits
+//! [`Event::FellBackToExhibition`] (`ticket.fell.back.to.exhibition`). Both
+//! enforce every invariant above before recording anything.
 //! This module is hand-written (it no longer uses `shared::stub_aggregate!`) but
 //! preserves the same public surface — a [`MatchmakingTicket`] aggregate and a
 //! [`MatchmakingTicketRepository`] port — so the persistence adapters in
@@ -31,7 +34,10 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "MatchmakingTicket";
 
-/// The command name [`MatchmakingTicket::execute`] recognizes.
+/// The command name that places a player into the ranked queue.
+const ENQUEUE_TICKET: &str = "EnqueueTicketCmd";
+
+/// The command name that routes an unmatched ticket to an exhibition game.
 const FALLBACK_TO_EXHIBITION: &str = "FallbackToExhibitionCmd";
 
 /// Primary Rating search band: matchmaking initially targets opponents within
@@ -59,6 +65,65 @@ pub enum TicketStatus {
     Cancelled,
     /// Routed to an exhibition game after exceeding the fallback cap.
     FellBackToExhibition,
+}
+
+/// The `EnqueueTicketCmd` payload: the player to place into the ranked queue and
+/// the matchmaking inputs used to seed the ticket. Field names are the queue's
+/// `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`EnqueueTicket::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`MatchmakingTicket::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueTicket {
+    /// Identity of the ticket being enqueued; must name the ticket this
+    /// aggregate records.
+    pub ticket_id: String,
+    /// The player being placed into the ranked queue. Must be non-empty; the
+    /// ticket is owned by, and may never be paired against, this player.
+    pub player_id: String,
+    /// The player's Rating, around which the primary ±[`PRIMARY_RATING_BAND`]
+    /// search band is centered.
+    pub rating: u32,
+    /// The player's Level, around which the primary ±[`PRIMARY_LEVEL_BAND`]
+    /// search band is centered.
+    pub level: u32,
+    /// Seconds the ticket has already spent queued at the moment of enqueue
+    /// (normally `0`). Must be below the fallback cap — a ticket already past the
+    /// cap should fall back to exhibition, not enter the queue afresh.
+    pub queue_time: u64,
+}
+
+impl EnqueueTicket {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = ENQUEUE_TICKET;
+
+    /// Build a command enqueueing `player_id` under ticket `ticket_id` at the
+    /// given `rating`, `level`, and `queue_time`.
+    pub fn new(
+        ticket_id: impl Into<String>,
+        player_id: impl Into<String>,
+        rating: u32,
+        level: u32,
+        queue_time: u64,
+    ) -> Self {
+        Self {
+            ticket_id: ticket_id.into(),
+            player_id: player_id.into(),
+            rating,
+            level,
+            queue_time,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`MatchmakingTicket::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("EnqueueTicket is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
 }
 
 /// The `FallbackToExhibitionCmd` payload: the ticket to route to exhibition and
@@ -103,6 +168,27 @@ impl FallbackToExhibition {
     }
 }
 
+/// The enqueued ticket, carried by [`Event::TicketEnqueued`] and thus by the
+/// emitted `ticket.enqueued` event. Records the player placed into the queue, the
+/// matchmaking inputs, and the initial primary search bands seeded on enqueue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketEnqueued {
+    /// The ticket that entered the ranked queue.
+    pub ticket_id: String,
+    /// The player the ticket was enqueued for.
+    pub player_id: String,
+    /// The player's Rating at enqueue time.
+    pub rating: u32,
+    /// The player's Level at enqueue time.
+    pub level: u32,
+    /// Seconds already queued at enqueue (normally `0`).
+    pub queue_time: u64,
+    /// Initial Rating search band the ticket entered the queue with.
+    pub rating_band: u32,
+    /// Initial Level search band the ticket entered the queue with.
+    pub level_band: u32,
+}
+
 /// The exhibition pairing, carried by [`Event::FellBackToExhibition`] and thus by
 /// the emitted `ticket.fell.back.to.exhibition` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +202,8 @@ pub struct FellBackToExhibition {
 /// Domain events emitted by [`MatchmakingTicket`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// A player was placed into the ranked queue with the primary search bands.
+    TicketEnqueued(TicketEnqueued),
     /// An unmatched ticket exceeded the cap and was routed to an exhibition game.
     FellBackToExhibition(FellBackToExhibition),
 }
@@ -123,6 +211,7 @@ pub enum Event {
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
+            Event::TicketEnqueued(_) => "ticket.enqueued",
             Event::FellBackToExhibition(_) => "ticket.fell.back.to.exhibition",
         }
     }
@@ -160,6 +249,10 @@ pub struct MatchmakingTicket {
     rating_band: u32,
     /// Current Level search band; must be at least [`PRIMARY_LEVEL_BAND`].
     level_band: u32,
+    /// The opponent the ticket is paired against, if any. A ticket entering the
+    /// queue must be unpaired ([`None`]); it may later be paired with exactly one
+    /// opponent, and never with its own player.
+    opponent: Option<String>,
 }
 
 impl MatchmakingTicket {
@@ -176,6 +269,7 @@ impl MatchmakingTicket {
             queued_seconds: 0,
             rating_band: PRIMARY_RATING_BAND,
             level_band: PRIMARY_LEVEL_BAND,
+            opponent: None,
         }
     }
 
@@ -217,6 +311,12 @@ impl MatchmakingTicket {
     /// Record how long the ticket has queued unmatched, in seconds.
     pub fn set_queued_seconds(&mut self, seconds: u64) {
         self.queued_seconds = seconds;
+    }
+
+    /// Pair the ticket against an opponent (or clear the pairing with [`None`]). A
+    /// ticket must be unpaired to enter the queue.
+    pub fn set_opponent(&mut self, opponent: Option<impl Into<String>>) {
+        self.opponent = opponent.map(Into::into);
     }
 
     /// Set the current Rating and Level search bands. As the ticket ages these
@@ -292,6 +392,80 @@ impl MatchmakingTicket {
         Ok(())
     }
 
+    /// Fallback-cap invariant, enqueue side: a ticket that has already gone
+    /// unmatched for the full 5 minutes ([`FALLBACK_CAP_SECONDS`]) belongs in an
+    /// exhibition fallback, not freshly in the ranked queue. Enqueue is therefore
+    /// only permitted while the ticket is still *within* the cap.
+    fn ensure_within_fallback_cap(queue_time: u64) -> Result<(), DomainError> {
+        if queue_time >= FALLBACK_CAP_SECONDS {
+            return Err(DomainError::InvariantViolation(format!(
+                "cannot enqueue a ticket already queued {queue_time}s; a ticket must fall back to \
+                 exhibition after {FALLBACK_CAP_SECONDS}s (5 minutes) of unmatched queueing"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Pairing invariant, enqueue side: a ticket may be paired with exactly one
+    /// opponent and never with its own player, so a ticket entering the queue to
+    /// *find* an opponent must not already carry one.
+    fn ensure_unpaired_for_enqueue(&self) -> Result<(), DomainError> {
+        if let Some(opponent) = &self.opponent {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' is already paired with '{}' and cannot be enqueued; a ticket enters \
+                 the queue unpaired and is later paired with exactly one opponent",
+                self.id, opponent
+            )));
+        }
+        Ok(())
+    }
+
+    /// Handle `EnqueueTicketCmd`: verify the command targets this ticket and names
+    /// a player, enforce every invariant (re-matchable, within the fallback cap,
+    /// monotonic bands, and not already paired), then seed the ticket with the
+    /// player and initial queue time and emit [`Event::TicketEnqueued`].
+    fn enqueue_ticket(&mut self, cmd: EnqueueTicket) -> Result<Vec<Event>, DomainError> {
+        // The command must name the ticket this aggregate actually records.
+        if cmd.ticket_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets ticket '{}' but this aggregate records '{}'",
+                cmd.ticket_id, self.id
+            )));
+        }
+        // A ticket must be enqueued for a named player.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' must be enqueued for a non-empty player",
+                self.id
+            )));
+        }
+
+        // Enforce every invariant before placing anything into the queue.
+        self.ensure_rematchable()?;
+        Self::ensure_within_fallback_cap(cmd.queue_time)?;
+        self.ensure_bands_expand_monotonically()?;
+        self.ensure_unpaired_for_enqueue()?;
+
+        // Seed the ticket: it is now owned by this player and has queued for the
+        // stated time; the search bands it entered the queue with are recorded on
+        // the event.
+        self.player_id = cmd.player_id.clone();
+        self.queued_seconds = cmd.queue_time;
+        self.status = TicketStatus::Queued;
+
+        let event = Event::TicketEnqueued(TicketEnqueued {
+            ticket_id: cmd.ticket_id,
+            player_id: cmd.player_id,
+            rating: cmd.rating,
+            level: cmd.level,
+            queue_time: cmd.queue_time,
+            rating_band: self.rating_band,
+            level_band: self.level_band,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
     /// Handle `FallbackToExhibitionCmd`: verify the command targets this ticket,
     /// enforce every invariant (re-matchable, cap elapsed, monotonic bands, and a
     /// single valid opponent), and emit [`Event::FellBackToExhibition`].
@@ -332,6 +506,14 @@ impl Aggregate for MatchmakingTicket {
 
     fn execute(&mut self, command: Command) -> Result<Vec<Self::Event>, DomainError> {
         match command.name.as_str() {
+            ENQUEUE_TICKET => {
+                let cmd: EnqueueTicket = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!(
+                        "malformed EnqueueTicketCmd payload: {e}"
+                    ))
+                })?;
+                self.enqueue_ticket(cmd)
+            }
             FALLBACK_TO_EXHIBITION => {
                 let cmd: FallbackToExhibition =
                     serde_json::from_slice(&command.payload).map_err(|e| {
@@ -375,6 +557,148 @@ mod tests {
         FallbackToExhibition::new("t-01", "p-rival")
     }
 
+    /// A fresh, enqueue-ready ticket `t-01`: just created, at the primary search
+    /// bands, still queued and unpaired. Tests mutate one aspect to drive a
+    /// specific enqueue rejection.
+    fn enqueue_ready_ticket() -> MatchmakingTicket {
+        MatchmakingTicket::new("t-01")
+    }
+
+    /// A valid `EnqueueTicketCmd` placing player `p-self` into the queue.
+    fn valid_enqueue_cmd() -> EnqueueTicket {
+        EnqueueTicket::new("t-01", "p-self", 1500, 30, 0)
+    }
+
+    // Scenario: Successfully execute EnqueueTicketCmd.
+    #[test]
+    fn enqueues_and_emits_ticket_enqueued_event() {
+        let mut ticket = enqueue_ready_ticket();
+
+        let events = ticket
+            .execute(valid_enqueue_cmd().into_command())
+            .expect("valid enqueue should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "ticket.enqueued");
+        match &events[0] {
+            Event::TicketEnqueued(enqueued) => {
+                assert_eq!(enqueued.ticket_id, "t-01");
+                assert_eq!(enqueued.player_id, "p-self");
+                assert_eq!(enqueued.rating, 1500);
+                assert_eq!(enqueued.level, 30);
+                assert_eq!(enqueued.queue_time, 0);
+                // The ticket entered the queue at the primary search bands.
+                assert_eq!(enqueued.rating_band, PRIMARY_RATING_BAND);
+                assert_eq!(enqueued.level_band, PRIMARY_LEVEL_BAND);
+            }
+            other => panic!("expected TicketEnqueued, got {other:?}"),
+        }
+        // The ticket is now owned by the player and recorded the event.
+        assert_eq!(ticket.player_id(), "p-self");
+        assert_eq!(ticket.status(), TicketStatus::Queued);
+        assert_eq!(ticket.version(), 1);
+        assert_eq!(ticket.uncommitted_events().len(), 1);
+        assert_eq!(
+            ticket.uncommitted_events()[0].event_type(),
+            "ticket.enqueued"
+        );
+    }
+
+    // Scenario: rejected — primary targeting is ±150 Rating; secondary is ±5
+    // Level; bands expand monotonically as the ticket ages.
+    #[test]
+    fn enqueue_rejects_when_initial_band_is_narrower_than_primary() {
+        let mut ticket = enqueue_ready_ticket();
+        // Entering the queue below the primary ±150 band would break the
+        // monotonic-band invariant.
+        ticket.set_search_bands(PRIMARY_RATING_BAND - 1, PRIMARY_LEVEL_BAND);
+
+        let err = ticket
+            .execute(valid_enqueue_cmd().into_command())
+            .expect_err("a sub-primary search band must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a ticket must fall back to exhibition after 5 minutes
+    // of unmatched queueing.
+    #[test]
+    fn enqueue_rejects_when_already_past_the_fallback_cap() {
+        let mut ticket = enqueue_ready_ticket();
+        // A ticket already past the cap belongs in exhibition, not the queue.
+        let cmd = EnqueueTicket::new("t-01", "p-self", 1500, 30, FALLBACK_CAP_SECONDS);
+
+        let err = ticket
+            .execute(cmd.into_command())
+            .expect_err("enqueueing a ticket past the fallback cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a ticket may be paired with exactly one opponent and
+    // never with the ticket's own player.
+    #[test]
+    fn enqueue_rejects_when_ticket_is_already_paired() {
+        let mut ticket = enqueue_ready_ticket();
+        // A ticket entering the queue must be unpaired.
+        ticket.set_opponent(Some("p-rival"));
+
+        let err = ticket
+            .execute(valid_enqueue_cmd().into_command())
+            .expect_err("enqueueing an already-paired ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a cancelled or matched ticket cannot be re-matched.
+    #[test]
+    fn enqueue_rejects_when_ticket_is_terminal() {
+        let mut ticket = enqueue_ready_ticket();
+        // A cancelled ticket is terminal and cannot be re-matched into the queue.
+        ticket.set_status(TicketStatus::Cancelled);
+
+        let err = ticket
+            .execute(valid_enqueue_cmd().into_command())
+            .expect_err("re-enqueueing a cancelled ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // A ticket must be enqueued for a named player.
+    #[test]
+    fn enqueue_rejects_empty_player() {
+        let mut ticket = enqueue_ready_ticket();
+        let cmd = EnqueueTicket::new("t-01", "   ", 1500, 30, 0);
+
+        let err = ticket
+            .execute(cmd.into_command())
+            .expect_err("an empty player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // A command naming a different ticket is rejected before any invariant runs.
+    #[test]
+    fn enqueue_rejects_command_for_a_different_ticket() {
+        let mut ticket = enqueue_ready_ticket();
+        let cmd = EnqueueTicket::new("t-99", "p-self", 1500, 30, 0);
+
+        let err = ticket
+            .execute(cmd.into_command())
+            .expect_err("a command for another ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    #[test]
+    fn enqueue_command_payload_round_trips() {
+        let cmd = valid_enqueue_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, EnqueueTicket::COMMAND);
+        let decoded: EnqueueTicket = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_enqueue_cmd());
+    }
+
     // Scenario: Successfully execute FallbackToExhibitionCmd.
     #[test]
     fn falls_back_and_emits_fell_back_to_exhibition_event() {
@@ -391,6 +715,7 @@ mod tests {
                 assert_eq!(paired.ticket_id, "t-01");
                 assert_eq!(paired.exhibition_opponent, "p-rival");
             }
+            other => panic!("expected FellBackToExhibition, got {other:?}"),
         }
         // The ticket transitioned out of the queue and recorded the event.
         assert_eq!(ticket.status(), TicketStatus::FellBackToExhibition);
