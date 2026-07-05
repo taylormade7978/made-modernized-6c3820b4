@@ -37,6 +37,12 @@
 //! [`Event::CombatResolved`] (`combat.resolved`) followed by
 //! [`Event::BossDefeated`] (`boss.defeated`) when that combat drops the defending
 //! Boss.
+//!
+//! [`ActivateHeroPower`] (`ActivateHeroPowerCmd`) then activates the turn-holding
+//! player's Boss trademark hero power at a target: it pays the power's Juice cost
+//! out of the seat's available pool (rejecting a power the player cannot afford),
+//! re-checks the same rules-contract invariants, and on success emits
+//! [`Event::HeroPowerActivated`] (`hero_power.activated`).
 
 use std::ops::RangeInclusive;
 
@@ -59,6 +65,9 @@ const PLAY_CARD: &str = "PlayCardCmd";
 
 /// The `DeclareAttackCmd` command name [`GameSession::execute`] recognizes.
 const DECLARE_ATTACK: &str = "DeclareAttackCmd";
+
+/// The `ActivateHeroPowerCmd` command name [`GameSession::execute`] recognizes.
+const ACTIVATE_HERO_POWER: &str = "ActivateHeroPowerCmd";
 
 /// Heat a player gains each time they play a card. Playing a card always raises
 /// Heat, so a successful [`PlayCard`] emits an accompanying `heat.raised` event.
@@ -365,6 +374,60 @@ impl DeclareAttack {
     }
 }
 
+/// The `ActivateHeroPowerCmd` payload: the match being played, the player using
+/// their Boss's trademark hero power, the target the power resolves against, and
+/// the hero power's Juice cost. Field names are the match-play schema's
+/// `camelCase`.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`ActivateHeroPower::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`GameSession::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivateHeroPower {
+    /// Identifier of the match being played; must name the match this session
+    /// records.
+    pub match_id: String,
+    /// Identity of the player activating the hero power; must name one of this
+    /// session's configured Outfits, and it must be that player's turn.
+    pub player_id: String,
+    /// A reference to the target the hero power resolves against. Must be
+    /// non-blank.
+    pub target_ref: String,
+    /// The hero power's Juice cost. A hero power may only be activated when its
+    /// cost does not exceed the player's currently available Juice.
+    pub juice_cost: u8,
+}
+
+impl ActivateHeroPower {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = ACTIVATE_HERO_POWER;
+
+    /// Build an `ActivateHeroPowerCmd` for `player_id` in `match_id`, resolving
+    /// the Boss hero power against `target_ref` and paying `juice_cost` Juice.
+    pub fn new(
+        match_id: impl Into<String>,
+        player_id: impl Into<String>,
+        target_ref: impl Into<String>,
+        juice_cost: u8,
+    ) -> Self {
+        Self {
+            match_id: match_id.into(),
+            player_id: player_id.into(),
+            target_ref: target_ref.into(),
+            juice_cost,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`GameSession::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("ActivateHeroPower is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The started match, carried by [`Event::MatchStarted`] and thus by the emitted
 /// `match.started` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +525,24 @@ pub struct BossDefeated {
     pub winner: Player,
 }
 
+/// An activated Boss hero power, carried by [`Event::HeroPowerActivated`] and
+/// thus by the emitted `hero_power.activated` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeroPowerActivated {
+    /// The match the hero power was activated in.
+    pub match_id: String,
+    /// The player identity that activated the hero power.
+    pub player_id: String,
+    /// The seat that player occupies.
+    pub player: Player,
+    /// The target the hero power resolved against.
+    pub target_ref: String,
+    /// The Juice paid to activate the hero power.
+    pub juice_spent: u8,
+    /// The seat's remaining available Juice after paying the hero power's cost.
+    pub remaining_juice: u8,
+}
+
 /// Domain events emitted by [`GameSession`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -477,6 +558,9 @@ pub enum Event {
     CombatResolved(CombatResolved),
     /// Resolved combat defeated a Boss and ended the match for one winner.
     BossDefeated(BossDefeated),
+    /// A Boss trademark hero power passed every invariant, was paid for, and
+    /// was activated.
+    HeroPowerActivated(HeroPowerActivated),
 }
 
 impl DomainEvent for Event {
@@ -488,6 +572,7 @@ impl DomainEvent for Event {
             Event::HeatRaised(_) => "heat.raised",
             Event::CombatResolved(_) => "combat.resolved",
             Event::BossDefeated(_) => "boss.defeated",
+            Event::HeroPowerActivated(_) => "hero_power.activated",
         }
     }
 }
@@ -1067,6 +1152,74 @@ impl GameSession {
         self.root.record(Box::new(defeated.clone()));
         Ok(vec![resolved, defeated])
     }
+
+    /// Handle `ActivateHeroPowerCmd`: verify the command targets this match, a
+    /// real player whose turn it is, and a well-formed target; enforce every
+    /// match-play invariant against the session's state; pay the Boss hero
+    /// power's Juice cost; and emit [`Event::HeroPowerActivated`].
+    fn activate_hero_power(&mut self, cmd: ActivateHeroPower) -> Result<Vec<Event>, DomainError> {
+        // The command must name the match this session actually records.
+        if cmd.match_id != self.match_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets match '{}' but this session records '{}'",
+                cmd.match_id, self.match_id
+            )));
+        }
+        // A player must be named, and it must be one of the configured Outfits.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a playerId must be provided".to_string(),
+            ));
+        }
+        let seat = self.seat_for_player(&cmd.player_id)?;
+
+        // The hero power's target must be identified.
+        if cmd.target_ref.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a targetRef must be provided".to_string(),
+            ));
+        }
+
+        // Enforce every match-play invariant before applying the activation.
+        self.ensure_boards_within_caps()?;
+        self.ensure_heat_within_bounds()?;
+        self.ensure_starting_juice_valid()?;
+        self.ensure_decks_nonempty()?;
+        self.ensure_heists_prereqs_satisfied()?;
+        self.ensure_bosses_alive()?;
+        let turn_player = self.ensure_opening_player_designated()?;
+
+        // Turn-ownership: a hero power is activated only by the player whose
+        // turn it is.
+        if seat != turn_player {
+            return Err(DomainError::InvariantViolation(format!(
+                "player '{}' (seat {seat:?}) may not activate a hero power; it is player {turn_player:?}'s turn",
+                cmd.player_id
+            )));
+        }
+
+        // The Boss hero power is paid for out of the seat's available Juice; it
+        // may only be activated when its cost does not exceed that pool.
+        self.ensure_card_affordable(seat, cmd.juice_cost)?;
+
+        // Pay the cost, deducting it from the seat's available Juice. The
+        // affordability check guarantees this cannot underflow, and the result
+        // stays within the Juice hard cap.
+        let outfit = self.outfit_at_mut(seat);
+        outfit.available_juice -= cmd.juice_cost;
+        let remaining_juice = outfit.available_juice;
+
+        let activated = Event::HeroPowerActivated(HeroPowerActivated {
+            match_id: cmd.match_id,
+            player_id: cmd.player_id,
+            player: seat,
+            target_ref: cmd.target_ref,
+            juice_spent: cmd.juice_cost,
+            remaining_juice,
+        });
+        self.root.record(Box::new(activated.clone()));
+        Ok(vec![activated])
+    }
 }
 
 impl Aggregate for GameSession {
@@ -1103,6 +1256,15 @@ impl Aggregate for GameSession {
                     ))
                 })?;
                 self.declare_attack(cmd)
+            }
+            ACTIVATE_HERO_POWER => {
+                let cmd: ActivateHeroPower =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed ActivateHeroPowerCmd payload: {e}"
+                        ))
+                    })?;
+                self.activate_hero_power(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -2124,5 +2286,239 @@ mod tests {
         assert_eq!(command.name, DeclareAttack::COMMAND);
         let decoded: DeclareAttack = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_declare_attack());
+    }
+
+    // ---- ActivateHeroPowerCmd (S-6) ----------------------------------------
+
+    /// A legal `ActivateHeroPowerCmd` for `m-1`: the turn-holding player `A`
+    /// activates their Boss hero power at a target, paying 2 Juice (within the
+    /// default available pool of 3). Tests mutate one aspect at a time to drive
+    /// a rejection.
+    fn valid_activate_hero_power() -> ActivateHeroPower {
+        ActivateHeroPower::new("m-1", "m-1-a", "target-1", 2)
+    }
+
+    // Scenario: Successfully execute ActivateHeroPowerCmd — a
+    // hero_power.activated event is emitted and the GameSession state is updated.
+    #[test]
+    fn activates_hero_power_and_emits_hero_power_activated_event() {
+        let mut session = valid_session();
+
+        let events = session
+            .execute(valid_activate_hero_power().into_command())
+            .expect("a valid hero power activation should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "hero_power.activated");
+        match &events[0] {
+            Event::HeroPowerActivated(activated) => {
+                assert_eq!(activated.match_id, "m-1");
+                assert_eq!(activated.player_id, "m-1-a");
+                assert_eq!(activated.player, Player::A);
+                assert_eq!(activated.target_ref, "target-1");
+                assert_eq!(activated.juice_spent, 2);
+                // Default available Juice is 3; paying 2 leaves 1.
+                assert_eq!(activated.remaining_juice, 1);
+            }
+            other => panic!("expected HeroPowerActivated, got {other:?}"),
+        }
+        // The paid Juice cost is deducted from the seat's available pool — the
+        // GameSession state is updated — and the single event advances version.
+        assert_eq!(session.version(), 1);
+        assert_eq!(session.uncommitted_events().len(), 1);
+        assert_eq!(
+            session.uncommitted_events()[0].event_type(),
+            "hero_power.activated"
+        );
+    }
+
+    // Scenario: rejected — a hero power may only be activated when its Juice cost
+    // does not exceed currently available Juice.
+    #[test]
+    fn activate_hero_power_rejects_when_cost_exceeds_available_juice() {
+        let mut session = valid_session();
+        // Default available Juice is 3; a cost of 4 cannot be afforded.
+        let err = session
+            .execute(ActivateHeroPower::new("m-1", "m-1-a", "target-1", 4).into_command())
+            .expect_err("a hero power the player cannot afford must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a board may hold at most 7 Operators and 3 Vehicles.
+    #[test]
+    fn activate_hero_power_rejects_when_board_exceeds_operator_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.operators = MAX_OPERATORS + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_activate_hero_power().into_command())
+            .expect_err("an over-capacity board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn activate_hero_power_rejects_when_board_exceeds_vehicle_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.vehicles = MAX_VEHICLES + 1;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_activate_hero_power().into_command())
+            .expect_err("an over-capacity vehicle board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — Heat is bounded 0..10 and no state may leave it.
+    #[test]
+    fn activate_hero_power_rejects_when_heat_leaves_bounds() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_heat = *HEAT_BOUNDS.end() + 1; // Outside [0, 10].
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_activate_hero_power().into_command())
+            .expect_err("Heat outside its bounds must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a Heist resolves only after its prerequisite queue is
+    // satisfied.
+    #[test]
+    fn activate_hero_power_rejects_when_heist_resolved_with_outstanding_prereqs() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.heist_resolved = true;
+        outfit.outstanding_heist_prereqs = 2;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_activate_hero_power().into_command())
+            .expect_err("a Heist resolved with outstanding prereqs must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — drawing from an empty deck deals Fatigue instead of a
+    // card, so a match may not carry a deckless Outfit.
+    #[test]
+    fn activate_hero_power_rejects_when_deck_is_empty() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.deck_size = 0;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_activate_hero_power().into_command())
+            .expect_err("an empty deck must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a command is valid only for the player whose turn it
+    // currently is; an activation by the off-turn player is rejected.
+    #[test]
+    fn activate_hero_power_rejects_when_not_the_players_turn() {
+        let mut session = valid_session();
+        // Player A holds the turn; player B tries to activate a hero power.
+        let err = session
+            .execute(ActivateHeroPower::new("m-1", "m-1-b", "target-1", 2).into_command())
+            .expect_err("an off-turn activation must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A turn-less setup is likewise ill-formed for a hero power activation.
+    #[test]
+    fn activate_hero_power_rejects_when_no_opening_player_is_designated() {
+        let mut session = valid_session();
+        session.set_opening_player(None);
+
+        let err = session
+            .execute(valid_activate_hero_power().into_command())
+            .expect_err("a turn-less setup must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a match ends the instant a Boss's HP reaches 0 or
+    // below, so a defeated Boss cannot be carried into an activation.
+    #[test]
+    fn activate_hero_power_rejects_when_a_boss_is_defeated() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.boss_hp = 0;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_activate_hero_power().into_command())
+            .expect_err("a defeated Boss must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — Juice starts at 1; an opening Juice that is not the
+    // starting value is an illegal Juice state.
+    #[test]
+    fn activate_hero_power_rejects_when_starting_juice_is_not_one() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_juice = 3;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_activate_hero_power().into_command())
+            .expect_err("an illegal opening Juice must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An activation must name the match this session records.
+    #[test]
+    fn activate_hero_power_rejects_when_command_targets_a_different_match() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ActivateHeroPower::new("other-match", "m-1-a", "target-1", 2).into_command())
+            .expect_err("a mismatched match id must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An activation must name a configured Outfit.
+    #[test]
+    fn activate_hero_power_rejects_unknown_player() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ActivateHeroPower::new("m-1", "ghost", "target-1", 2).into_command())
+            .expect_err("an unknown player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An activation must identify the target it resolves against.
+    #[test]
+    fn activate_hero_power_rejects_blank_target_ref() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ActivateHeroPower::new("m-1", "m-1-a", "  ", 2).into_command())
+            .expect_err("a blank targetRef must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn activate_hero_power_command_payload_round_trips() {
+        let cmd = valid_activate_hero_power();
+        let command = cmd.into_command();
+        assert_eq!(command.name, ActivateHeroPower::COMMAND);
+        let decoded: ActivateHeroPower = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_activate_hero_power());
     }
 }
