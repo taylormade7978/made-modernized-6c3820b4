@@ -13,6 +13,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 shared = { workspace = true }
+# serde/serde_json decode the typed StartMatch command payload. Both compile to
+# wasm32, so they keep the dual native/WASM build working (mirrors the domain
+# aggregates, which decode their command payloads the same way).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # wasm-bindgen is optional and only pulled in for the `wasm` feature, so the
 # host build (`cargo build --workspace`) stays free of wasm-only dependencies.
 wasm-bindgen = { workspace = true, optional = true }
