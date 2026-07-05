@@ -43,6 +43,14 @@
 //! out of the seat's available pool (rejecting a power the player cannot afford),
 //! re-checks the same rules-contract invariants, and on success emits
 //! [`Event::HeroPowerActivated`] (`hero_power.activated`).
+//!
+//! [`EndTurn`] (`EndTurnCmd`) then passes the turn from the turn-holding player to
+//! their opponent: it re-checks the same rules-contract invariants, ramps the
+//! incoming seat's Juice (+1, hard-capped at [`JUICE_CAP`]), and resolves that
+//! seat's start-of-turn draw — a card when the deck is non-empty, escalating
+//! Fatigue to the drawing Boss when it is not. On success it emits *two* events,
+//! [`Event::FatigueDamageDealt`] (`fatigue.damage.dealt`) followed by
+//! [`Event::TurnEnded`] (`turn.ended`).
 
 use std::ops::RangeInclusive;
 
@@ -69,6 +77,9 @@ const DECLARE_ATTACK: &str = "DeclareAttackCmd";
 /// The `ActivateHeroPowerCmd` command name [`GameSession::execute`] recognizes.
 const ACTIVATE_HERO_POWER: &str = "ActivateHeroPowerCmd";
 
+/// The `EndTurnCmd` command name [`GameSession::execute`] recognizes.
+const END_TURN: &str = "EndTurnCmd";
+
 /// Heat a player gains each time they play a card. Playing a card always raises
 /// Heat, so a successful [`PlayCard`] emits an accompanying `heat.raised` event.
 pub const HEAT_PER_PLAY: i32 = 1;
@@ -84,6 +95,16 @@ pub const STARTING_JUICE: u8 = 1;
 
 /// Juice is hard-capped at this value; no state may exceed it.
 pub const JUICE_CAP: u8 = 10;
+
+/// Juice a seat gains at the start of each of its turns; ending a turn ramps the
+/// incoming seat's available Juice by this much (hard-capped at [`JUICE_CAP`]).
+pub const JUICE_RAMP_PER_TURN: u8 = 1;
+
+/// Fatigue dealt to the drawing Boss by a draw from an empty deck. Drawing from
+/// an empty deck deals escalating Fatigue instead of yielding a card; this is the
+/// base increment. The deck-nonempty invariant means a legal end of turn never
+/// reaches this, but the start-of-turn draw resolution models the rule faithfully.
+pub const FATIGUE_PER_EMPTY_DRAW: i32 = 1;
 
 /// Heat is bounded to this inclusive range; no state may leave it. Reaching the
 /// upper bound immediately triggers a Cop Event, so a *clean* match start must
@@ -428,6 +449,44 @@ impl ActivateHeroPower {
     }
 }
 
+/// The `EndTurnCmd` payload: the match being played and the player passing the
+/// turn. Field names are the match-play schema's `camelCase`.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`EndTurn::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`GameSession::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndTurn {
+    /// Identifier of the match being played; must name the match this session
+    /// records.
+    pub match_id: String,
+    /// Identity of the player ending their turn; must name one of this session's
+    /// configured Outfits, and it must be that player's turn.
+    pub player_id: String,
+}
+
+impl EndTurn {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = END_TURN;
+
+    /// Build an `EndTurnCmd` for `player_id` in `match_id`.
+    pub fn new(match_id: impl Into<String>, player_id: impl Into<String>) -> Self {
+        Self {
+            match_id: match_id.into(),
+            player_id: player_id.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`GameSession::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("EndTurn is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The started match, carried by [`Event::MatchStarted`] and thus by the emitted
 /// `match.started` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -543,6 +602,44 @@ pub struct HeroPowerActivated {
     pub remaining_juice: u8,
 }
 
+/// A resolved start-of-turn draw, carried by [`Event::FatigueDamageDealt`] and
+/// thus by the emitted `fatigue.damage.dealt` event. Ending a turn resolves the
+/// incoming seat's start-of-turn draw: a non-empty deck yields a card and deals
+/// no Fatigue, so `amount` is `0`; drawing from an empty deck would instead deal
+/// escalating Fatigue to the drawing Boss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FatigueDamageDealt {
+    /// The match the draw happened in.
+    pub match_id: String,
+    /// The player identity of the incoming seat that drew.
+    pub player_id: String,
+    /// The incoming seat that drew at the start of its turn.
+    pub player: Player,
+    /// Fatigue dealt to the drawing Boss (`0` when a card was available).
+    pub amount: i32,
+    /// The drawing Boss's HP after any Fatigue was applied (always `> 0`; the
+    /// deck-nonempty invariant leaves it unchanged on a legal end of turn).
+    pub boss_hp_remaining: i32,
+}
+
+/// A passed turn, carried by [`Event::TurnEnded`] and thus by the emitted
+/// `turn.ended` event. The turn passes from the ending seat to its opponent,
+/// whose available Juice ramps for the turn now beginning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnEnded {
+    /// The match the turn was passed in.
+    pub match_id: String,
+    /// The player identity that ended their turn.
+    pub player_id: String,
+    /// The seat that ended its turn.
+    pub player: Player,
+    /// The seat whose turn now begins.
+    pub next_player: Player,
+    /// The incoming seat's available Juice after ramping (+1, hard-capped at
+    /// [`JUICE_CAP`]).
+    pub next_player_juice: u8,
+}
+
 /// Domain events emitted by [`GameSession`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -561,6 +658,10 @@ pub enum Event {
     /// A Boss trademark hero power passed every invariant, was paid for, and
     /// was activated.
     HeroPowerActivated(HeroPowerActivated),
+    /// Ending a turn resolved the incoming seat's start-of-turn draw.
+    FatigueDamageDealt(FatigueDamageDealt),
+    /// The turn passed from the ending seat to its opponent.
+    TurnEnded(TurnEnded),
 }
 
 impl DomainEvent for Event {
@@ -573,6 +674,8 @@ impl DomainEvent for Event {
             Event::CombatResolved(_) => "combat.resolved",
             Event::BossDefeated(_) => "boss.defeated",
             Event::HeroPowerActivated(_) => "hero_power.activated",
+            Event::FatigueDamageDealt(_) => "fatigue.damage.dealt",
+            Event::TurnEnded(_) => "turn.ended",
         }
     }
 }
@@ -1220,6 +1323,107 @@ impl GameSession {
         self.root.record(Box::new(activated.clone()));
         Ok(vec![activated])
     }
+
+    /// Juice-ramp: a seat's available Juice ramps [`JUICE_RAMP_PER_TURN`] each of
+    /// the owner's turns and is hard-capped at [`JUICE_CAP`]. Returns the ramped,
+    /// capped value for `seat`.
+    fn ramped_juice(&self, seat: Player) -> u8 {
+        self.outfit_at(seat)
+            .available_juice
+            .saturating_add(JUICE_RAMP_PER_TURN)
+            .min(JUICE_CAP)
+    }
+
+    /// Resolve `seat`'s start-of-turn draw, returning the Fatigue dealt and the
+    /// drawing Boss's resulting HP. A non-empty deck yields a card and deals no
+    /// Fatigue; drawing from an empty deck deals escalating Fatigue to the drawing
+    /// Boss instead of yielding a card. The deck-nonempty invariant
+    /// ([`GameSession::ensure_decks_nonempty`]) precludes the empty case on a
+    /// legal end of turn, so it resolves to zero Fatigue with the Boss unharmed.
+    fn resolve_start_of_turn_draw(&self, seat: Player) -> (i32, i32) {
+        let outfit = self.outfit_at(seat);
+        if outfit.deck_size == 0 {
+            let fatigue = FATIGUE_PER_EMPTY_DRAW;
+            (fatigue, outfit.boss_hp - fatigue)
+        } else {
+            (0, outfit.boss_hp)
+        }
+    }
+
+    /// Handle `EndTurnCmd`: verify the command targets this match and the player
+    /// whose turn it currently is; enforce every match-play invariant against the
+    /// session's state; ramp the incoming seat's Juice and resolve its
+    /// start-of-turn draw; and emit [`Event::FatigueDamageDealt`] followed by
+    /// [`Event::TurnEnded`].
+    fn end_turn(&mut self, cmd: EndTurn) -> Result<Vec<Event>, DomainError> {
+        // The command must name the match this session actually records.
+        if cmd.match_id != self.match_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets match '{}' but this session records '{}'",
+                cmd.match_id, self.match_id
+            )));
+        }
+        // A player must be named, and it must be one of the configured Outfits.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a playerId must be provided".to_string(),
+            ));
+        }
+        let seat = self.seat_for_player(&cmd.player_id)?;
+
+        // Enforce every match-play invariant before passing the turn.
+        self.ensure_boards_within_caps()?;
+        self.ensure_heat_within_bounds()?;
+        self.ensure_starting_juice_valid()?;
+        self.ensure_decks_nonempty()?;
+        self.ensure_heists_prereqs_satisfied()?;
+        self.ensure_bosses_alive()?;
+        let turn_player = self.ensure_opening_player_designated()?;
+
+        // Turn-ownership: a turn is ended only by the player whose turn it is.
+        if seat != turn_player {
+            return Err(DomainError::InvariantViolation(format!(
+                "player '{}' (seat {seat:?}) may not end the turn; it is player {turn_player:?}'s turn",
+                cmd.player_id
+            )));
+        }
+
+        // The turn passes to the opponent, whose turn now begins: their Juice
+        // ramps and they resolve a start-of-turn draw.
+        let incoming = Self::opponent_of(seat);
+        let next_player_juice = self.ramped_juice(incoming);
+        let (fatigue_amount, boss_hp_remaining) = self.resolve_start_of_turn_draw(incoming);
+        let incoming_player_id = self.outfit_at(incoming).name.clone();
+
+        // Apply the passed turn to the aggregate: ramp the incoming seat's Juice,
+        // apply any start-of-turn Fatigue to its Boss, and hand it the turn.
+        {
+            let outfit = self.outfit_at_mut(incoming);
+            outfit.available_juice = next_player_juice;
+            outfit.boss_hp = boss_hp_remaining;
+        }
+        self.opening_player = Some(incoming);
+
+        // A successful end of turn resolves the start-of-turn draw first, then
+        // marks the turn passed.
+        let fatigue = Event::FatigueDamageDealt(FatigueDamageDealt {
+            match_id: cmd.match_id.clone(),
+            player_id: incoming_player_id,
+            player: incoming,
+            amount: fatigue_amount,
+            boss_hp_remaining,
+        });
+        let ended = Event::TurnEnded(TurnEnded {
+            match_id: cmd.match_id,
+            player_id: cmd.player_id,
+            player: seat,
+            next_player: incoming,
+            next_player_juice,
+        });
+        self.root.record(Box::new(fatigue.clone()));
+        self.root.record(Box::new(ended.clone()));
+        Ok(vec![fatigue, ended])
+    }
 }
 
 impl Aggregate for GameSession {
@@ -1265,6 +1469,12 @@ impl Aggregate for GameSession {
                         ))
                     })?;
                 self.activate_hero_power(cmd)
+            }
+            END_TURN => {
+                let cmd: EndTurn = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed EndTurnCmd payload: {e}"))
+                })?;
+                self.end_turn(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -2520,5 +2730,268 @@ mod tests {
         assert_eq!(command.name, ActivateHeroPower::COMMAND);
         let decoded: ActivateHeroPower = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_activate_hero_power());
+    }
+
+    // ---- EndTurnCmd (S-7) ---------------------------------------------------
+
+    /// A legal `EndTurnCmd` for `m-1`: the turn-holding player `A` passes the
+    /// turn. Tests mutate one aspect at a time to drive a rejection.
+    fn valid_end_turn() -> EndTurn {
+        EndTurn::new("m-1", "m-1-a")
+    }
+
+    // Scenario: Successfully execute EndTurnCmd — a fatigue.damage.dealt event
+    // and a turn.ended event are emitted.
+    #[test]
+    fn ends_turn_and_emits_fatigue_damage_dealt_and_turn_ended_events() {
+        let mut session = valid_session();
+
+        let events = session
+            .execute(valid_end_turn().into_command())
+            .expect("a valid end of turn should succeed");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type(), "fatigue.damage.dealt");
+        assert_eq!(events[1].event_type(), "turn.ended");
+        match &events[0] {
+            Event::FatigueDamageDealt(fatigue) => {
+                assert_eq!(fatigue.match_id, "m-1");
+                // The turn passes to player B, who draws at the start of its turn.
+                assert_eq!(fatigue.player_id, "m-1-b");
+                assert_eq!(fatigue.player, Player::B);
+                // A non-empty deck yields a card, so no Fatigue is dealt and the
+                // drawing Boss keeps its opening HP.
+                assert_eq!(fatigue.amount, 0);
+                assert_eq!(fatigue.boss_hp_remaining, 30);
+            }
+            other => panic!("expected FatigueDamageDealt, got {other:?}"),
+        }
+        match &events[1] {
+            Event::TurnEnded(ended) => {
+                assert_eq!(ended.match_id, "m-1");
+                assert_eq!(ended.player_id, "m-1-a");
+                assert_eq!(ended.player, Player::A);
+                assert_eq!(ended.next_player, Player::B);
+                // Default available Juice is 3; ramping +1 for the turn now
+                // beginning leaves 4, within the hard cap.
+                assert_eq!(ended.next_player_juice, 4);
+            }
+            other => panic!("expected TurnEnded, got {other:?}"),
+        }
+        // Two events recorded on the root: the version advances by two.
+        assert_eq!(session.version(), 2);
+        assert_eq!(session.uncommitted_events().len(), 2);
+        assert_eq!(
+            session.uncommitted_events()[0].event_type(),
+            "fatigue.damage.dealt"
+        );
+        assert_eq!(session.uncommitted_events()[1].event_type(), "turn.ended");
+    }
+
+    // The incoming seat's Juice ramps but stays hard-capped at JUICE_CAP.
+    #[test]
+    fn end_turn_ramps_incoming_juice_capped_at_the_hard_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.available_juice = JUICE_CAP; // Already at the cap; ramping cannot exceed it.
+        session.configure_player_b(outfit);
+
+        let events = session
+            .execute(valid_end_turn().into_command())
+            .expect("ending the turn should succeed");
+        match &events[1] {
+            Event::TurnEnded(ended) => assert_eq!(ended.next_player_juice, JUICE_CAP),
+            other => panic!("expected TurnEnded, got {other:?}"),
+        }
+    }
+
+    // Scenario: rejected — Juice starts at 1 (hard-capped at 10).
+    #[test]
+    fn end_turn_rejects_when_starting_juice_is_not_one() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_juice = 3;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_end_turn().into_command())
+            .expect_err("an illegal opening Juice must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn end_turn_rejects_when_available_juice_exceeds_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.available_juice = JUICE_CAP + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_end_turn().into_command())
+            .expect_err("available Juice over the hard cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a board may hold at most 7 Operators and 3 Vehicles.
+    #[test]
+    fn end_turn_rejects_when_board_exceeds_operator_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.operators = MAX_OPERATORS + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_end_turn().into_command())
+            .expect_err("an over-capacity board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn end_turn_rejects_when_board_exceeds_vehicle_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.vehicles = MAX_VEHICLES + 1;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_end_turn().into_command())
+            .expect_err("an over-capacity vehicle board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — Heat is bounded 0..10 and no state may leave it.
+    #[test]
+    fn end_turn_rejects_when_heat_leaves_bounds() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_heat = *HEAT_BOUNDS.end() + 1; // Outside [0, 10].
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_end_turn().into_command())
+            .expect_err("Heat outside its bounds must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a Heist resolves only after its prerequisite queue is
+    // satisfied.
+    #[test]
+    fn end_turn_rejects_when_heist_resolved_with_outstanding_prereqs() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.heist_resolved = true;
+        outfit.outstanding_heist_prereqs = 2;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_end_turn().into_command())
+            .expect_err("a Heist resolved with outstanding prereqs must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — drawing from an empty deck deals Fatigue instead of a
+    // card, so a match may not carry a deckless Outfit.
+    #[test]
+    fn end_turn_rejects_when_deck_is_empty() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.deck_size = 0;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_end_turn().into_command())
+            .expect_err("an empty deck must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a command is valid only for the player whose turn it
+    // currently is; an end of turn by the off-turn player is rejected.
+    #[test]
+    fn end_turn_rejects_when_not_the_players_turn() {
+        let mut session = valid_session();
+        // Player A holds the turn; player B tries to end the turn.
+        let err = session
+            .execute(EndTurn::new("m-1", "m-1-b").into_command())
+            .expect_err("an off-turn end of turn must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A turn-less setup is likewise ill-formed for ending a turn.
+    #[test]
+    fn end_turn_rejects_when_no_opening_player_is_designated() {
+        let mut session = valid_session();
+        session.set_opening_player(None);
+
+        let err = session
+            .execute(valid_end_turn().into_command())
+            .expect_err("a turn-less setup must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a match ends the instant a Boss's HP reaches 0 or
+    // below, so a defeated Boss cannot be carried into an end of turn.
+    #[test]
+    fn end_turn_rejects_when_a_boss_is_defeated() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.boss_hp = 0;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_end_turn().into_command())
+            .expect_err("a defeated Boss must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An end of turn must name the match this session records.
+    #[test]
+    fn end_turn_rejects_when_command_targets_a_different_match() {
+        let mut session = valid_session();
+        let err = session
+            .execute(EndTurn::new("other-match", "m-1-a").into_command())
+            .expect_err("a mismatched match id must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An end of turn must name a configured Outfit.
+    #[test]
+    fn end_turn_rejects_unknown_player() {
+        let mut session = valid_session();
+        let err = session
+            .execute(EndTurn::new("m-1", "ghost").into_command())
+            .expect_err("an unknown player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An end of turn must identify the player passing the turn.
+    #[test]
+    fn end_turn_rejects_blank_player_id() {
+        let mut session = valid_session();
+        let err = session
+            .execute(EndTurn::new("m-1", "  ").into_command())
+            .expect_err("a blank playerId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn end_turn_command_payload_round_trips() {
+        let cmd = valid_end_turn();
+        let command = cmd.into_command();
+        assert_eq!(command.name, EndTurn::COMMAND);
+        let decoded: EndTurn = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_end_turn());
     }
 }
