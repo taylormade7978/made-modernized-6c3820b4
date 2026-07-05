@@ -20,14 +20,18 @@
 //!    [`MAX_LEADERBOARD_ENTRIES`] (1000) and requires no login; a leaderboard
 //!    larger than the cap is inconsistent.
 //!
-//! Two commands are implemented. [`SnapshotSeason`] (`SnapshotSeasonCmd`)
+//! Three commands are implemented. [`SnapshotSeason`] (`SnapshotSeasonCmd`)
 //! freezes the final standings at season end, enforcing every invariant, and on
 //! success emits [`Event::SeasonSnapshotted`] (`season.snapshotted`).
 //! [`DistributeSeasonRewards`] (`DistributeSeasonRewardsCmd`) then grants the
 //! one-time rewards drawn from that immutable snapshot — it requires the
 //! snapshot to have been taken and rewards not yet distributed, enforces the
 //! same invariants, and on success emits [`Event::SeasonRewardsDistributed`]
-//! (`season.rewards.distributed`). This module is hand-written (it no longer uses
+//! (`season.rewards.distributed`). [`PublishLeaderboard`]
+//! (`PublishLeaderboardCmd`) publishes the public top-`topN` leaderboard while
+//! the season is live (before the snapshot is taken), enforces the same
+//! invariants, and on success emits [`Event::LeaderboardPublished`]
+//! (`leaderboard.published`). This module is hand-written (it no longer uses
 //! `shared::stub_aggregate!`) but preserves the same public surface — a
 //! [`Season`] aggregate and a [`SeasonRepository`] port — so the persistence
 //! adapters in `crates/mocks` keep compiling unchanged.
@@ -46,6 +50,10 @@ const SNAPSHOT_SEASON: &str = "SnapshotSeasonCmd";
 /// The command name [`Season::execute`] recognizes to grant one-time rewards
 /// from the end-of-season snapshot.
 const DISTRIBUTE_SEASON_REWARDS: &str = "DistributeSeasonRewardsCmd";
+
+/// The command name [`Season::execute`] recognizes to publish the public
+/// top-1000 leaderboard.
+const PUBLISH_LEADERBOARD: &str = "PublishLeaderboardCmd";
 
 /// A season runs on a fixed cadence of this many weeks. A season whose length
 /// does not match is off-cadence and inconsistent.
@@ -140,6 +148,44 @@ impl DistributeSeasonRewards {
     }
 }
 
+/// The `PublishLeaderboardCmd` payload: publish the public top-`topN`
+/// leaderboard. Field names are the ranked service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`PublishLeaderboard::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`Season::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishLeaderboard {
+    /// Identity of the season whose leaderboard is being published; must name the
+    /// season this aggregate records, and must be non-empty.
+    pub season_id: String,
+    /// How many top standings to expose publicly; must be non-zero and at most
+    /// [`MAX_LEADERBOARD_ENTRIES`] (the leaderboard exposes at most the top 1000).
+    pub top_n: u32,
+}
+
+impl PublishLeaderboard {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = PUBLISH_LEADERBOARD;
+
+    /// Build a command publishing `season_id`'s top-`top_n` leaderboard.
+    pub fn new(season_id: impl Into<String>, top_n: u32) -> Self {
+        Self {
+            season_id: season_id.into(),
+            top_n,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`Season::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("PublishLeaderboard is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The frozen final standings, carried by [`Event::SeasonSnapshotted`] and thus
 /// by the emitted `season.snapshotted` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +207,17 @@ pub struct SeasonRewardsDistributed {
     pub snapshot_id: String,
 }
 
+/// The public leaderboard that went live, carried by
+/// [`Event::LeaderboardPublished`] and thus by the emitted `leaderboard.published`
+/// event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderboardPublished {
+    /// The season whose public leaderboard was published.
+    pub season_id: String,
+    /// The number of top standings exposed (≤ [`MAX_LEADERBOARD_ENTRIES`]).
+    pub top_n: u32,
+}
+
 /// Domain events emitted by [`Season`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -169,6 +226,8 @@ pub enum Event {
     SeasonSnapshotted(SeasonSnapshotted),
     /// The one-time season rewards were distributed from the immutable snapshot.
     SeasonRewardsDistributed(SeasonRewardsDistributed),
+    /// The public top-`topN` leaderboard was published.
+    LeaderboardPublished(LeaderboardPublished),
 }
 
 impl DomainEvent for Event {
@@ -176,6 +235,7 @@ impl DomainEvent for Event {
         match self {
             Event::SeasonSnapshotted(_) => "season.snapshotted",
             Event::SeasonRewardsDistributed(_) => "season.rewards.distributed",
+            Event::LeaderboardPublished(_) => "leaderboard.published",
         }
     }
 }
@@ -461,6 +521,62 @@ impl Season {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `PublishLeaderboardCmd`: verify the command targets this season with
+    /// a valid identity and a valid `topN`, enforce every invariant (cadence &
+    /// singularity, snapshot immutability, reward-once, soft reset at open, and
+    /// leaderboard cap), publish the public top-`topN` leaderboard, and emit
+    /// [`Event::LeaderboardPublished`].
+    ///
+    /// A public leaderboard is a live, during-season artifact, so — like
+    /// [`Season::snapshot_season`] — it may only be published while the
+    /// end-of-season snapshot has *not* yet been taken: once the season is frozen
+    /// the leaderboard is immutable.
+    fn publish_leaderboard(&mut self, cmd: PublishLeaderboard) -> Result<Vec<Event>, DomainError> {
+        // A valid seasonId must be supplied.
+        if cmd.season_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "season '{}' requires a valid seasonId to publish its leaderboard",
+                self.id
+            )));
+        }
+        // A valid topN must be supplied: non-zero and within the public cap.
+        if cmd.top_n == 0 {
+            return Err(DomainError::InvariantViolation(format!(
+                "season '{}' requires a valid topN to publish its leaderboard, but 0 was given",
+                self.id
+            )));
+        }
+        if cmd.top_n > MAX_LEADERBOARD_ENTRIES {
+            return Err(DomainError::InvariantViolation(format!(
+                "season '{}' cannot publish a top-{} leaderboard; the public leaderboard exposes \
+                 at most the top {}",
+                self.id, cmd.top_n, MAX_LEADERBOARD_ENTRIES
+            )));
+        }
+        // The command must name the season this aggregate actually records.
+        if cmd.season_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets season '{}' but this aggregate records '{}'",
+                cmd.season_id, self.id
+            )));
+        }
+
+        // Enforce every invariant before publishing.
+        self.ensure_cadence_and_single_open()?;
+        self.ensure_snapshot_not_taken()?;
+        self.ensure_rewards_not_distributed()?;
+        self.ensure_soft_reset_applied()?;
+        self.ensure_leaderboard_within_cap()?;
+
+        let event = Event::LeaderboardPublished(LeaderboardPublished {
+            season_id: cmd.season_id,
+            top_n: cmd.top_n,
+        });
+        // Publishing does not change the season's lifecycle; it just goes live.
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for Season {
@@ -489,6 +605,15 @@ impl Aggregate for Season {
                         ))
                     })?;
                 self.distribute_season_rewards(cmd)
+            }
+            PUBLISH_LEADERBOARD => {
+                let cmd: PublishLeaderboard =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed PublishLeaderboardCmd payload: {e}"
+                        ))
+                    })?;
+                self.publish_leaderboard(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -872,5 +997,196 @@ mod tests {
         assert_eq!(command.name, DistributeSeasonRewards::COMMAND);
         let decoded: DistributeSeasonRewards = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_rewards_cmd());
+    }
+
+    // --- PublishLeaderboardCmd ---
+
+    /// A publish-ready season `s-01`: a live season whose snapshot has not yet been
+    /// taken, on the 12-week cadence, the sole open season, rewards not yet
+    /// distributed, soft reset applied at open, and a full-but-capped leaderboard.
+    /// Tests mutate one aspect at a time to drive a specific rejection.
+    fn publish_ready_season() -> Season {
+        let mut season = Season::new("s-01");
+        // A public leaderboard is published while the season is live.
+        season.set_status(SeasonStatus::Open);
+        season.set_cadence(SEASON_CADENCE_WEEKS, 1);
+        season.set_rewards_distributed(false);
+        season.set_soft_reset_applied(true);
+        season.set_leaderboard_size(MAX_LEADERBOARD_ENTRIES);
+        season
+    }
+
+    /// A command publishing `s-01`'s top-1000 leaderboard.
+    fn valid_publish_cmd() -> PublishLeaderboard {
+        PublishLeaderboard::new("s-01", MAX_LEADERBOARD_ENTRIES)
+    }
+
+    // Scenario: Successfully execute PublishLeaderboardCmd.
+    #[test]
+    fn publishes_and_emits_leaderboard_published_event() {
+        let mut season = publish_ready_season();
+
+        let events = season
+            .execute(valid_publish_cmd().into_command())
+            .expect("valid publish should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "leaderboard.published");
+        match &events[0] {
+            Event::LeaderboardPublished(published) => {
+                assert_eq!(published.season_id, "s-01");
+                assert_eq!(published.top_n, MAX_LEADERBOARD_ENTRIES);
+            }
+            other => panic!("expected LeaderboardPublished, got {other:?}"),
+        }
+        // The season recorded the event; publishing does not change its lifecycle.
+        assert_eq!(season.status(), SeasonStatus::Open);
+        assert_eq!(season.version(), 1);
+        assert_eq!(season.uncommitted_events().len(), 1);
+        assert_eq!(
+            season.uncommitted_events()[0].event_type(),
+            "leaderboard.published"
+        );
+    }
+
+    // Scenario: rejected — a season runs on a 12-week cadence (off-cadence length).
+    #[test]
+    fn publish_rejected_when_off_cadence() {
+        let mut season = publish_ready_season();
+        season.set_cadence(SEASON_CADENCE_WEEKS - 4, 1);
+
+        let err = season
+            .execute(valid_publish_cmd().into_command())
+            .expect_err("an off-cadence season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — only one season is open at a time.
+    #[test]
+    fn publish_rejected_when_multiple_seasons_open() {
+        let mut season = publish_ready_season();
+        season.set_cadence(SEASON_CADENCE_WEEKS, 2);
+
+        let err = season
+            .execute(valid_publish_cmd().into_command())
+            .expect_err("a non-sole open season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — the end-of-season snapshot is immutable once taken.
+    #[test]
+    fn publish_rejected_when_already_snapshotted() {
+        let mut season = publish_ready_season();
+        // Once frozen, the leaderboard is immutable and cannot be re-published.
+        season.set_status(SeasonStatus::Snapshotted);
+
+        let err = season
+            .execute(valid_publish_cmd().into_command())
+            .expect_err("publishing after the snapshot is taken must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — season rewards are distributed exactly once per
+    // eligible player per season.
+    #[test]
+    fn publish_rejected_when_rewards_already_distributed() {
+        let mut season = publish_ready_season();
+        season.set_rewards_distributed(true);
+
+        let err = season
+            .execute(valid_publish_cmd().into_command())
+            .expect_err("publishing after rewards were distributed must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — a soft reset is applied to standings at season open.
+    #[test]
+    fn publish_rejected_when_soft_reset_not_applied() {
+        let mut season = publish_ready_season();
+        season.set_soft_reset_applied(false);
+
+        let err = season
+            .execute(valid_publish_cmd().into_command())
+            .expect_err("a missing season-open soft reset must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // Scenario: rejected — the public leaderboard exposes at most the top 1000.
+    #[test]
+    fn publish_rejected_when_leaderboard_exceeds_cap() {
+        let mut season = publish_ready_season();
+        season.set_leaderboard_size(MAX_LEADERBOARD_ENTRIES + 1);
+
+        let err = season
+            .execute(valid_publish_cmd().into_command())
+            .expect_err("an over-cap leaderboard must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // A publish command with an invalid topN (out of the top-1000 cap) is rejected.
+    #[test]
+    fn publish_rejected_when_top_n_exceeds_cap() {
+        let mut season = publish_ready_season();
+        let cmd = PublishLeaderboard::new("s-01", MAX_LEADERBOARD_ENTRIES + 1);
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a topN beyond the top-1000 cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // A publish command with a zero topN is rejected.
+    #[test]
+    fn publish_rejected_when_top_n_is_zero() {
+        let mut season = publish_ready_season();
+        let cmd = PublishLeaderboard::new("s-01", 0);
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a zero topN must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // A publish command naming a different season is rejected.
+    #[test]
+    fn publish_rejected_for_a_different_season() {
+        let mut season = publish_ready_season();
+        let cmd = PublishLeaderboard::new("s-99", MAX_LEADERBOARD_ENTRIES);
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a command for another season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    // A publish command with no seasonId is rejected.
+    #[test]
+    fn publish_rejected_without_a_season_id() {
+        let mut season = publish_ready_season();
+        let cmd = PublishLeaderboard::new("   ", MAX_LEADERBOARD_ENTRIES);
+
+        let err = season
+            .execute(cmd.into_command())
+            .expect_err("a missing seasonId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(season.version(), 0);
+    }
+
+    #[test]
+    fn publish_command_payload_round_trips() {
+        let cmd = valid_publish_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, PublishLeaderboard::COMMAND);
+        let decoded: PublishLeaderboard = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_publish_cmd());
     }
 }
