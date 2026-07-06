@@ -399,7 +399,7 @@ impl BattlePassRepository {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
     use crate::repositories::collection::{PlayerCollectionRepository, PlayerCollectionRow};

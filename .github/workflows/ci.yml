@@ -198,6 +198,16 @@ jobs:
       - name: Run migrations via the made-migrate binary (idempotent)
         run: cargo run -p persistence --bin made-migrate
 
+      # The sqlx-backed repository adapters. Their `#[sqlx::test]` suites are
+      # gated behind the `integration-tests` feature (off by default) so the
+      # DB-free build-and-test job does not try to run them without a database;
+      # this is the one job with a Postgres service, so it enables the feature
+      # and exercises every adapter — round-trips, typed optimistic-concurrency
+      # conflicts, and the transactional multi-row invariants — for real. Each
+      # test provisions its own ephemeral database via DATABASE_URL.
+      - name: Repository adapter integration tests (real Postgres)
+        run: cargo test -p persistence --features integration-tests
+
       # Fail if a query changed but `cargo sqlx prepare` was not re-run. Setting
       # DATABASE_URL (a real env var) overrides the offline default from
       # .cargo/config.toml, so the check validates queries live against the DB.

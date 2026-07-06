@@ -9,6 +9,17 @@ description = "PostgreSQL persistence adapter: the sqlx migration runner (local 
 [lib]
 crate-type = ["rlib"]
 
+[features]
+# The `#[sqlx::test]` repository suites exercise the adapters against a *live*
+# Postgres (each test provisions an ephemeral database via `DATABASE_URL`). They
+# are gated behind this off-by-default feature so the DB-free `build-and-test`
+# CI job — which runs `cargo test --workspace` with sqlx in offline mode and no
+# Postgres in reach — does not attempt to run them and panic on a missing
+# `DATABASE_URL`. The `migrations` CI job, which stands up a `postgres:16`
+# service, enables this feature to run them for real. Pure (DB-less) unit tests
+# stay under a plain `#[cfg(test)]` and run in every job.
+integration-tests = []
+
 [[bin]]
 name = "made-migrate"
 path = "src/bin/migrate.rs"
