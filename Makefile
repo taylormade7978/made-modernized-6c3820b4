@@ -1,4 +1,4 @@
-.PHONY: build test wasm run fmt clippy check migrate sqlx-prepare web-image web-run server-image server-run
+.PHONY: build test wasm run fmt clippy check migrate sqlx-prepare web-image web-run server-image server-run content-validate helm-lint
 
 # Build every crate and target (including test targets).
 build:
@@ -55,7 +55,20 @@ fmt:
 	cargo fmt --all
 
 clippy:
-	cargo clippy --workspace --all-targets
+	cargo clippy --workspace --all-targets -- -D warnings
+
+# Validate the shipped content catalog (content/catalog/*.json) against the
+# domain's own card invariants. CI runs this on every PR; run it locally after
+# editing catalog data.
+content-validate:
+	cargo run -q -p domain --bin content-validator -- content/catalog
+
+# Render + lint the Helm chart for both overlays without a cluster (what CI
+# runs on PRs). Requires helm on PATH.
+helm-lint:
+	helm lint deploy/helm/made -f deploy/helm/made/values-dev.yaml
+	helm lint deploy/helm/made -f deploy/helm/made/values-prod.yaml
+	helm template made deploy/helm/made -f deploy/helm/made/values-prod.yaml >/dev/null
 
 # The local compile gate: build all targets, then compile + run tests.
 check: build test

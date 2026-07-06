@@ -1,0 +1,80 @@
+name: Contract promotion (mainnet)
+
+# Promote an ERC-1155 card-token contract release to mainnet.
+#
+# Mainnet promotion is BLOCKED unless BOTH gates pass:
+#   1. testnet — the release was deployed to a testnet and its checks passed
+#   2. audit   — an independent third party audited the release and signed off
+# Both are committed attestations under contracts/attestations/, so the gate is
+# auditable in git and enforced here — testnet-first, then audit, then mainnet.
+#
+# The `mainnet` job cannot start until both gate jobs succeed (`needs:`) and is
+# additionally bound to the protected `mainnet` GitHub Environment (required
+# reviewers / wait timer). There is no path to mainnet that skips either gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      contract_version:
+        description: "Contract release version to promote (e.g. 1.4.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # Never interpolate the dispatch input straight into a shell/path; validate its
+  # shape once here and pass the sanitized value downstream as a job output.
+  validate-input:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        env:
+          RAW_VERSION: ${{ inputs.contract_version }}
+        run: |
+          if ! printf '%s' "$RAW_VERSION" | grep -Eq '^[0-9A-Za-z][0-9A-Za-z._-]*$'; then
+            echo "::error::invalid contract_version '$RAW_VERSION'" >&2
+            exit 1
+          fi
+          echo "version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
+
+  # Gate 1 — testnet-first.
+  testnet-gate:
+    needs: validate-input
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify testnet attestation
+        env:
+          VERSION: ${{ needs.validate-input.outputs.version }}
+        run: bash contracts/scripts/verify-attestation.sh testnet "$VERSION"
+
+  # Gate 2 — independent third-party audit.
+  audit-gate:
+    needs: validate-input
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify third-party audit attestation
+        env:
+          VERSION: ${{ needs.validate-input.outputs.version }}
+        run: bash contracts/scripts/verify-attestation.sh audit "$VERSION"
+
+  # Mainnet broadcast — reachable only after BOTH gates pass and the protected
+  # `mainnet` environment approves.
+  mainnet:
+    needs: [validate-input, testnet-gate, audit-gate]
+    runs-on: ubuntu-latest
+    environment: mainnet
+    steps:
+      - uses: actions/checkout@v4
+      - name: Promote to mainnet
+        env:
+          CONTRACT_VERSION: ${{ needs.validate-input.outputs.version }}
+          MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+          MAINNET_DEPLOYER_KEY: ${{ secrets.MAINNET_DEPLOYER_KEY }}
+          CONTRACT_DEPLOY_CMD: ${{ vars.CONTRACT_DEPLOY_CMD }}
+        run: bash contracts/scripts/promote-mainnet.sh

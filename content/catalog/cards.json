@@ -1,0 +1,56 @@
+{
+  "_comment": "MADE card catalog. Every entry is validated in CI by the content-validator binary against the domain's CardDefinition invariants (Juice cost range per type, one known class or Neutral, registered effect script, Legendary copy cap = 1). Keep camelCase field names; `type` is the card type.",
+  "cards": [
+    {
+      "cardId": "card.operator.getaway_driver",
+      "name": "Getaway Driver",
+      "cost": 3,
+      "class": "Driver",
+      "type": "Operator",
+      "rarity": "Common",
+      "keywords": ["Recruit", "Wheels"],
+      "effectScriptRef": "effect.recruit_operator"
+    },
+    {
+      "cardId": "card.job.casino_heist",
+      "name": "Casino Heist",
+      "cost": 5,
+      "class": "Grifter",
+      "type": "Job",
+      "rarity": "Rare",
+      "keywords": ["Payout"],
+      "effectScriptRef": "effect.gain_juice"
+    },
+    {
+      "cardId": "card.piece.lockpick_set",
+      "name": "Lockpick Set",
+      "cost": 2,
+      "class": "Neutral",
+      "type": "Piece",
+      "rarity": "Uncommon",
+      "keywords": ["Tool"],
+      "effectScriptRef": "effect.steal_piece"
+    },
+    {
+      "cardId": "card.vehicle.armored_van",
+      "name": "Armored Van",
+      "cost": 6,
+      "class": "Muscle",
+      "type": "Vehicle",
+      "rarity": "Epic",
+      "keywords": ["Shielded"],
+      "effectScriptRef": "effect.deal_damage"
+    },
+    {
+      "cardId": "card.heist.mainframe_breach",
+      "name": "Mainframe Breach",
+      "cost": 9,
+      "class": "Hacker",
+      "type": "Heist",
+      "rarity": "Legendary",
+      "keywords": ["Signature", "Overload"],
+      "effectScriptRef": "effect.pull_heist",
+      "copyCap": 1
+    }
+  ]
+}
