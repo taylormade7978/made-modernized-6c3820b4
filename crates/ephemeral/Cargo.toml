@@ -1,0 +1,26 @@
+[package]
+name = "ephemeral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Redis ephemeral-state adapter: live GameSession match snapshots, session/presence keys, dual-axis matchmaking queues, and match-event pub/sub over the shared VForce360 Redis."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# serde/serde_json encode the values written to Redis (match snapshots are
+# opaque bytes; match events are JSON documents on the pub/sub wire).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# deadpool-redis is the async connection pool; it re-exports the `redis` driver
+# it is built against, so we use `deadpool_redis::redis` everywhere rather than
+# depending on `redis` directly — that guarantees a single, matching redis
+# version across the pool, the command connections, and the pub/sub client.
+deadpool-redis = "0.23"
+# tokio drives the async adapters (and gates the fail-fast connect timeout);
+# mirrors the persistence adapter, which is likewise tokio-based.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# StreamExt drives the pub/sub message stream (`on_message().next()`).
+futures-util = "0.3"

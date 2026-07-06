@@ -6,6 +6,7 @@ members = [
     "crates/domain",
     "crates/mocks",
     "crates/persistence",
+    "crates/ephemeral",
     "crates/server",
 ]
 
@@ -22,6 +23,7 @@ game-session = { path = "crates/game-session" }
 domain = { path = "crates/domain" }
 mocks = { path = "crates/mocks" }
 persistence = { path = "crates/persistence" }
+ephemeral = { path = "crates/ephemeral" }
 
 # External
 actix-web = "4"

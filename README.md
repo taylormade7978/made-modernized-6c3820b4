@@ -14,6 +14,7 @@ framework-free and WASM-safe; adapters live at the edges.
 | `crates/domain` | The other 7 bounded contexts | MatchReplay, CardDefinition, BossDefinition, ExpansionSet, MatchmakingTicket, RankedStanding, Season — each a stub aggregate + repository contract. |
 | `crates/mocks` | In-memory repository adapters | One `InMemory*Repository` per aggregate, each implementing its domain repository contract. Home of the scaffold test suite. |
 | `crates/persistence` | PostgreSQL adapter | Owns the versioned `migrations/`, the `made-migrate` runner (local + CI twin of `sqlx migrate run`), and the first compile-time-checked read models. PostgreSQL is non-substitutable. |
+| `crates/ephemeral` | Redis adapter | Ephemeral state on the shared VForce360 Redis: live match snapshots (TTL'd), session/presence keys, the dual-axis matchmaking queue, and match-event pub/sub. Namespaced keys, a configurable pool that fails fast on unreachable Redis. See `docs/ephemeral.md`. |
 | `crates/server` | Authoritative WebSocket server | `actix-web` + `actix-ws` driving adapter, wiring aggregates to the mock repositories. |
 
 ### Persistence & migrations
@@ -31,6 +32,19 @@ build` and CI's build-and-test job compile the checked queries against the
 committed `.sqlx/` metadata with no database in reach. A dedicated CI job
 applies the migrations to a fresh Postgres service container and checks that the
 offline metadata is current.
+
+### Ephemeral state (Redis)
+
+Where PostgreSQL is the durable record of truth, the shared **VForce360 Redis**
+holds the *ephemeral* state a live match needs and can safely lose on restart.
+`crates/ephemeral` is that adapter: live `GameSession` match snapshots written
+and read back with a configurable TTL, session/presence heartbeat keys, the
+dual-axis (MMR + secondary) matchmaking queue the matchmaker consumes, and the
+pub/sub fan-out of match events. `connect(&RedisConfig)` opens a pool sized from
+the environment and **fails fast** if Redis is unreachable, and every key is
+namespaced (`made:…`) so MADE never collides with a neighbouring tenant on the
+shared instance. Live-Redis integration tests self-skip unless `MADE_REDIS_URL`
+is set, keeping CI green with no Redis in reach — see `docs/ephemeral.md`.
 
 ### The Aggregate `Execute(cmd)` pattern
 
