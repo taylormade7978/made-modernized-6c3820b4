@@ -1,0 +1,125 @@
+{{- $root := . -}}
+{{- range $name, $c := .Values.components }}
+{{- if $c.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "made.fullname" $root }}-{{ $name }}
+  namespace: {{ include "made.namespace" $root }}
+  labels:
+    {{- include "made.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: {{ $c.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "made.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: {{ $name }}
+  template:
+    metadata:
+      labels:
+        {{- include "made.selectorLabels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ $name }}
+      annotations:
+        {{- if $c.metrics.enabled }}
+        # Classic Prometheus scrape annotations — the /metrics surface is
+        # dependency-free so scraping never blocks on Postgres/Redis.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $c.port | quote }}
+        prometheus.io/path: {{ $c.metrics.path | default "/metrics" | quote }}
+        {{- end }}
+        {{- if and $c.dapr.enabled $root.Values.gateway.dapr.enabled }}
+        # Dapr sidecar injection: the runtime mesh the services speak through.
+        dapr.io/enabled: "true"
+        dapr.io/app-id: {{ printf "%s-%s" (include "made.fullname" $root) $name | quote }}
+        dapr.io/app-port: {{ $c.port | quote }}
+        dapr.io/app-protocol: "http"
+        dapr.io/config: {{ $root.Values.gateway.dapr.configName | quote }}
+        dapr.io/metrics-port: {{ $root.Values.gateway.dapr.metricsPort | quote }}
+        {{- end }}
+        {{- with $c.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "made.serviceAccountName" $root }}
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ $name }}
+          image: "{{ $c.image.repository }}:{{ $c.image.tag | default $root.Chart.AppVersion }}"
+          imagePullPolicy: {{ $c.image.pullPolicy | default "IfNotPresent" }}
+          ports:
+            - name: http
+              containerPort: {{ $c.port }}
+              protocol: TCP
+          {{- if $c.envFrom }}
+          envFrom:
+            {{- if $root.Values.config.create }}
+            - configMapRef:
+                name: {{ include "made.fullname" $root }}-config
+            {{- end }}
+            {{- if include "made.hasSecret" $root }}
+            - secretRef:
+                name: {{ include "made.secretName" $root }}
+            {{- end }}
+          {{- end }}
+          {{- with $c.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ $c.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ $c.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ $c.probes.liveness.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: {{ $c.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ $c.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ $c.probes.readiness.periodSeconds }}
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml $root.Values.containerSecurityContext | nindent 12 }}
+          {{- if $root.Values.containerSecurityContext.readOnlyRootFilesystem }}
+          # nginx (web) needs writable scratch under a read-only root FS.
+          {{- if eq $name "web" }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+          {{- end }}
+          {{- end }}
+      {{- if and $root.Values.containerSecurityContext.readOnlyRootFilesystem (eq $name "web") }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+      {{- end }}
+      {{- with $root.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}

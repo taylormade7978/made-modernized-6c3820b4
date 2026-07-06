@@ -1,0 +1,13 @@
+{{- if .Values.config.create }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "made.fullname" . }}-config
+  namespace: {{ include "made.namespace" . }}
+  labels:
+    {{- include "made.labels" . | nindent 4 }}
+data:
+  {{- range $k, $v := .Values.config.data }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+{{- end }}

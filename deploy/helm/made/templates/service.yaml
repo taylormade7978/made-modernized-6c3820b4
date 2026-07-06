@@ -1,0 +1,24 @@
+{{- $root := . -}}
+{{- range $name, $c := .Values.components }}
+{{- if $c.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "made.fullname" $root }}-{{ $name }}
+  namespace: {{ include "made.namespace" $root }}
+  labels:
+    {{- include "made.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  type: {{ $c.service.type | default "ClusterIP" }}
+  ports:
+    - name: http
+      port: {{ $c.service.port | default $c.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "made.selectorLabels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+{{- end }}
+{{- end }}

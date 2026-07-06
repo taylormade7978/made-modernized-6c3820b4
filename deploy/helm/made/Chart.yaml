@@ -1,0 +1,25 @@
+apiVersion: v2
+name: made
+description: >-
+  MADE (Track B) game platform — the authoritative Rust/Actix game server
+  (REST /v1 + /ws) and the React PWA, deployed into a dedicated MicroK8s
+  namespace behind an NGINX Ingress with cert-manager TLS and the Kong/OPA
+  edge. One chart renders a Deployment + Service per component plus the shared
+  ConfigMap/Secret carrying the Postgres, Redis, MinIO, and Temporal
+  connection settings.
+type: application
+
+# Chart version is the packaging version (bump on template changes); appVersion
+# tracks the application image tag the components default to when none is set.
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords:
+  - made
+  - vforce360
+  - actix
+  - pwa
+  - microk8s
+home: https://github.com/edgentx/made-modernized-6c3820b4
+maintainers:
+  - name: VForce360 Track B

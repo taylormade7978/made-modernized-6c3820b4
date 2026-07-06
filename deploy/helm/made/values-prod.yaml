@@ -1,0 +1,58 @@
+# Production overlay (made.vforce360.ai). Layer over the defaults:
+#   helm upgrade --install made deploy/helm/made -n made \
+#     -f deploy/helm/made/values-prod.yaml \
+#     --set secrets.existingSecret=made-prod-secrets
+#
+# The defaults are already prod-shaped, so this overlay is mostly explicit
+# confirmation plus the production cert issuer. Real credentials are NOT here —
+# reference an externally-managed Secret via secrets.existingSecret.
+global:
+  env: prod
+
+namespace:
+  create: true
+  name: made
+
+components:
+  server:
+    replicas: 3
+  web:
+    replicas: 2
+
+ingress:
+  certManager:
+    enabled: true
+    clusterIssuer: letsencrypt-prod
+  routes:
+    - host: made.vforce360.ai
+      component: web
+      port: 8080
+      path: /
+      pathType: Prefix
+      tlsSecret: made-web-tls
+    - host: api.made.vforce360.ai
+      component: server
+      port: 8080
+      path: /
+      pathType: Prefix
+      tlsSecret: made-api-tls
+    - host: ws.made.vforce360.ai
+      component: server
+      port: 8080
+      path: /
+      pathType: Prefix
+      tlsSecret: made-ws-tls
+
+gateway:
+  kong:
+    enabled: true
+  dapr:
+    enabled: true
+
+serviceMonitor:
+  enabled: true
+
+# Supply real credentials out-of-band. Prefer an externally-managed Secret:
+secrets:
+  create: false
+  existingSecret: made-prod-secrets

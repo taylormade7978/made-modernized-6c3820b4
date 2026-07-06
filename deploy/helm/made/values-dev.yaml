@@ -1,0 +1,72 @@
+# Dev / testnet overlay (dev.made.vforce360.ai). Single replicas, the Let's
+# Encrypt STAGING issuer (avoids rate limits on throwaway certs), and a chart-
+# rendered Secret whose values are injected at deploy time:
+#   helm upgrade --install made deploy/helm/made -n made-dev \
+#     -f deploy/helm/made/values-dev.yaml \
+#     --set secrets.data.DATABASE_URL="postgres://made:dev@postgres:5432/made" \
+#     --set secrets.data.MADE_REDIS_URL="redis://redis:6379"
+global:
+  env: dev
+
+namespace:
+  create: true
+  name: made-dev
+
+components:
+  server:
+    replicas: 1
+  web:
+    replicas: 1
+
+config:
+  data:
+    BIND_ADDR: "0.0.0.0:8080"
+    MADE_REDIS_NAMESPACE: "made-dev"
+    MADE_REDIS_POOL_MAX_SIZE: "8"
+    MADE_REDIS_CONNECT_TIMEOUT_MS: "2000"
+    MADE_REDIS_DEFAULT_TTL_SECS: "3600"
+    MINIO_ENDPOINT: "http://minio.made-dev.svc.cluster.local:9000"
+    MINIO_BUCKET: "made-ota-dev"
+    MINIO_REGION: "us-east-1"
+    TEMPORAL_HOST_PORT: "temporal-frontend.made-dev.svc.cluster.local:7233"
+    TEMPORAL_NAMESPACE: "made-dev"
+
+ingress:
+  certManager:
+    enabled: true
+    clusterIssuer: letsencrypt-staging
+  routes:
+    - host: dev.made.vforce360.ai
+      component: web
+      port: 8080
+      path: /
+      pathType: Prefix
+      tlsSecret: made-web-tls-dev
+    - host: api.dev.made.vforce360.ai
+      component: server
+      port: 8080
+      path: /
+      pathType: Prefix
+      tlsSecret: made-api-tls-dev
+    - host: ws.dev.made.vforce360.ai
+      component: server
+      port: 8080
+      path: /
+      pathType: Prefix
+      tlsSecret: made-ws-tls-dev
+
+# Kong/OPA and Dapr operators may not be present in a bare dev cluster; leave the
+# references off there and flip on per-cluster.
+gateway:
+  kong:
+    enabled: false
+  dapr:
+    enabled: false
+
+serviceMonitor:
+  enabled: false
+
+# Dev renders its own Secret; inject the values with --set at deploy time.
+secrets:
+  create: true
+  existingSecret: ""

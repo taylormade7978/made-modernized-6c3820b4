@@ -1,0 +1,29 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{- $root := . -}}
+{{- range $name, $c := .Values.components }}
+{{- if and $c.enabled $c.metrics.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "made.fullname" $root }}-{{ $name }}
+  namespace: {{ include "made.namespace" $root }}
+  labels:
+    {{- include "made.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+    {{- with $root.Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "made.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: {{ $name }}
+  endpoints:
+    - port: http
+      path: {{ $c.metrics.path | default "/metrics" }}
+      interval: {{ $root.Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ $root.Values.serviceMonitor.scrapeTimeout }}
+{{- end }}
+{{- end }}
+{{- end }}

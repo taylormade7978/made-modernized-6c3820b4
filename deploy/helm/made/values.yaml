@@ -1,0 +1,273 @@
+# Default values for the MADE chart.
+#
+# These defaults render a valid, production-shaped release for the `prod` tier
+# (made.vforce360.ai). Per-environment overlays live alongside this file
+# (values-dev.yaml, values-prod.yaml) and are layered with `-f`:
+#
+#   helm template made deploy/helm/made -f deploy/helm/made/values-prod.yaml
+#
+# NOTHING in this file is a real credential. Secret *values* are empty by
+# default and are supplied at deploy time (--set, a sealed secret, or an
+# externally-managed `secrets.existingSecret`); see the `secrets` block.
+
+# ── Platform identity ─────────────────────────────────────────────────────────
+# The `{service}.{project}.vforce360.ai` naming the platform derives its hosts
+# from. `env` is a free label surfaced onto resources and (for non-prod) folded
+# into the derived host names in the overlays.
+global:
+  project: made
+  env: prod
+  domain: vforce360.ai
+
+# Override the generated resource name stems if desired.
+nameOverride: ""
+fullnameOverride: ""
+
+# ── Dedicated namespace ───────────────────────────────────────────────────────
+# MADE gets its own MicroK8s namespace. When `create` is true the chart emits the
+# Namespace object; when false it assumes the namespace already exists and only
+# targets it (`helm -n <name> ...`). `name` empty => use the release namespace.
+namespace:
+  create: true
+  name: made
+
+# ── Components ────────────────────────────────────────────────────────────────
+# Each entry becomes a Deployment + Service. The two MADE images differ enough
+# (the server needs the DB/Redis/MinIO/Temporal env, Dapr, and a /metrics scrape;
+# the PWA is a static, dependency-free nginx) that behaviour is toggled per
+# component rather than duplicated across two templates.
+components:
+  # Authoritative game server: REST /v1 + /ws over one Postgres pool.
+  server:
+    enabled: true
+    replicas: 2
+    image:
+      # MicroK8s' built-in registry (see `microk8s enable registry`).
+      repository: localhost:32000/made-server
+      tag: ""            # empty => Chart.appVersion
+      pullPolicy: IfNotPresent
+    port: 8080
+    # Pull the shared ConfigMap + Secret in as environment.
+    envFrom: true
+    env: []
+    service:
+      type: ClusterIP
+      port: 8080
+    probes:
+      # /health is dependency-free (no Postgres/Redis needed), so it is safe for
+      # both liveness and readiness — the process serves it the moment it binds.
+      liveness:
+        path: /health
+        initialDelaySeconds: 5
+        periodSeconds: 15
+      readiness:
+        path: /health
+        initialDelaySeconds: 3
+        periodSeconds: 10
+    metrics:
+      enabled: true
+      path: /metrics
+    dapr:
+      enabled: true
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+    podAnnotations: {}
+
+  # React PWA served by rootless nginx.
+  web:
+    enabled: true
+    replicas: 2
+    image:
+      repository: localhost:32000/made-pwa
+      tag: ""
+      pullPolicy: IfNotPresent
+    port: 8080
+    # Static bundle: build-time configured, so no runtime env is wired in.
+    envFrom: false
+    env: []
+    service:
+      type: ClusterIP
+      port: 8080
+    probes:
+      liveness:
+        path: /healthz
+        initialDelaySeconds: 5
+        periodSeconds: 15
+      readiness:
+        path: /healthz
+        initialDelaySeconds: 3
+        periodSeconds: 10
+    metrics:
+      enabled: false
+      path: /metrics
+    dapr:
+      enabled: false
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
+    podAnnotations: {}
+
+# ── Non-secret connection settings (ConfigMap) ────────────────────────────────
+# Everything here is safe to commit — hostnames, ports, namespaces, tuning. It is
+# mounted into the server via `envFrom`. Credentials live in `secrets` below.
+config:
+  create: true
+  data:
+    # Server bind (the image already defaults to this; set explicitly for clarity).
+    BIND_ADDR: "0.0.0.0:8080"
+
+    # Redis (shared VForce360 instance) — namespacing + pool tuning. The URL with
+    # its password is a Secret; these knobs are not.
+    MADE_REDIS_NAMESPACE: "made"
+    MADE_REDIS_POOL_MAX_SIZE: "16"
+    MADE_REDIS_CONNECT_TIMEOUT_MS: "2000"
+    MADE_REDIS_DEFAULT_TTL_SECS: "3600"
+
+    # Object storage (MinIO) — endpoint + bucket only; keys are a Secret.
+    MINIO_ENDPOINT: "https://minio.made.svc.cluster.local:9000"
+    MINIO_BUCKET: "made-ota"
+    MINIO_REGION: "us-east-1"
+
+    # Temporal — the frontend host:port and namespace; any API key is a Secret.
+    TEMPORAL_HOST_PORT: "temporal-frontend.made.svc.cluster.local:7233"
+    TEMPORAL_NAMESPACE: "made"
+
+# ── Credentials (Secret) ──────────────────────────────────────────────────────
+# NO credentials are hardcoded. Either the chart renders a Secret from values you
+# supply at deploy time (`create: true`, values injected via --set / CI / a
+# sealed secret), or it references a Secret managed entirely outside the chart
+# (`existingSecret`). When `existingSecret` is set, `create` is ignored.
+secrets:
+  create: true
+  existingSecret: ""
+  # Left blank on purpose. Supply at deploy time, e.g.
+  #   --set secrets.data.DATABASE_URL='postgres://made:***@postgres:5432/made'
+  data:
+    DATABASE_URL: ""       # postgres://<user>:<pass>@<host>:5432/made
+    MADE_REDIS_URL: ""     # redis://:<pass>@<host>:6379
+    MINIO_ACCESS_KEY: ""
+    MINIO_SECRET_KEY: ""
+    TEMPORAL_API_KEY: ""
+
+# ── Ingress ───────────────────────────────────────────────────────────────────
+# One shared NGINX Ingress exposes the three hosts. cert-manager provisions a
+# Let's Encrypt certificate per host (one TLS secret each). Because nginx-ingress
+# annotations apply to every host on the Ingress, the websocket timeouts and the
+# identity-header scrub below cover web/api/ws in one place.
+ingress:
+  enabled: true
+  className: nginx
+  certManager:
+    enabled: true
+    clusterIssuer: letsencrypt-prod
+  # host + which component backs it + the TLS secret cert-manager fills.
+  routes:
+    - host: made.vforce360.ai
+      component: web
+      port: 8080
+      path: /
+      pathType: Prefix
+      tlsSecret: made-web-tls
+    - host: api.made.vforce360.ai
+      component: server
+      port: 8080
+      path: /
+      pathType: Prefix
+      tlsSecret: made-api-tls
+    - host: ws.made.vforce360.ai
+      component: server
+      port: 8080
+      path: /
+      pathType: Prefix
+      tlsSecret: made-ws-tls
+  # Applied to the Ingress as-is. Defaults: long-lived upstreams for the /ws
+  # channel, and a scrub of any client-supplied identity headers so ONLY the
+  # Kong/OPA edge can assert who the caller is (the backend trusts these blindly).
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      # Defence-in-depth: strip inbound identity headers a client might forge so
+      # the gateway is the only source of the identity the backend trusts.
+      proxy_set_header X-Identity "";
+      proxy_set_header X-Consumer-Id "";
+      proxy_set_header X-Consumer-Username "";
+      proxy_set_header X-Authenticated-User "";
+
+# ── Edge / gateway wiring (Kong + OPA) and Dapr ───────────────────────────────
+# The server terminates NO auth itself: the Kong gateway authenticates the caller
+# and its OPA plugin authorizes the request, then injects the trusted identity
+# headers the handlers read. These blocks emit the plugin/config references that
+# wire that up. They are guarded so a cluster without the Kong or Dapr CRDs
+# installed can turn them off and still render a valid release.
+gateway:
+  kong:
+    enabled: true
+    # KongPlugin names attached to the Ingress via the konghq.com/plugins
+    # annotation. `opa` gates every route through the policy decision point;
+    # `identity-headers` (a request-transformer) removes client-set identity
+    # headers and stamps the gateway-asserted ones.
+    plugins:
+      - made-opa
+      - made-identity-headers
+    opa:
+      # The OPA policy decision endpoint Kong calls per request.
+      url: http://opa.made.svc.cluster.local:8181/v1/data/made/authz/allow
+    identityHeaders:
+      # Headers the gateway guarantees; the backend trusts these and only these.
+      inject:
+        - "X-Identity"
+        - "X-Consumer-Id"
+        - "X-Consumer-Username"
+  dapr:
+    # Emits a Dapr Configuration object and drives the dapr.io/* pod annotations
+    # on Dapr-enabled components. app-port/metrics-port come from the component.
+    enabled: true
+    createConfig: true
+    configName: made-dapr
+    metricsPort: 9090
+    # mTLS between sidecars is on by default in Dapr; surfaced here for overlays.
+    mtls: true
+
+# ── Prometheus Operator ServiceMonitor (optional) ─────────────────────────────
+# The pods already carry prometheus.io/scrape annotations (classic scrape). When
+# the Prometheus Operator is present, also emit a ServiceMonitor for the metrics
+# component(s).
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  # Selector label the cluster's Prometheus uses to adopt ServiceMonitors.
+  labels: {}
+
+# ── Pod / container hardening + scheduling ────────────────────────────────────
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+imagePullSecrets: []
+nodeSelector: {}
+tolerations: []
+affinity: {}

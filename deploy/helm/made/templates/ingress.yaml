@@ -1,0 +1,45 @@
+{{- if .Values.ingress.enabled }}
+{{- $fullname := include "made.fullname" . -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ include "made.namespace" . }}
+  labels:
+    {{- include "made.labels" . | nindent 4 }}
+  annotations:
+    {{- if .Values.ingress.certManager.enabled }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.certManager.clusterIssuer | quote }}
+    {{- end }}
+    {{- if .Values.gateway.kong.enabled }}
+    # Attach the Kong plugins (OPA authz + identity-header transform) to every
+    # route so the backend only ever sees gateway-asserted identity.
+    konghq.com/plugins: {{ join "," .Values.gateway.kong.plugins | quote }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.certManager.enabled }}
+  tls:
+    {{- range .Values.ingress.routes }}
+    - hosts:
+        - {{ .host | quote }}
+      secretName: {{ .tlsSecret | quote }}
+    {{- end }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.routes }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          - path: {{ .path | default "/" }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ $fullname }}-{{ .component }}
+                port:
+                  number: {{ .port }}
+    {{- end }}
+{{- end }}

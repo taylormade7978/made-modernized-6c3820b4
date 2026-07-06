@@ -1,0 +1,35 @@
+MADE ({{ .Values.global.env }}) has been rendered into namespace "{{ include "made.namespace" . }}".
+
+Components:
+{{- range $name, $c := .Values.components }}
+{{- if $c.enabled }}
+  - {{ include "made.fullname" $ }}-{{ $name }} ({{ $c.replicas | default 1 }} replica(s), {{ $c.image.repository }}:{{ $c.image.tag | default $.Chart.AppVersion }})
+{{- end }}
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+
+Ingress hosts ({{ .Values.ingress.className }}{{ if .Values.ingress.certManager.enabled }}, TLS via cert-manager/{{ .Values.ingress.certManager.clusterIssuer }}{{ end }}):
+{{- range .Values.ingress.routes }}
+  - https://{{ .host }}  ->  {{ include "made.fullname" $ }}-{{ .component }}:{{ .port }}
+{{- end }}
+{{- end }}
+
+{{- if and .Values.secrets.create (not .Values.secrets.existingSecret) }}
+{{- $missing := list }}
+{{- range $k, $v := .Values.secrets.data }}
+{{- if not $v }}{{ $missing = append $missing $k }}{{- end }}
+{{- end }}
+{{- if $missing }}
+
+WARNING: these Secret keys were rendered EMPTY — supply them at deploy time
+(--set secrets.data.KEY=..., a sealed secret, or secrets.existingSecret):
+{{- range $missing }}
+  - {{ . }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+Auth is terminated at the Kong/OPA edge; the backend trusts only gateway-set
+identity headers. Verify a render before applying with:
+  helm template made deploy/helm/made -f deploy/helm/made/values-{{ .Values.global.env }}.yaml

@@ -1,0 +1,59 @@
+{{- /*
+Edge (Kong + OPA) and mesh (Dapr) wiring.
+
+These reference Kong (configuration.konghq.com) and Dapr (dapr.io) CRDs. They are
+guarded by gateway.kong.enabled / gateway.dapr.createConfig so a cluster without
+those operators installed can disable them and still render a valid release.
+*/}}
+{{- if .Values.gateway.kong.enabled }}
+---
+# OPA authorization: Kong calls the policy decision point for every request on the
+# routes this plugin is attached to (see the Ingress konghq.com/plugins annotation).
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: made-opa
+  namespace: {{ include "made.namespace" . }}
+  labels:
+    {{- include "made.labels" . | nindent 4 }}
+plugin: opa
+config:
+  opa_protocol: http
+  opa_path: {{ .Values.gateway.kong.opa.url | quote }}
+  include_service_in_opa_input: true
+  include_consumer_in_opa_input: true
+---
+# Identity-header transform: strip any client-supplied identity headers at the
+# edge so a caller cannot forge the identity the backend trusts. Kong's auth/OPA
+# stage sets the authoritative values downstream of this removal.
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: made-identity-headers
+  namespace: {{ include "made.namespace" . }}
+  labels:
+    {{- include "made.labels" . | nindent 4 }}
+plugin: request-transformer
+config:
+  remove:
+    headers:
+      {{- range .Values.gateway.kong.identityHeaders.inject }}
+      - {{ . | quote }}
+      {{- end }}
+{{- end }}
+{{- if and .Values.gateway.dapr.enabled .Values.gateway.dapr.createConfig }}
+---
+# Dapr control-plane Configuration referenced by the dapr.io/config pod annotation.
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: {{ .Values.gateway.dapr.configName }}
+  namespace: {{ include "made.namespace" . }}
+  labels:
+    {{- include "made.labels" . | nindent 4 }}
+spec:
+  metric:
+    enabled: true
+  mtls:
+    enabled: {{ .Values.gateway.dapr.mtls }}
+{{- end }}
