@@ -37,6 +37,32 @@ hidden. Unset ⇒ enabled (full open-web build). See `.env.example`.
 VITE_CAP_TOKEN=false VITE_CAP_MARKETPLACE=false VITE_CAP_WALLET=false npm run build
 ```
 
+## Auth / identity (trusted-header, gateway-driven)
+
+The PWA does **not** implement authentication. A Kong/OPA edge terminates OIDC,
+validates the token, and injects **trusted identity headers** upstream. The
+client only:
+
+- reads a backend session ("who am I") endpoint that echoes the edge-asserted
+  identity/tenant (`VITE_SESSION_ENDPOINT`, default `/api/session`), and
+- redirects to the gateway sign-in entry (`VITE_GATEWAY_SIGNIN_URL`, default
+  `/oauth2/start`) for the OIDC hand-off.
+
+There is **no** JWT parsing, password handling, or OAuth client logic in the
+bundle. The pieces:
+
+- `src/config/session.ts` — endpoint/URL config from `import.meta.env`.
+- `src/auth/session.ts` — `fetchSession()` (401/403 ⇒ anonymous), sign-in URL
+  builder, and `apiFetch()` (a `fetch` wrapper that routes to `/login` on a 401,
+  giving every later view the session-expiry redirect).
+- `src/auth/SessionProvider.tsx` — one session check shared via context.
+- `src/auth/RequireSession.tsx` — route guard: anonymous/expired ⇒ `/login`.
+- `src/views/LoginView.tsx` — the entry view: shows identity/tenant when signed
+  in, otherwise directs to the gateway.
+
+`/login` sits outside the guard and the tab-bar shell; every other route is
+behind `RequireSession`. See `.env.example` for the full config surface.
+
 ## Capacitor
 
 `base: './'` (relative asset URLs) + hash routing keep the bundle

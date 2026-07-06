@@ -8,3 +8,14 @@ declare const __CAP_TOKEN__: boolean
 declare const __CAP_MARKETPLACE__: boolean
 declare const __CAP_WALLET__: boolean
 declare const __CAP_REDIRECT_BASE_URL__: string
+
+// Runtime env for the edge/session config (see src/config/session.ts). Unlike
+// the capability flags, these are ordinary runtime values read from
+// import.meta.env — no dead-code elimination depends on them. Interface merging
+// augments Vite's built-in ImportMetaEnv with our typed keys.
+interface ImportMetaEnv {
+  readonly VITE_SESSION_ENDPOINT?: string
+  readonly VITE_GATEWAY_SIGNIN_URL?: string
+  readonly VITE_GATEWAY_SIGNOUT_URL?: string
+  readonly VITE_GATEWAY_RETURN_PARAM?: string
+}
