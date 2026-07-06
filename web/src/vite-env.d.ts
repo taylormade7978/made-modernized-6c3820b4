@@ -28,4 +28,5 @@ interface ImportMetaEnv {
   readonly VITE_API_CAP_LEADERBOARD?: string
   readonly VITE_API_CAP_SHOP?: string
   readonly VITE_API_CAP_CATALOG?: string
+  readonly VITE_API_CAP_STORY?: string
 }

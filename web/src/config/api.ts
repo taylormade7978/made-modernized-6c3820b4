@@ -51,6 +51,7 @@ export interface ApiCapabilities {
   readonly leaderboard: boolean
   readonly shop: boolean
   readonly catalog: boolean
+  readonly story: boolean
 }
 
 /** Coerce a `VITE_*` env var into an {@link ApiEnv}, defaulting to `dev`. */
@@ -128,5 +129,6 @@ export const apiConfig: ApiConfig = {
     leaderboard: readFlag(import.meta.env.VITE_API_CAP_LEADERBOARD, true),
     shop: readFlag(import.meta.env.VITE_API_CAP_SHOP, true),
     catalog: readFlag(import.meta.env.VITE_API_CAP_CATALOG, true),
+    story: readFlag(import.meta.env.VITE_API_CAP_STORY, true),
   },
 }

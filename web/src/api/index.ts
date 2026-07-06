@@ -16,6 +16,7 @@ export type {
   LeaderboardApi,
   RealtimeApi,
   ShopApi,
+  StoryApi,
 } from './client'
 
 export { createHttpClient, buildUrl, backoffDelay } from './http'

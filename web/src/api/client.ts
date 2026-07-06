@@ -17,11 +17,14 @@ import type {
   Deck,
   Card,
   ExpansionSet,
+  LaunchMissionRequest,
   LeaderboardPage,
   LeaderboardQuery,
+  MissionAttempt,
   Order,
   SaveDeckRequest,
   ShopItem,
+  StoryResponse,
 } from './types'
 
 /** Options accepted by every call: an abort signal for cancellation. */
@@ -40,6 +43,7 @@ export interface ApiClient {
   readonly leaderboard: LeaderboardApi
   readonly shop: ShopApi
   readonly catalog: CatalogApi
+  readonly story: StoryApi
   readonly realtime: RealtimeApi
 }
 
@@ -67,6 +71,22 @@ export interface ShopApi {
   createOrder(body: CreateOrderRequest, opts?: CallOptions): Promise<Order>
   /** `GET /v1/shop/orders/{orderId}` — an order's current state. */
   getOrder(orderId: string, opts?: CallOptions): Promise<Order>
+}
+
+export interface StoryApi {
+  /** `GET /v1/story/{playerId}/missions` — the player's campaign (missions + bosses). */
+  listMissions(playerId: string, opts?: CallOptions): Promise<StoryResponse>
+  /**
+   * `POST /v1/story/{playerId}/missions/{missionId}/attempts` — launch a
+   * MissionAttempt against the AI-opponent service; returns the attempt and the
+   * match ticket that joins the authoritative match to play it.
+   */
+  launchAttempt(
+    playerId: string,
+    missionId: string,
+    body: LaunchMissionRequest,
+    opts?: CallOptions,
+  ): Promise<MissionAttempt>
 }
 
 export interface CatalogApi {
@@ -183,6 +203,22 @@ export function createApiClient({ http, config = apiConfig }: CreateApiClientCon
     },
   }
 
+  const story: StoryApi = {
+    listMissions(playerId, opts) {
+      return guard(cap.story, 'story', env, () =>
+        http.request<StoryResponse>(`/story/${seg(playerId)}/missions`, { signal: opts?.signal }),
+      )
+    },
+    launchAttempt(playerId, missionId, body, opts) {
+      return guard(cap.story, 'story', env, () =>
+        http.request<MissionAttempt>(
+          `/story/${seg(playerId)}/missions/${seg(missionId)}/attempts`,
+          { method: 'POST', body, signal: opts?.signal },
+        ),
+      )
+    },
+  }
+
   const realtime: RealtimeApi = {
     gameSocketUrl(params) {
       const url = new URL('/ws', `${config.wsBaseUrl}/`)
@@ -191,7 +227,7 @@ export function createApiClient({ http, config = apiConfig }: CreateApiClientCon
     },
   }
 
-  return { collection, leaderboard, shop, catalog, realtime }
+  return { collection, leaderboard, shop, catalog, story, realtime }
 }
 
 /**

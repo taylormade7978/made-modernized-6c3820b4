@@ -1,4 +1,6 @@
+import { useLocation } from 'react-router-dom'
 import { useMatch, type MatchMode } from '../match/useMatch'
+import type { MissionLaunch } from '../match/mission'
 
 /**
  * Match / board view — the primary play surface.
@@ -9,12 +11,18 @@ import { useMatch, type MatchMode } from '../match/useMatch'
  * mispredicted move against server truth). A **Practice** toggle detaches the
  * socket and runs a whole match fully client-side against the same rules.
  *
+ * When reached from the story view (via router state carrying a
+ * {@link MissionLaunch}), the match joins the AI opponent's authoritative match
+ * with the launched attempt's `ticket`, and a banner names the boss being fought.
+ *
  * The layout is mobile-first: a fixed header + action bar bracket a flex-filling
  * canvas, so the board scales to the viewport and the controls stay reachable
  * with a thumb.
  */
 export default function MatchView() {
-  const match = useMatch()
+  const location = useLocation()
+  const mission = (location.state as { mission?: MissionLaunch } | null)?.mission
+  const match = useMatch('live', mission?.ticket)
   const { state } = match
   const yourTurn = state.turn === match.selfSeat && state.phase === 'active'
   const over = state.phase === 'completed'
@@ -43,6 +51,12 @@ export default function MatchView() {
       </header>
 
       <div className="match__stage">
+        {mission ? (
+          <div className="match__mission" role="status">
+            {mission.missionName} — vs {mission.bossName}
+            <span className="match__mission-tier"> · {mission.difficultyTier}</span>
+          </div>
+        ) : null}
         <canvas ref={match.canvasRef} className="match__canvas" aria-label="Game board" role="img" />
         {match.correction ? (
           <div className="match__correction" role="alert">

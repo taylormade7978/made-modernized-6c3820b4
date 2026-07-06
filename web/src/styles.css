@@ -578,3 +578,345 @@ body {
     grid-template-columns: 2fr 1fr 1fr;
   }
 }
+
+/* ── Shop / leaderboard / story: shared surface tokens ──────────────────────
+   All three S-83 views are mobile-first: a single scrolling column of cards on
+   a phone, widening to a responsive grid on a tablet+ viewport. */
+.shop__title,
+.ranks__title,
+.story__title {
+  margin: 0 0 0.75rem;
+  font-size: 1.4rem;
+}
+
+.shop__section-title,
+.ranks__season {
+  margin: 1.25rem 0 0.6rem;
+  font-size: 0.95rem;
+  color: var(--muted);
+}
+
+.shop__status,
+.ranks__status,
+.story__status {
+  color: var(--muted);
+}
+
+.shop__error,
+.ranks__error,
+.story__error {
+  color: #f7c6cc;
+  margin: 0 0 0.75rem;
+}
+
+.shop__btn,
+.ranks__btn,
+.story__btn {
+  display: inline-block;
+  padding: 0.7rem 0.9rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  text-align: center;
+  text-decoration: none;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 0.6rem;
+  cursor: pointer;
+}
+
+.shop__btn--primary,
+.story__btn--primary {
+  color: #fff;
+  background: var(--accent);
+  border-color: transparent;
+}
+
+.shop__btn:disabled,
+.ranks__btn:disabled,
+.story__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ── Shop ──────────────────────────────────────────────────────────────── */
+.shop__grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.75rem;
+}
+
+.shop__card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.9rem;
+  background: var(--surface);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0.8rem;
+}
+
+.shop__card--token {
+  border-color: rgba(76, 139, 245, 0.4);
+}
+
+.shop__card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.shop__kind {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 0.4rem;
+  padding: 0.1rem 0.4rem;
+}
+
+.shop__kind--battlePass {
+  color: #ffd479;
+  border-color: rgba(255, 212, 121, 0.5);
+}
+
+.shop__kind--token {
+  color: var(--accent);
+  border-color: rgba(76, 139, 245, 0.5);
+}
+
+.shop__price {
+  font-weight: 700;
+  font-size: 1rem;
+}
+
+.shop__card-name {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.shop__card-desc {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+  flex: 1 1 auto;
+}
+
+.shop__card .shop__btn,
+.shop__card .shop__btn--primary {
+  margin-top: 0.25rem;
+}
+
+.shop__token-redirect {
+  margin-top: 0.5rem;
+}
+
+.shop__empty {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+/* ── Leaderboard ───────────────────────────────────────────────────────── */
+.ranks__head {
+  margin-bottom: 0.5rem;
+}
+
+.ranks__season-id {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.ranks__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.ranks__row {
+  display: grid;
+  grid-template-columns: 3rem 1fr auto auto;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.6rem 0.75rem;
+  background: var(--surface);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 0.6rem;
+}
+
+.ranks__row--self {
+  border-color: var(--accent);
+  background: rgba(76, 139, 245, 0.14);
+}
+
+.ranks__rank {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.ranks__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ranks__stars {
+  color: #ffd479;
+  font-size: 0.85rem;
+}
+
+.ranks__rating {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.ranks__empty {
+  color: var(--muted);
+  padding: 0.75rem;
+}
+
+.ranks__pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.ranks__page-label {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+/* ── Story ─────────────────────────────────────────────────────────────── */
+.story__grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.75rem;
+}
+
+.story__card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.9rem;
+  background: var(--surface);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0.8rem;
+}
+
+.story__card--locked {
+  opacity: 0.6;
+}
+
+.story__card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.story__tier {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 0.4rem;
+  padding: 0.1rem 0.4rem;
+  color: var(--muted);
+}
+
+.story__tier--brutal {
+  color: #ffb27a;
+  border-color: rgba(255, 178, 122, 0.5);
+}
+
+.story__tier--legendary {
+  color: #ffd479;
+  border-color: rgba(255, 212, 121, 0.5);
+}
+
+.story__cleared {
+  font-size: 0.72rem;
+  color: #7ddca0;
+}
+
+.story__mission-name {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.story__mission-desc {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.story__boss {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.15rem 0.6rem;
+  margin: 0.25rem 0 0;
+  font-size: 0.82rem;
+}
+
+.story__boss-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 0.66rem;
+  letter-spacing: 0.05em;
+  align-self: center;
+}
+
+.story__boss-name,
+.story__ai {
+  margin: 0;
+}
+
+.story__boss-hp,
+.story__ai-budget {
+  color: var(--muted);
+}
+
+.story__empty {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+/* Mission banner over the match board (story → match hand-off). */
+.match__mission {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  right: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.82rem;
+  text-align: center;
+  color: var(--text);
+  background: rgba(11, 13, 18, 0.8);
+  border: 1px solid rgba(76, 139, 245, 0.4);
+  border-radius: 0.5rem;
+}
+
+.match__mission-tier {
+  color: var(--muted);
+}
+
+/* Tablet+ : the shop and story card lists flow into a responsive grid. */
+@media (min-width: 40rem) {
+  .shop__grid,
+  .story__grid {
+    grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  }
+}

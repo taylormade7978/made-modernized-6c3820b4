@@ -27,7 +27,7 @@ const testConfig: ApiConfig = {
   project: 'made',
   restBaseUrl: BASE,
   wsBaseUrl: 'wss://ws.testnet.made.vforce360.ai',
-  capabilities: { collection: true, leaderboard: true, shop: true, catalog: true },
+  capabilities: { collection: true, leaderboard: true, shop: true, catalog: true, story: true },
 }
 
 const server = setupServer()
@@ -107,6 +107,76 @@ describe('shop.createOrder', () => {
 
     expect(order.status).toBe('created')
     expect(received).toEqual({ playerId: 'p1', lineItems: ['pack.core'], currency: 'USD' })
+  })
+})
+
+describe('story.listMissions', () => {
+  it('decodes the campaign for a player', async () => {
+    server.use(
+      http.get(`${BASE}/story/:playerId/missions`, ({ params }) =>
+        HttpResponse.json({
+          playerId: params.playerId,
+          missions: [
+            {
+              missionId: 'm-1',
+              name: 'The Awakening',
+              description: 'Face the first boss.',
+              difficultyTier: 'Prologue',
+              boss: {
+                bossId: 'b-1',
+                name: 'Gravemind',
+                startingHp: 30,
+                heroPower: 'Reap',
+                trademark: 'Undying',
+                signatureCardIds: ['c-9'],
+              },
+              aiProfile: {
+                profileId: 'ai-1',
+                difficultyTier: 'Prologue',
+                strategyKind: 'Scripted',
+                mctsBudget: 0,
+              },
+              firstClearRewardClaimed: false,
+              unlocked: true,
+            },
+          ],
+        }),
+      ),
+    )
+
+    const { api } = makeClient()
+    const story = await api.story.listMissions('p1')
+    expect(story.playerId).toBe('p1')
+    expect(story.missions[0].boss.name).toBe('Gravemind')
+    expect(story.missions[0].aiProfile.strategyKind).toBe('Scripted')
+  })
+})
+
+describe('story.launchAttempt', () => {
+  it('POSTs the launch body and returns the attempt with its match ticket', async () => {
+    let received: unknown
+    server.use(
+      http.post(`${BASE}/story/:playerId/missions/:missionId/attempts`, async ({ request }) => {
+        received = await request.json()
+        return HttpResponse.json(
+          {
+            attemptId: 'a-1',
+            missionId: 'm-1',
+            playerId: 'p1',
+            difficultyTier: 'Prologue',
+            matchTicket: 't-mission-1',
+            scriptedStateStep: 0,
+            missionCompleted: false,
+          },
+          { status: 201 },
+        )
+      }),
+    )
+
+    const { api } = makeClient()
+    const attempt = await api.story.launchAttempt('p1', 'm-1', { playerId: 'p1', missionId: 'm-1' })
+    expect(attempt.matchTicket).toBe('t-mission-1')
+    expect(received).toEqual({ playerId: 'p1', missionId: 'm-1' })
   })
 })
 

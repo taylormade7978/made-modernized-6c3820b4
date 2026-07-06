@@ -51,7 +51,7 @@ export interface MatchController {
   readonly dismissCorrection: () => void
 }
 
-export function useMatch(matchId = 'live'): MatchController {
+export function useMatch(matchId = 'live', ticket?: string): MatchController {
   const reconciler = useRef<Reconciler>(new Reconciler(startMatch(matchId)))
   const connection = useRef<MatchConnection | null>(null)
   const wasmGate = useRef<RulesWasm | null>(null)
@@ -94,36 +94,40 @@ export function useMatch(matchId = 'live'): MatchController {
       return
     }
 
-    const conn = new MatchConnection({
-      onStatus: setStatus,
-      onMessage: (message) => {
-        const r = reconciler.current
-        switch (message.type) {
-          case 'ack':
-            if (message.accepted) r.confirmHead()
-            else {
-              const rolled = r.rejectHead()
-              raiseCorrection(rolled.rolledBack ? `Server rejected your move: ${message.reason ?? 'illegal'}` : (message.reason ?? 'move corrected'))
+    const conn = new MatchConnection(
+      {
+        onStatus: setStatus,
+        onMessage: (message) => {
+          const r = reconciler.current
+          switch (message.type) {
+            case 'ack':
+              if (message.accepted) r.confirmHead()
+              else {
+                const rolled = r.rejectHead()
+                raiseCorrection(rolled.rolledBack ? `Server rejected your move: ${message.reason ?? 'illegal'}` : (message.reason ?? 'move corrected'))
+              }
+              break
+            case 'delta': {
+              const c = r.applyAuthoritative(message.events)
+              if (c.dropped.length) raiseCorrection('Board reconciled to server state')
+              break
             }
-            break
-          case 'delta': {
-            const c = r.applyAuthoritative(message.events)
-            if (c.dropped.length) raiseCorrection('Board reconciled to server state')
-            break
+            case 'snapshot': {
+              const c = r.reset(message.state)
+              if (c.dropped.length) raiseCorrection('Board resynced to server state')
+              break
+            }
           }
-          case 'snapshot': {
-            const c = r.reset(message.state)
-            if (c.dropped.length) raiseCorrection('Board resynced to server state')
-            break
-          }
-        }
-        rerender()
+          rerender()
+        },
       },
-    })
+      // A mission launch joins the AI-opponent's authoritative match via its ticket.
+      ticket,
+    )
     connection.current = conn
     conn.connect()
     return () => conn.close()
-  }, [mode, raiseCorrection, rerender])
+  }, [mode, ticket, raiseCorrection, rerender])
 
   // Canvas renderer + animation loop. Redraws from refs each frame and decays the
   // correction flash; a ResizeObserver keeps the backing store matched to the box.
