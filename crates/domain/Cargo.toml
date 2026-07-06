@@ -9,6 +9,13 @@ description = "Bounded-context aggregate stubs (MatchReplay, CardDefinition, Bos
 [lib]
 crate-type = ["rlib"]
 
+# CI content-gate: validate the shipped content catalog (content/catalog/*.json)
+# against the domain's own invariants by replaying each entry through its
+# aggregate's `execute` path, so the check can never drift from the rules.
+[[bin]]
+name = "content-validator"
+path = "src/bin/content-validator.rs"
+
 [dependencies]
 shared = { workspace = true }
 serde = { version = "1", features = ["derive"] }

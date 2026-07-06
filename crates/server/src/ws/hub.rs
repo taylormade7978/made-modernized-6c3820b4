@@ -321,10 +321,7 @@ impl MatchHub {
                     .map(|event| live.record_and_broadcast(match_id, event))
                     .collect();
 
-                let completion = match winner {
-                    Some(seat) => Some(self.seal(match_id, live, seat)),
-                    None => None,
-                };
+                let completion = winner.map(|seat| self.seal(match_id, live, seat));
 
                 ApplyOutcome::Applied(Applied {
                     snapshot: live.snapshot(match_id),

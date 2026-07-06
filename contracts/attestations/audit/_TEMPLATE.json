@@ -1,0 +1,7 @@
+{
+  "version": "REPLACE-WITH-CONTRACT-VERSION",
+  "status": "passed",
+  "auditor": "REPLACE-WITH-THIRD-PARTY-AUDITOR",
+  "report": "REPLACE-WITH-REPORT-URL-OR-HASH",
+  "auditedAt": "REPLACE-WITH-ISO8601-TIMESTAMP"
+}

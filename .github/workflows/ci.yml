@@ -34,10 +34,6 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      # The GameSession rules crate must also compile to WASM for the client.
-      - name: Build GameSession for wasm32
-        run: cargo build -p game-session --features wasm --target wasm32-unknown-unknown
-
   fmt:
     runs-on: ubuntu-latest
     steps:
@@ -46,6 +42,48 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+
+  # Lint gate: clippy across every crate and target, warnings promoted to errors
+  # so a lint regression fails the PR instead of accumulating as debt.
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Build the GameSession rules crate to WASM with wasm-pack — the exact bundler
+  # target the PWA consumes — so a change that breaks the browser build fails
+  # here rather than in the client's Vite/Dockerfile build.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - name: wasm-pack build (bundler target)
+        run: wasm-pack build crates/game-session --target bundler -- --features wasm
+
+  # Content gate: replay every catalog entry (content/catalog/*.json) through its
+  # domain aggregate's own invariants via the content-validator binary, so a
+  # catalog data change that would violate a card rule fails the PR.
+  content-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate content catalog
+        run: cargo run -q -p domain --bin content-validator -- content/catalog
 
   # PWA client: type-check + Vite production build (manifest + service worker).
   web-build:
@@ -310,3 +348,86 @@ jobs:
       # .cargo/config.toml, so the check validates queries live against the DB.
       - name: Verify offline query metadata is current
         run: cargo sqlx prepare --workspace --check
+
+  # Render + lint the Helm chart against both environment overlays without a
+  # cluster, so a template or values regression fails the PR. No secrets needed,
+  # so this runs on every PR (unlike the deploy job below).
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint + template both overlays
+        run: |
+          for env in dev prod; do
+            echo "::group::helm lint ($env)"
+            helm lint deploy/helm/made -f "deploy/helm/made/values-${env}.yaml"
+            helm template made deploy/helm/made \
+              -f "deploy/helm/made/values-${env}.yaml" >/dev/null
+            echo "::endgroup::"
+          done
+
+  # On a merge to main, roll the freshly-pushed images out to the target
+  # namespace with the environment-scoped overlay. Gated on the image + test
+  # jobs so we never deploy a build that did not pass CI or push its images.
+  # The GitHub Environment (`vars.DEPLOY_ENV`, default `prod`) carries any
+  # required-reviewer / wait-timer protection, and holds the KUBECONFIG secret.
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [build-and-test, migrations, web-image, server-image, content-validate]
+    environment: ${{ vars.DEPLOY_ENV || 'prod' }}
+    env:
+      DEPLOY_ENV: ${{ vars.DEPLOY_ENV || 'prod' }}
+      DEPLOY_NAMESPACE: ${{ vars.DEPLOY_NAMESPACE || 'made' }}
+      SERVER_REGISTRY: ${{ vars.SERVER_REGISTRY || 'ghcr.io' }}
+      SERVER_IMAGE_NAME: ${{ vars.SERVER_IMAGE_NAME || format('{0}/made-server', github.repository) }}
+      WEB_REGISTRY: ${{ vars.WEB_REGISTRY || 'ghcr.io' }}
+      WEB_IMAGE_NAME: ${{ vars.WEB_IMAGE_NAME || format('{0}/made-pwa', github.repository) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      # Recompute the same version identities the image jobs pushed under, so the
+      # release deploys exactly those tags (crate/pkg version + short sha).
+      - name: Compute image tags
+        id: ver
+        run: |
+          SHORT="${GITHUB_SHA::7}"
+          CRATE_VER="$(grep -m1 -E '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          PKG_VER="$(node -p "require('./web/package.json').version")"
+          echo "server_tag=${CRATE_VER}+${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "web_tag=${PKG_VER}+${SHORT}" >> "$GITHUB_OUTPUT"
+
+      # Materialize the cluster credential from the environment secret.
+      - name: Configure kubeconfig
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
+        run: |
+          if [ -z "$KUBECONFIG_DATA" ]; then
+            echo "KUBECONFIG secret is not set for environment '$DEPLOY_ENV'" >&2
+            exit 1
+          fi
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBECONFIG_DATA" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
+
+      # Apply the chart to the namespace with the environment overlay, pinning
+      # both component images to the tags pushed for this commit. --wait blocks
+      # until the rollout is Ready (or times out and fails the deploy).
+      - name: Helm upgrade --install
+        env:
+          SERVER_TAG: ${{ steps.ver.outputs.server_tag }}
+          WEB_TAG: ${{ steps.ver.outputs.web_tag }}
+        run: |
+          helm upgrade --install made deploy/helm/made \
+            --namespace "$DEPLOY_NAMESPACE" --create-namespace \
+            -f "deploy/helm/made/values-${DEPLOY_ENV}.yaml" \
+            --set "components.server.image.repository=${SERVER_REGISTRY}/${SERVER_IMAGE_NAME}" \
+            --set "components.server.image.tag=${SERVER_TAG}" \
+            --set "components.web.image.repository=${WEB_REGISTRY}/${WEB_IMAGE_NAME}" \
+            --set "components.web.image.tag=${WEB_TAG}" \
+            --wait --timeout 5m
+          helm status made --namespace "$DEPLOY_NAMESPACE"

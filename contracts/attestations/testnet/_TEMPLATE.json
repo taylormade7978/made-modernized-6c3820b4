@@ -1,0 +1,7 @@
+{
+  "version": "REPLACE-WITH-CONTRACT-VERSION",
+  "status": "passed",
+  "network": "sepolia",
+  "txHash": "0xREPLACE-WITH-DEPLOY-TX-HASH",
+  "deployedAt": "REPLACE-WITH-ISO8601-TIMESTAMP"
+}
