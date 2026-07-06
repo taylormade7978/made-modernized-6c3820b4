@@ -11,6 +11,14 @@
 //! At this scaffold stage the aggregates recognize no commands, so the server
 //! faithfully reports the domain's [`shared::DomainError::UnknownCommand`]
 //! decision back to the client.
+//!
+//! Alongside the WebSocket channel it serves the versioned `/v1` REST API (see
+//! [`http`]): collection/deck, leaderboard/ranked, shop-payments, and catalog
+//! endpoints wired to the Postgres repository adapters. Auth is terminated by
+//! the Kong/OPA sidecars in front of this process, so the REST handlers only
+//! read the identity the gateway injects — there is no auth middleware here.
+
+mod http;
 
 use std::sync::Mutex;
 
@@ -87,17 +95,32 @@ async fn main() -> std::io::Result<()> {
         game_sessions: Mutex::new(InMemoryGameSessionRepository::new()),
     });
 
+    // Build the Postgres pool the `/v1` REST handlers run over. It connects
+    // *lazily* — the server binds and serves immediately, and the first request
+    // that touches the database establishes the connection — so startup does not
+    // depend on Postgres (or the Kong/OPA sidecars) already being reachable.
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://made:made@localhost:5432/made".to_string());
+    let pool = persistence::connect_lazy(&database_url)
+        .expect("DATABASE_URL must be a valid Postgres connection string");
+    let api_state = web::Data::new(http::ApiState::new(pool));
+
     let addr = ("127.0.0.1", 8080);
     println!(
-        "MADE game server listening on ws://{}:{}/ws",
+        "MADE game server listening on http://{}:{} (REST /v1, ws /ws)",
         addr.0, addr.1
     );
 
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .app_data(api_state.clone())
+            // Malformed JSON bodies render the same structured 400 envelope as a
+            // failed field validation.
+            .app_data(http::json_config())
             .service(health)
             .route("/ws", web::get().to(game_ws))
+            .configure(http::configure)
     })
     .bind(addr)?
     .run()

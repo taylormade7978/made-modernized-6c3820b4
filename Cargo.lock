@@ -1803,6 +1803,9 @@ dependencies = [
  "futures-util",
  "game-session",
  "mocks",
+ "persistence",
+ "serde",
+ "serde_json",
  "shared",
 ]
 

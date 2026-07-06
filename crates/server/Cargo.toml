@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Authoritative WebSocket game server (actix-web + actix-ws). Driving adapter wiring the domain aggregates and mock repositories."
+description = "Authoritative game server (actix-web + actix-ws). Driving adapter: the /v1 REST API over the Postgres repository adapters plus the WebSocket match channel."
 
 [[bin]]
 name = "made-server"
@@ -15,6 +15,9 @@ shared = { workspace = true }
 domain = { workspace = true }
 game-session = { workspace = true }
 mocks = { workspace = true }
+persistence = { workspace = true }
 actix-web = { workspace = true }
 actix-ws = { workspace = true }
 futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

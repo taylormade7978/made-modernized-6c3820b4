@@ -26,7 +26,12 @@
 //! there is intentionally no other backend behind these ports.
 
 use sqlx::migrate::Migrator;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
+
+/// Re-export of the sqlx connection pool so driving adapters (the actix-web
+/// server) can name and hold the pool without taking a direct `sqlx`
+/// dependency. The pool is what every repository adapter here is built over.
+pub use sqlx::postgres::PgPool;
 
 pub mod error;
 pub mod repositories;
@@ -48,6 +53,20 @@ pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
         .max_connections(5)
         .connect(database_url)
         .await
+}
+
+/// Build a pool that connects *lazily* — no TCP connection is opened until the
+/// first query runs. Only the `database_url` is validated up front.
+///
+/// The driving server uses this so it can bind and serve its liveness probe
+/// (and mount the `/v1` routes) the instant it starts, even before Postgres is
+/// reachable; a connection is then established on demand when the first request
+/// actually touches the database. This keeps startup ordering (Kong/OPA
+/// sidecars, the DB, the app) from becoming a boot-time dependency.
+pub fn connect_lazy(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        .max_connections(5)
+        .connect_lazy(database_url)
 }
 
 /// Apply every pending migration in forward order, bringing the database up to
