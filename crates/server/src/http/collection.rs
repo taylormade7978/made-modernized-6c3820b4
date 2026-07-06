@@ -211,14 +211,25 @@ async fn create_collection(
 /// `GET /collections/{id}` — read a collection and its owned-card ledger.
 async fn get_collection(
     state: web::Data<ApiState>,
-    _identity: Identity,
+    identity: Identity,
     path: web::Path<String>,
 ) -> Result<HttpResponse, ApiError> {
+    let id = path.into_inner();
     let repo = PlayerCollectionRepository::new(state.pool.clone());
-    Ok(ok(load_collection(&repo, &path.into_inner()).await?))
+    let resp = load_collection(&repo, &id).await?;
+    // Object-level authorization: a caller may only read their own collection.
+    identity.require_owner(&resp.player_id, "PlayerCollection", &id)?;
+    Ok(ok(resp))
 }
 
 /// `POST /collections/{id}/grants` — atomically grant cards into the ledger.
+///
+/// This is a privileged, server-authoritative operation: the *contents* of the
+/// grant are supplied by the caller, so exposing it to players would let anyone
+/// mint themselves arbitrary cards. It is therefore restricted to internal
+/// service accounts (fulfillment, rewards). Player-facing card acquisition must
+/// go through a purchase/reward flow that calls this with a service identity
+/// once the domain reveal/entitlement logic exists.
 async fn grant_cards(
     state: web::Data<ApiState>,
     identity: Identity,
@@ -227,6 +238,8 @@ async fn grant_cards(
 ) -> Result<HttpResponse, ApiError> {
     let id = path.into_inner();
     let body = body.into_inner();
+
+    identity.require_service("collection.grant")?;
 
     let mut v = Validator::new();
     v.require(!body.grants.is_empty(), "grants", "must not be empty");
@@ -261,6 +274,18 @@ async fn create_outfit(
     v.non_empty("name", &body.name);
     v.finish()?;
 
+    // The outfit must draw from a collection the caller owns — otherwise a
+    // player could build a deck against another player's collection.
+    let collections = PlayerCollectionRepository::new(state.pool.clone());
+    let coll = collections
+        .find_by_id(&body.collection_id)
+        .await?
+        .ok_or(ApiError::NotFound {
+            resource: "PlayerCollection",
+            id: body.collection_id.clone(),
+        })?;
+    identity.require_owner(&coll.player_id, "PlayerCollection", &body.collection_id)?;
+
     identity.audit("outfit.create");
     let row = OutfitRow {
         id: body.id,
@@ -279,7 +304,7 @@ async fn create_outfit(
 /// `GET /outfits/{id}` — read a single outfit.
 async fn get_outfit(
     state: web::Data<ApiState>,
-    _identity: Identity,
+    identity: Identity,
     path: web::Path<String>,
 ) -> Result<HttpResponse, ApiError> {
     let id = path.into_inner();
@@ -288,6 +313,8 @@ async fn get_outfit(
         resource: "Outfit",
         id: id.clone(),
     })?;
+    // Object-level authorization: only the owner may read the outfit.
+    identity.require_owner(&row.player_id, "Outfit", &id)?;
     Ok(ok(OutfitResponse::from(row)))
 }
 
@@ -304,7 +331,6 @@ async fn update_outfit(
     v.non_empty("name", &body.name);
     v.finish()?;
 
-    identity.audit("outfit.update");
     let repo = OutfitRepository::new(state.pool.clone());
     // Load the current row so the immutable fields (owner, collection) are
     // preserved; only the name changes. Missing → 404 from the adapter's read.
@@ -312,6 +338,12 @@ async fn update_outfit(
         resource: "Outfit",
         id: id.clone(),
     })?;
+    // Object-level authorization: only the owner may rename the outfit. Checked
+    // before any mutation, and returns NotFound so a non-owner cannot even tell
+    // the outfit exists.
+    identity.require_owner(&row.player_id, "Outfit", &id)?;
+
+    identity.audit("outfit.update");
     row.name = body.name;
     repo.update(&row, body.expected_version).await?;
 

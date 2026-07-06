@@ -236,11 +236,16 @@ async fn load_order(repo: &OrderRepository, id: &str) -> Result<OrderResponse, A
 /// `GET /orders/{id}` — read an order and its line items.
 async fn get_order(
     state: web::Data<ApiState>,
-    _identity: Identity,
+    identity: Identity,
     path: web::Path<String>,
 ) -> Result<HttpResponse, ApiError> {
+    let id = path.into_inner();
     let repo = OrderRepository::new(state.pool.clone());
-    Ok(ok(load_order(&repo, &path.into_inner()).await?))
+    let resp = load_order(&repo, &id).await?;
+    // Object-level authorization: a caller may only read their own order.
+    // NotFound (not Forbidden) so a client-guessable order id cannot be probed.
+    identity.require_owner(&resp.player_id, "Order", &id)?;
+    Ok(ok(resp))
 }
 
 /// `GET /card-packs/{id}` — read a purchasable pack.
@@ -268,6 +273,15 @@ async fn get_card_pack(
 }
 
 /// `POST /card-packs/{id}/open` — reveal a pack's cards into a collection.
+///
+/// Privileged and server-authoritative: the revealed cards are supplied in the
+/// request, so a player-callable version would let anyone mint arbitrary cards
+/// into their collection. It is therefore restricted to internal service
+/// accounts (fulfillment). In the target design a player buys a pack (an order),
+/// and the fulfillment service — holding the `service` role — computes the
+/// reveal from the pack definition and calls this; that reveal logic is a
+/// domain concern not yet implemented (the aggregates are still stubs), so this
+/// handler deliberately does not fabricate it here.
 async fn open_pack(
     state: web::Data<ApiState>,
     identity: Identity,
@@ -275,6 +289,8 @@ async fn open_pack(
     body: web::Json<OpenPackRequest>,
 ) -> Result<HttpResponse, ApiError> {
     let body = body.into_inner();
+
+    identity.require_service("card_pack.open")?;
 
     let mut v = Validator::new();
     v.non_empty("collection_id", &body.collection_id);

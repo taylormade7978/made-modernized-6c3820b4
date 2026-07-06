@@ -74,6 +74,12 @@ pub enum ApiError {
         /// The identity that produced no row.
         id: String,
     },
+    /// The caller is authenticated but not permitted to perform this operation
+    /// (e.g. a privileged, service-role-only action invoked by a player) — 403.
+    /// Distinct from [`ApiError::NotFound`], which is used for object-level
+    /// ownership mismatches so a caller cannot probe for another player's
+    /// resource ids.
+    Forbidden(String),
     /// Optimistic-concurrency loss: the caller's `expected_version` was stale — 409.
     Conflict(String),
     /// A domain/database invariant rejected the write (copy cap, non-negative
@@ -90,6 +96,7 @@ impl ApiError {
         match self {
             ApiError::Validation(_) => "validation_error",
             ApiError::Unauthenticated(_) => "unauthenticated",
+            ApiError::Forbidden(_) => "forbidden",
             ApiError::NotFound { .. } => "not_found",
             ApiError::Conflict(_) => "conflict",
             ApiError::Unprocessable(_) => "unprocessable_entity",
@@ -112,6 +119,7 @@ impl ApiError {
                     .collect(),
             ),
             ApiError::Unauthenticated(msg) => (msg.clone(), Vec::new()),
+            ApiError::Forbidden(msg) => (msg.clone(), Vec::new()),
             ApiError::NotFound { resource, id } => {
                 (format!("no {resource} found for id '{id}'"), Vec::new())
             }
@@ -143,6 +151,7 @@ impl ResponseError for ApiError {
         match self {
             ApiError::Validation(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthenticated(_) => StatusCode::UNAUTHORIZED,
+            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound { .. } => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -206,6 +215,10 @@ mod tests {
         assert_eq!(
             ApiError::Unauthenticated("x".into()).status_code(),
             StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            ApiError::Forbidden("x".into()).status_code(),
+            StatusCode::FORBIDDEN
         );
         assert_eq!(
             ApiError::NotFound {
