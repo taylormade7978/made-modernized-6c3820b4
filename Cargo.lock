@@ -1800,6 +1800,7 @@ dependencies = [
  "actix-web",
  "actix-ws",
  "domain",
+ "ephemeral",
  "futures-util",
  "game-session",
  "mocks",
@@ -1807,6 +1808,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared",
+ "tokio",
 ]
 
 [[package]]

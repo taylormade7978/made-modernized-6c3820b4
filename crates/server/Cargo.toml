@@ -16,8 +16,12 @@ domain = { workspace = true }
 game-session = { workspace = true }
 mocks = { workspace = true }
 persistence = { workspace = true }
+ephemeral = { workspace = true }
 actix-web = { workspace = true }
 actix-ws = { workspace = true }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The authoritative match hub fans deltas out over a `tokio::sync::broadcast`
+# channel; actix already runs on tokio, so this only pulls in the sync feature.
+tokio = { version = "1", features = ["sync"] }
