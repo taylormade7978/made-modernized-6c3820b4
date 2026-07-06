@@ -11,6 +11,20 @@
     <meta name="theme-color" content="#0b0d12" />
     <meta name="description" content="MADE modernized card game — mobile-first PWA client." />
     <title>MADE — Card Game</title>
+
+    <!--
+      Resolve the shared rules-WASM bare specifier (imported with `@vite-ignore`
+      in src/match/wasm.ts, so Vite never bundles it) to the co-located pkg the
+      Docker build stages under public/vendor/. game_session.js fetches its
+      sibling .wasm via `new URL('game_session_bg.wasm', import.meta.url)`, so a
+      relative, base-agnostic map is all the runtime needs. When the artifact is
+      absent (a plain `npm run build` without the Rust/wasm toolchain) the import
+      404s and loadRulesWasm() degrades to "gate disabled" — the TS mirror stays
+      authoritative.
+    -->
+    <script type="importmap">
+      { "imports": { "game-session": "./vendor/game-session/game_session.js" } }
+    </script>
   </head>
   <body>
     <div id="root"></div>

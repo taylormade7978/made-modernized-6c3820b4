@@ -1,0 +1,26 @@
+# Build context is the repo root (the wasm crate lives outside web/). Keep the
+# context small and reproducible: never ship host build outputs or secrets.
+
+# Rust / cargo build outputs (the wasm stage rebuilds from source).
+target/
+crates/game-session/pkg/
+
+# Node outputs (the web stage runs `npm ci` + a clean build).
+web/node_modules/
+web/dist/
+web/dev-dist/
+web/public/vendor/
+
+# Local env / secrets — never bake into an image layer.
+**/.env
+**/.env.*
+!**/.env.example
+**/*.local
+
+# VCS / CI / editor noise.
+.git/
+.github/
+**/.DS_Store
+
+# Docs & tests not needed at build time.
+docs/
