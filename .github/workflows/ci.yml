@@ -63,6 +63,100 @@ jobs:
       - run: npm ci
       - run: npm run build
 
+  # Build the production container image for the PWA (made.vforce360.ai) and, on
+  # a push to main, tag + push it to the deploy-configured registry and publish a
+  # versioned OTA bundle to MinIO. On PRs the image is built (Dockerfile is
+  # validated) but neither pushed nor published — no secrets are needed there.
+  web-image:
+    runs-on: ubuntu-latest
+    needs: web-build
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Deploy-time-configured registry: override via repo/org Actions variables,
+      # defaulting to GHCR for this repo.
+      REGISTRY: ${{ vars.WEB_REGISTRY || 'ghcr.io' }}
+      IMAGE_NAME: ${{ vars.WEB_IMAGE_NAME || format('{0}/made-pwa', github.repository) }}
+      IS_RELEASE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Version = PWA package version + short commit sha (e.g. 0.1.0+1a2b3c4);
+      # reused as the image tag, the image label, and the OTA bundle prefix so
+      # the container and the OTA bundle are the same identity.
+      - name: Compute OTA version
+        id: ver
+        run: |
+          SHORT="${GITHUB_SHA::7}"
+          echo "sha_short=${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./web/package.json').version")+${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=latest,enable=${{ env.IS_RELEASE }}
+
+      - name: Log in to the registry
+        if: ${{ env.IS_RELEASE == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.WEB_REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.WEB_REGISTRY_PASSWORD || secrets.GITHUB_TOKEN }}
+
+      # Always build (validates the multi-stage Dockerfile in PRs); push only on
+      # a main release. Context is the repo root — the wasm crate lives outside web/.
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web/Dockerfile
+          target: runtime
+          build-args: |
+            OTA_VERSION=${{ steps.ver.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: ${{ env.IS_RELEASE == 'true' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Export the built bundle from the `dist` stage (cache-reused from above) so
+      # the exact bytes baked into the image become the OTA bundle.
+      - name: Export OTA bundle
+        if: ${{ env.IS_RELEASE == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web/Dockerfile
+          target: dist
+          outputs: type=local,dest=web/ota-dist
+          cache-from: type=gha
+
+      - name: Install MinIO client (mc)
+        if: ${{ env.IS_RELEASE == 'true' }}
+        run: |
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o "$RUNNER_TEMP/mc"
+          install -m 0755 "$RUNNER_TEMP/mc" /usr/local/bin/mc
+
+      - name: Publish versioned OTA bundle to MinIO
+        if: ${{ env.IS_RELEASE == 'true' }}
+        working-directory: web
+        env:
+          MINIO_ENDPOINT: ${{ vars.MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          GIT_SHA: ${{ steps.ver.outputs.sha_short }}
+          DIST_DIR: ota-dist
+        run: ./scripts/publish-ota.sh
+
   # Apply the sqlx migrations to a throwaway Postgres service container to prove
   # they migrate a *fresh* database cleanly in forward order, then verify the
   # committed offline query metadata (`.sqlx/`) is current against that schema.

@@ -6,6 +6,8 @@
   "description": "MADE card game — mobile-first React PWA client (VForce360 Track B). Shell-agnostic bundle: runs standalone in a browser and, unchanged, inside a Capacitor native container.",
   "scripts": {
     "dev": "vite",
+    "stage:wasm": "node scripts/stage-wasm.mjs",
+    "prebuild": "node scripts/stage-wasm.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",

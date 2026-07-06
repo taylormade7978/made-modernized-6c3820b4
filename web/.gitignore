@@ -3,3 +3,6 @@ dist
 dev-dist
 *.local
 .env
+
+# Rules-WASM pkg staged into the bundle by scripts/stage-wasm.mjs (built, not committed)
+public/vendor/
