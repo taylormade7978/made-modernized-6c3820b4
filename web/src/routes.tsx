@@ -1,7 +1,9 @@
 import { Navigate, type RouteObject } from 'react-router-dom'
 import AppLayout from './components/AppLayout'
+import RequireSession from './auth/RequireSession'
 
 // Core views are always in the bundle → static imports.
+import LoginView from './views/LoginView'
 import MatchView from './views/MatchView'
 import CollectionView from './views/CollectionView'
 import ShopView from './views/ShopView'
@@ -35,18 +37,28 @@ if (__CAP_WALLET__) {
 }
 
 export const routes: RouteObject[] = [
+  // Login / identity entry view — reachable WITHOUT a session, so it sits
+  // outside the RequireSession guard (and outside the tab-bar shell).
+  { path: '/login', element: <LoginView /> },
   {
+    // Everything below the app shell requires an edge-asserted session; the
+    // guard routes anonymous / expired visitors to `/login`.
     path: '/',
-    element: <AppLayout />,
+    element: <RequireSession />,
     children: [
-      { index: true, element: <Navigate to="/match" replace /> },
-      { path: 'match', element: <MatchView /> },
-      { path: 'collection', element: <CollectionView /> },
-      { path: 'shop', element: <ShopView /> },
-      { path: 'leaderboard', element: <LeaderboardView /> },
-      { path: 'story', element: <StoryView /> },
-      ...gatedRoutes,
-      { path: '*', element: <NotFoundView /> },
+      {
+        element: <AppLayout />,
+        children: [
+          { index: true, element: <Navigate to="/match" replace /> },
+          { path: 'match', element: <MatchView /> },
+          { path: 'collection', element: <CollectionView /> },
+          { path: 'shop', element: <ShopView /> },
+          { path: 'leaderboard', element: <LeaderboardView /> },
+          { path: 'story', element: <StoryView /> },
+          ...gatedRoutes,
+          { path: '*', element: <NotFoundView /> },
+        ],
+      },
     ],
   },
 ]
