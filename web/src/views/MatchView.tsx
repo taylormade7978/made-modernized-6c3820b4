@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type DragEvent } from 'react'
 import { useLocation } from 'react-router-dom'
 import { useMatch, type MatchMode } from '../match/useMatch'
 import { hasSpotlight, opponent, type BoardUnit, type HandCard } from '../match/model'
@@ -31,17 +31,25 @@ export default function MatchView() {
 
   const [sel, setSel] = useState<Sel>(null)
   const [inspect, setInspect] = useState<Inspected>(null)
+  const [dragId, setDragId] = useState<string | null>(null)
   const targeting = sel !== null
   const enemyHasSpotlight = opp.board.some(hasSpotlight)
 
-  const clickHandCard = (c: HandCard) => {
-    setInspect({ card: c })
+  const dragCard = dragId ? you.hand.find((c) => c.instanceId === dragId) ?? null : null
+  const dragPlayable = dragCard != null && yourTurn && dragCard.cost <= you.juice && !over
+  const allowDrop = (ok: boolean) => (e: DragEvent) => { if (ok) e.preventDefault() }
+  // Drop a summon/utility card onto your board; a damage card onto a target.
+  const dropToBoard = () => { if (dragPlayable && dragCard!.effect !== 'damage') match.playCard(dragCard!.instanceId); setDragId(null) }
+  const dropToTarget = (targetRef: string) => { if (dragPlayable && dragCard!.effect === 'damage') match.playCard(dragCard!.instanceId, targetRef); setDragId(null) }
+
+  // Click a hand card to inspect it (drag it to play). The detail panel's Play
+  // button is the non-drag fallback.
+  const clickHandCard = (c: HandCard) => setInspect({ card: c })
+  const playFromDetail = (c: HandCard) => {
     if (!yourTurn || c.cost > you.juice || over) return
-    if (c.effect === 'damage') setSel({ kind: 'card', id: c.instanceId }) // needs a target
-    else {
-      match.playCard(c.instanceId)
-      setSel(null)
-    }
+    if (c.effect === 'damage') setSel({ kind: 'card', id: c.instanceId })
+    else match.playCard(c.instanceId)
+    setInspect(null)
   }
   const clickMyUnit = (u: BoardUnit) => {
     setInspect({ unit: u })
@@ -94,18 +102,37 @@ export default function MatchView() {
       ) : null}
 
       {/* Opponent zone */}
-      <BossBar seat="Opponent" s={opp} face={targetableFace} onFace={() => resolveOn(`boss:${foe}`)} />
+      <BossBar
+        seat="Opponent"
+        s={opp}
+        face={targetableFace}
+        onFace={() => resolveOn(`boss:${foe}`)}
+        dropOk={!!dragPlayable && dragCard!.effect === 'damage'}
+        onDropCard={() => dropToTarget(`boss:${foe}`)}
+      />
       <div className={`board board--enemy${targeting ? ' board--targeting' : ''}`} aria-label="Opponent's Operators">
         {opp.board.map((u) => (
-          <Unit key={u.instanceId} u={u} target={targetableEnemyUnit(u)} onClick={() => clickEnemyUnit(u)} />
+          <Unit
+            key={u.instanceId}
+            u={u}
+            target={targetableEnemyUnit(u)}
+            dropOk={!!dragPlayable && dragCard!.effect === 'damage'}
+            onDropCard={() => dropToTarget(`op:${u.instanceId}`)}
+            onClick={() => clickEnemyUnit(u)}
+          />
         ))}
         {opp.board.length === 0 ? <span className="match__hint">No enemy Operators</span> : null}
       </div>
 
       <div className="match__mid">{yourTurn ? 'Your turn' : over ? '' : 'Opponent…'}</div>
 
-      {/* Your zone */}
-      <div className="board board--you" aria-label="Your Operators">
+      {/* Your zone — drop a summon/utility card here to play it */}
+      <div
+        className={`board board--you${dragPlayable && dragCard!.effect !== 'damage' ? ' board--drop' : ''}`}
+        aria-label="Your Operators"
+        onDragOver={allowDrop(!!dragPlayable && dragCard!.effect !== 'damage')}
+        onDrop={dropToBoard}
+      >
         {you.board.map((u) => (
           <Unit key={u.instanceId} u={u} selected={sel?.kind === 'attacker' && sel.id === u.instanceId} armed={yourTurn && u.ready} onClick={() => clickMyUnit(u)} />
         ))}
@@ -119,8 +146,11 @@ export default function MatchView() {
           <button
             key={c.instanceId}
             type="button"
-            className={`handcard${sel?.kind === 'card' && sel.id === c.instanceId ? ' handcard--sel' : ''}`}
+            className={`handcard${sel?.kind === 'card' && sel.id === c.instanceId ? ' handcard--sel' : ''}${dragId === c.instanceId ? ' handcard--drag' : ''}`}
             disabled={over}
+            draggable={!over}
+            onDragStart={() => { setDragId(c.instanceId); setInspect({ card: c }) }}
+            onDragEnd={() => setDragId(null)}
             onClick={() => clickHandCard(c)}
           >
             <span className="handcard__art" style={{ backgroundImage: `url(/assets/cards/${c.cardId}.webp)` }} aria-hidden="true" />
@@ -139,7 +169,14 @@ export default function MatchView() {
       ) : null}
 
       {/* Detail panel */}
-      {inspect ? <Detail inspect={inspect} onClose={() => setInspect(null)} /> : null}
+      {inspect ? (
+        <Detail
+          inspect={inspect}
+          onClose={() => setInspect(null)}
+          onPlay={inspect.card && yourTurn && inspect.card.cost <= you.juice && !over ? () => playFromDetail(inspect.card!) : undefined}
+          playLabel={inspect.card?.effect === 'damage' ? 'Play → pick target' : 'Play'}
+        />
+      ) : null}
 
       {match.correction ? (
         <div className="match__correction" role="alert">
@@ -168,10 +205,16 @@ export default function MatchView() {
   )
 }
 
-/** A boss resource bar: HP, Heat, Juice. Optionally a face-attack target. */
-function BossBar({ seat, s, face, onFace }: { seat: string; s: { bossName: string; bossHp: number; heat: number; juice: number }; face?: boolean; onFace?: () => void }) {
+/** A boss resource bar: HP, Heat, Juice. Optionally a face-attack / drop target. */
+function BossBar({ seat, s, face, onFace, dropOk, onDropCard }: { seat: string; s: { bossName: string; bossHp: number; heat: number; juice: number }; face?: boolean; onFace?: () => void; dropOk?: boolean; onDropCard?: () => void }) {
   return (
-    <div className={`bossbar${face ? ' bossbar--target' : ''}`} onClick={face ? onFace : undefined} role={face ? 'button' : undefined}>
+    <div
+      className={`bossbar${face || dropOk ? ' bossbar--target' : ''}`}
+      onClick={face ? onFace : undefined}
+      role={face ? 'button' : undefined}
+      onDragOver={dropOk ? (e) => e.preventDefault() : undefined}
+      onDrop={dropOk ? onDropCard : undefined}
+    >
       <div className="bossbar__id">
         <span className="bossbar__seat">{seat}</span>
         <span className="bossbar__hp">♥ {s.bossHp}</span>
@@ -186,14 +229,21 @@ function BossBar({ seat, s, face, onFace }: { seat: string; s: { bossName: strin
 }
 
 /** A board Operator chip. */
-function Unit({ u, selected, armed, target, onClick }: { u: BoardUnit; selected?: boolean; armed?: boolean; target?: boolean; onClick: () => void }) {
+function Unit({ u, selected, armed, target, dropOk, onDropCard, onClick }: { u: BoardUnit; selected?: boolean; armed?: boolean; target?: boolean; dropOk?: boolean; onDropCard?: () => void; onClick: () => void }) {
   const cls = ['unit']
   if (armed) cls.push('unit--armed')
   if (selected) cls.push('unit--sel')
-  if (target) cls.push('unit--target')
+  if (target || dropOk) cls.push('unit--target')
   if (hasSpotlight(u)) cls.push('unit--spotlight')
   return (
-    <button type="button" className={cls.join(' ')} onClick={onClick} title={u.keywords.join(', ')}>
+    <button
+      type="button"
+      className={cls.join(' ')}
+      onClick={onClick}
+      title={u.keywords.join(', ')}
+      onDragOver={dropOk ? (e) => e.preventDefault() : undefined}
+      onDrop={dropOk ? onDropCard : undefined}
+    >
       <span className="unit__art" style={{ backgroundImage: `url(/assets/cards/${u.cardId}.webp)` }} aria-hidden="true" />
       <span className="unit__name">{u.name}</span>
       <span className="unit__stats">{u.atk}/{u.hp}</span>
@@ -203,7 +253,7 @@ function Unit({ u, selected, armed, target, onClick }: { u: BoardUnit; selected?
 }
 
 /** Card / unit detail panel. */
-function Detail({ inspect, onClose }: { inspect: NonNullable<Inspected>; onClose: () => void }) {
+function Detail({ inspect, onClose, onPlay, playLabel }: { inspect: NonNullable<Inspected>; onClose: () => void; onPlay?: () => void; playLabel?: string }) {
   const c = inspect.card
   const u = inspect.unit
   const cardId = c?.cardId ?? u?.cardId ?? ''
@@ -220,6 +270,7 @@ function Detail({ inspect, onClose }: { inspect: NonNullable<Inspected>; onClose
         </div>
         <span className="detail__type">{c?.type ?? 'Operator'}{c && (c.atk != null) ? ` · ${c.atk}/${c.hp}` : ''}</span>
         <p className="detail__text">{text}</p>
+        {onPlay ? <button type="button" className="detail__play" onClick={onPlay}>{playLabel ?? 'Play'}</button> : null}
       </div>
     </aside>
   )
