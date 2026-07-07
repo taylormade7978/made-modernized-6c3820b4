@@ -37,6 +37,12 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       VitePWA({
+        // DEV/design-iteration: ship a self-destroying service worker. The
+        // precache-everything SW was pinning stale bundles in browsers, so
+        // deploys never reached testers. selfDestroying emits a SW that
+        // unregisters itself and clears caches on the client, so every load is
+        // fresh. Re-enable full PWA (remove this flag) once the UI settles.
+        selfDestroying: true,
         // Register + auto-update the service worker without user prompts, so OTA
         // bundle refreshes land on next launch (the "offline/OTA bundles" AC).
         registerType: 'autoUpdate',
