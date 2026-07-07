@@ -68,6 +68,12 @@ export default defineConfig(({ mode }) => {
           // Precache the app shell so cold launches work offline (installability).
           globPatterns: ['**/*.{js,css,html,svg,png,ico,woff2,wasm}'],
           navigateFallback: 'index.html',
+          // Auth + API paths must reach the network (the oauth2-proxy gateway
+          // and the backend), never the SPA shell. Without this denylist the
+          // service worker serves index.html for /oauth2/start, hijacking the
+          // sign-in redirect and loading the app under /oauth2/ (assets then
+          // resolve to /oauth2/assets/* and are blocked).
+          navigateFallbackDenylist: [/^\/oauth2\//, /^\/api\//],
           cleanupOutdatedCaches: true,
         },
         devOptions: { enabled: false },
