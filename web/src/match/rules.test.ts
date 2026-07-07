@@ -21,6 +21,11 @@ const withHand = (s: MatchState, seat: Seat, hand: HandCard[], juice = 10): Matc
 const playOf = (seat: Seat, c: HandCard): MatchAction => ({
   kind: 'PlayCardCmd', seat, cardInstanceId: c.instanceId, targetRef: `boss:${opponent(seat)}`, juiceCost: c.cost,
 })
+/** Mark all of `seat`'s Operators ready (clear summoning sickness). */
+const ready = (s: MatchState, seat: Seat): MatchState => ({
+  ...s,
+  seats: { ...s.seats, [seat]: { ...s.seats[seat], board: s.seats[seat].board.map((u) => ({ ...u, ready: true })) } },
+})
 
 describe('validateAction', () => {
   it('accepts a legal play by the turn-holder', () => {
@@ -71,13 +76,51 @@ describe('applyAction', () => {
     expect(s.seats.A.board[0].ready).toBe(false) // summoning sickness
   })
 
-  it('an Operator attack lowers the enemy boss and exhausts the attacker', () => {
+  it('an Operator can attack the enemy boss and then exhausts', () => {
     const c = card({ instanceId: 'a1', cost: 1, effect: 'summon', amount: 0, atk: 5, hp: 5 })
     let s = applyAction(withHand(startMatch('m'), 'A', [c]), playOf('A', c)).state
-    s = { ...s, seats: { ...s.seats, A: { ...s.seats.A, board: s.seats.A.board.map((u) => ({ ...u, ready: true })) } } }
-    const { state } = applyAction(s, { kind: 'AttackCmd', seat: 'A', attackerId: 'a1' })
+    s = ready(s, 'A')
+    const { state } = applyAction(s, { kind: 'AttackCmd', seat: 'A', attackerId: 'a1', targetRef: 'boss:B' })
     expect(state.seats.B.bossHp).toBe(25) // 30 - 5
     expect(state.seats.A.board[0].ready).toBe(false)
+  })
+
+  it('operators trade damage in combat and the loser dies', () => {
+    // A's 3/2 attacks B's 2/2: B's unit takes 3 (dies), A's unit takes 2 back (dies).
+    let s = startMatch('m')
+    s = {
+      ...s,
+      seats: {
+        A: { ...s.seats.A, board: [{ instanceId: 'a1', name: 'Homie', cardId: 'x', atk: 3, hp: 2, maxHp: 2, ready: true, keywords: [] }] },
+        B: { ...s.seats.B, board: [{ instanceId: 'b1', name: 'Buck', cardId: 'y', atk: 2, hp: 2, maxHp: 2, ready: true, keywords: [] }] },
+      },
+    }
+    const { state } = applyAction(s, { kind: 'AttackCmd', seat: 'A', attackerId: 'a1', targetRef: 'op:b1' })
+    expect(state.seats.B.board).toHaveLength(0) // B's 2-hp unit took 3, died
+    expect(state.seats.A.board).toHaveLength(0) // A's 2-hp unit took 2 back, died
+  })
+
+  it('Spotlight forces attacks onto the taunting Operator', () => {
+    let s = startMatch('m')
+    s = {
+      ...s,
+      seats: {
+        A: { ...s.seats.A, board: [{ instanceId: 'a1', name: 'Att', cardId: 'x', atk: 2, hp: 3, maxHp: 3, ready: true, keywords: [] }] },
+        B: { ...s.seats.B, board: [{ instanceId: 'guard', name: 'Riot Squad', cardId: 'y', atk: 4, hp: 5, maxHp: 5, ready: false, keywords: ['Spotlight'] }] },
+      },
+    }
+    // Going face is illegal while the Spotlight guard stands.
+    expect(validateAction(s, { kind: 'AttackCmd', seat: 'A', attackerId: 'a1', targetRef: 'boss:B' }).ok).toBe(false)
+    // Attacking the guard is legal.
+    expect(validateAction(s, { kind: 'AttackCmd', seat: 'A', attackerId: 'a1', targetRef: 'op:guard' }).ok).toBe(true)
+  })
+
+  it('a targeted damage spell can kill an enemy Operator', () => {
+    const c = card({ instanceId: 'a1', cost: 2, effect: 'damage', amount: 4 })
+    let s = withHand(startMatch('m'), 'A', [c])
+    s = { ...s, seats: { ...s.seats, B: { ...s.seats.B, board: [{ instanceId: 'b1', name: 'Buck', cardId: 'y', atk: 2, hp: 3, maxHp: 3, ready: false, keywords: [] }] } } }
+    const { state } = applyAction(s, { kind: 'PlayCardCmd', seat: 'A', cardInstanceId: 'a1', targetRef: 'op:b1', juiceCost: 2 })
+    expect(state.seats.B.board).toHaveLength(0) // 3 hp, took 4, dead
   })
 
   it('completes the match when a boss reaches 0', () => {

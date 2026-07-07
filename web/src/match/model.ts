@@ -103,6 +103,10 @@ export interface CardDef {
   readonly amount: number
   readonly atk?: number
   readonly hp?: number
+  /** Evergreen keywords, e.g. 'Spotlight' (taunt), 'Drive-By' (arrival damage). */
+  readonly keywords?: readonly string[]
+  /** Rules text shown in the card-detail panel. */
+  readonly text?: string
 }
 
 /** A card in a hand/deck — a {@link CardDef} plus a per-copy instance id. */
@@ -110,14 +114,22 @@ export interface HandCard extends CardDef {
   readonly instanceId: string
 }
 
-/** An Operator on the board: it can attack the enemy boss when `ready`. */
+/** An Operator on the board: it can attack an enemy target when `ready`. */
 export interface BoardUnit {
   readonly instanceId: string
   readonly name: string
+  readonly cardId: string
   readonly atk: number
   readonly hp: number
+  readonly maxHp: number
   /** False the turn it arrives (summoning sickness), true from your next turn. */
   readonly ready: boolean
+  readonly keywords: readonly string[]
+}
+
+/** True if `unit` has Spotlight (must be dealt with before other targets). */
+export function hasSpotlight(unit: BoardUnit): boolean {
+  return unit.keywords.includes('Spotlight')
 }
 
 /** How much a boss is dealt when a Cop Event raids the hottest player. */
@@ -192,7 +204,7 @@ export function seatFromOutfit(outfit: OutfitConfig): SeatState {
  */
 export type MatchAction =
   | { readonly kind: 'PlayCardCmd'; readonly seat: Seat; readonly cardInstanceId: string; readonly targetRef: string; readonly juiceCost: number }
-  | { readonly kind: 'AttackCmd'; readonly seat: Seat; readonly attackerId: string }
+  | { readonly kind: 'AttackCmd'; readonly seat: Seat; readonly attackerId: string; readonly targetRef: string }
   | { readonly kind: 'ActivateHeroPowerCmd'; readonly seat: Seat; readonly targetRef: string; readonly juiceCost: number }
   | { readonly kind: 'EndTurnCmd'; readonly seat: Seat }
   | { readonly kind: 'ConcedeMatchCmd'; readonly seat: Seat }
@@ -218,6 +230,8 @@ export type DeltaEvent =
   | { readonly type: 'boss.damaged'; readonly player: Seat; readonly amount: number; readonly newHp: number }
   | { readonly type: 'juice.gained'; readonly player: Seat; readonly amount: number; readonly newJuice: number }
   | { readonly type: 'operator.summoned'; readonly player: Seat; readonly unit: BoardUnit }
+  | { readonly type: 'operator.damaged'; readonly player: Seat; readonly instanceId: string; readonly newHp: number }
+  | { readonly type: 'operator.died'; readonly player: Seat; readonly instanceId: string }
   | { readonly type: 'operators.readied'; readonly player: Seat }
   | { readonly type: 'operator.exhausted'; readonly player: Seat; readonly instanceId: string }
   | { readonly type: 'cop.raided'; readonly player: Seat; readonly bossHp: number; readonly newHeat: number }

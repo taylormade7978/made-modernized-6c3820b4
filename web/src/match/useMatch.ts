@@ -42,8 +42,8 @@ export interface MatchController {
   /** Reason for the most recent rollback, or `null` (drives the banner). */
   readonly correction: string | null
   readonly canvasRef: React.RefObject<HTMLCanvasElement>
-  readonly playCard: (cardInstanceId: string) => void
-  readonly attack: (attackerId: string) => void
+  readonly playCard: (cardInstanceId: string, targetRef?: string) => void
+  readonly attack: (attackerId: string, targetRef: string) => void
   readonly heroPower: () => void
   readonly endTurn: () => void
   readonly concede: () => void
@@ -212,15 +212,18 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
   }, [mode, rerender])
 
   const playCard = useCallback(
-    (cardInstanceId: string) => {
+    (cardInstanceId: string, targetRef = 'boss:B') => {
       const card = reconciler.current.view().seats[SELF_SEAT].hand.find((c) => c.instanceId === cardInstanceId)
       if (!card) return
-      dispatch({ kind: 'PlayCardCmd', seat: SELF_SEAT, cardInstanceId, targetRef: 'boss:B', juiceCost: card.cost })
+      dispatch({ kind: 'PlayCardCmd', seat: SELF_SEAT, cardInstanceId, targetRef, juiceCost: card.cost })
     },
     [dispatch],
   )
 
-  const attack = useCallback((attackerId: string) => dispatch({ kind: 'AttackCmd', seat: SELF_SEAT, attackerId }), [dispatch])
+  const attack = useCallback(
+    (attackerId: string, targetRef: string) => dispatch({ kind: 'AttackCmd', seat: SELF_SEAT, attackerId, targetRef }),
+    [dispatch],
+  )
 
   const heroPower = useCallback(() => {
     dispatch({ kind: 'ActivateHeroPowerCmd', seat: SELF_SEAT, targetRef: 'boss:B', juiceCost: 2 })
