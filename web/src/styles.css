@@ -1232,3 +1232,92 @@ body {
 .deck__empty, .shop__empty, .ranks__empty {
   color: var(--muted); font-family: var(--font-mono); text-align: center; padding: 2rem;
 }
+
+/* ============================================================================
+   Match / Story / Login cyberpunk pass.
+   ============================================================================ */
+
+/* ── Match: HUD bar, neon segmented mode toggle, framed stage ──────────────── */
+.match__bar {
+  padding: 0.5rem 0.75rem;
+  background: var(--surface-glass);
+  border: 1px solid var(--line-hot);
+  border-radius: 0.6rem;
+}
+.match__modes {
+  display: inline-flex;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px;
+}
+.match__mode {
+  border: none; background: none; cursor: pointer;
+  font-family: var(--font-tech); text-transform: uppercase; letter-spacing: 0.05em;
+  font-size: 0.72rem; color: var(--muted); padding: 0.35rem 0.9rem; border-radius: 999px;
+}
+.match__mode--on {
+  color: #04141a;
+  background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  box-shadow: var(--glow-cyan);
+}
+.match__status {
+  font-family: var(--font-mono); font-size: 0.72rem;
+  padding: 0.25rem 0.6rem; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--bg-deep);
+}
+.match__status--open, .match__status--practice { color: var(--green); border-color: rgba(43,255,136,0.35); }
+.match__status--reconnecting { color: var(--amber); border-color: rgba(255,176,31,0.35); }
+.match__status--closed { color: var(--magenta); border-color: rgba(255,45,142,0.35); }
+.match__stage {
+  border: 1px solid var(--line-hot);
+  box-shadow: inset 0 0 40px rgba(0,229,255,0.06), 0 12px 40px rgba(0,0,0,0.6);
+  background:
+    linear-gradient(to bottom, transparent 0 2px, rgba(0,229,255,0.04) 2px 4px),
+    radial-gradient(120% 80% at 50% 0%, rgba(0,229,255,0.06), transparent 60%),
+    var(--bg-deep);
+}
+.match__action--primary {
+  color: #04141a; border-color: var(--accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  box-shadow: var(--glow-cyan);
+}
+.match__action--danger { color: var(--magenta); border-color: rgba(255,45,142,0.5); background: rgba(255,45,142,0.08); }
+.match__correction { background: rgba(255,45,142,0.12); border-color: rgba(255,45,142,0.5); color: var(--magenta-glow, #ff77c0); }
+
+/* ── Story: mission grid + boss HP bar ────────────────────────────────────── */
+.story__grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1rem; margin-top: 1rem;
+}
+.story__boss {
+  padding: 1rem; border: 1px solid var(--line-hot);
+  background: linear-gradient(160deg, rgba(255,45,142,0.08), var(--surface-glass));
+  box-shadow: 0 12px 40px rgba(0,0,0,0.6), 0 0 24px rgba(255,45,142,0.15);
+}
+.story__boss-label { color: var(--magenta); font-size: 0.7rem; }
+.story__boss-name { font-family: var(--font-display); font-size: 1.4rem; letter-spacing: 0.04em; text-shadow: var(--glow-magenta); }
+.story__boss-hp {
+  height: 0.55rem; border-radius: 999px; overflow: hidden;
+  background: var(--bg-deep); border: 1px solid var(--line);
+  background-image: linear-gradient(90deg, var(--magenta), var(--amber));
+  box-shadow: 0 0 14px rgba(255,45,142,0.4);
+}
+.story__mission-name { font-family: var(--font-tech); letter-spacing: 0.02em; }
+.story__mission-desc { color: var(--muted); font-size: 0.85rem; }
+.story__ai-budget { font-family: var(--font-mono); font-size: 0.72rem; color: var(--purple); }
+.story__cleared {
+  font-family: var(--font-mono); font-size: 0.7rem; color: var(--green);
+  border: 1px solid rgba(43,255,136,0.4); border-radius: 999px; padding: 0.1rem 0.5rem;
+  text-shadow: 0 0 10px rgba(43,255,136,0.5);
+}
+
+/* ── Login polish ─────────────────────────────────────────────────────────── */
+.login { gap: 1.25rem; }
+.login__identity {
+  background: var(--surface-glass);
+  border: 1px solid var(--line-hot);
+  box-shadow: inset 0 0 0 1px rgba(0,229,255,0.05);
+}
+.login__identity dt { font-family: var(--font-mono); }
+.login__identity dd { font-family: var(--font-tech); }
+.login__note { font-family: var(--font-mono); color: var(--faint); }
