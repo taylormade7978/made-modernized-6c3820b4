@@ -33,6 +33,8 @@ export interface ApiConfig {
   readonly project: string
   /** REST base URL, including the `/v1` version prefix, without a trailing slash. */
   readonly restBaseUrl: string
+  /** GraphQL endpoint URL (reads/queries) — same host as REST, `/graphql`. */
+  readonly graphqlUrl: string
   /** WebSocket base URL (scheme + host), without a trailing slash. */
   readonly wsBaseUrl: string
   /**
@@ -123,6 +125,7 @@ export const apiConfig: ApiConfig = {
   env,
   project,
   restBaseUrl: resolveRestBaseUrl(env, project),
+  graphqlUrl: resolveRestBaseUrl(env, project).replace(/\/v1$/, '/graphql'),
   wsBaseUrl: resolveWsBaseUrl(env, project),
   capabilities: {
     collection: readFlag(import.meta.env.VITE_API_CAP_COLLECTION, true),

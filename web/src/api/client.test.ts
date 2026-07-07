@@ -26,6 +26,7 @@ const testConfig: ApiConfig = {
   env: 'testnet',
   project: 'made',
   restBaseUrl: BASE,
+  graphqlUrl: `${BASE.replace(/\/v1$/, '')}/graphql`,
   wsBaseUrl: 'wss://ws.testnet.made.vforce360.ai',
   capabilities: { collection: true, leaderboard: true, shop: true, catalog: true, story: true },
 }

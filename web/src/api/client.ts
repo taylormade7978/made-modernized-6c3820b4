@@ -10,6 +10,7 @@
 import { apiConfig, type ApiConfig } from '../config/api'
 import { redirectToLogin } from '../auth/session'
 import { createHttpClient, type HttpClient, type HttpClientConfig } from './http'
+import { gql } from './graphql'
 import { ApiError } from './errors'
 import type {
   CollectionResponse,
@@ -139,10 +140,19 @@ export function createApiClient({ http, config = apiConfig }: CreateApiClientCon
   const cap = config.capabilities
   const env = config.env
 
+  // Reads go through GraphQL (queries, searchable); mutations stay REST (below).
+  const gcfg = { url: config.graphqlUrl, onUnauthorized: redirectToLogin }
+  const CARD_FIELDS = 'cardId name cost cardClass cardType rarity keywords effectScriptRef copyCap'
+
   const collection: CollectionApi = {
     get(playerId, opts) {
       return guard(cap.collection, 'collection', env, () =>
-        http.request<CollectionResponse>(`/collection/${seg(playerId)}`, { signal: opts?.signal }),
+        gql<{ collection: CollectionResponse }>(
+          gcfg,
+          `query($p:ID!){ collection(playerId:$p){ playerId ownedCards{ cardId quantity cosmeticSkinRef } decks{ deckId name cardIds active } } }`,
+          { p: playerId },
+          opts?.signal,
+        ).then((d) => d.collection),
       )
     },
     saveDeck(playerId, deckId, body, opts) {
@@ -159,10 +169,12 @@ export function createApiClient({ http, config = apiConfig }: CreateApiClientCon
   const leaderboard: LeaderboardApi = {
     list(query, opts) {
       return guard(cap.leaderboard, 'leaderboard', env, () =>
-        http.request<LeaderboardPage>('/leaderboard', {
-          query: query as Record<string, string | number | undefined>,
-          signal: opts?.signal,
-        }),
+        gql<{ leaderboard: LeaderboardPage }>(
+          gcfg,
+          `query($page:Int,$size:Int){ leaderboard(page:$page,pageSize:$size){ seasonId total page pageSize entries{ rank playerId displayName rating stars } } }`,
+          { page: query?.page, size: query?.pageSize },
+          opts?.signal,
+        ).then((d) => d.leaderboard),
       )
     },
   }
@@ -170,7 +182,12 @@ export function createApiClient({ http, config = apiConfig }: CreateApiClientCon
   const shop: ShopApi = {
     listItems(opts) {
       return guard(cap.shop, 'shop', env, () =>
-        http.request<readonly ShopItem[]>('/shop/items', { signal: opts?.signal }),
+        gql<{ shopItems: readonly ShopItem[] }>(
+          gcfg,
+          `{ shopItems{ sku name description kind settlement priceMinor currency } }`,
+          undefined,
+          opts?.signal,
+        ).then((d) => d.shopItems),
       )
     },
     createOrder(body, opts) {
@@ -188,12 +205,16 @@ export function createApiClient({ http, config = apiConfig }: CreateApiClientCon
   const catalog: CatalogApi = {
     listCards(opts) {
       return guard(cap.catalog, 'catalog', env, () =>
-        http.request<readonly Card[]>('/catalog/cards', { signal: opts?.signal }),
+        gql<{ cards: readonly Card[] }>(gcfg, `{ cards{ ${CARD_FIELDS} } }`, undefined, opts?.signal).then(
+          (d) => d.cards,
+        ),
       )
     },
     getCard(cardId, opts) {
       return guard(cap.catalog, 'catalog', env, () =>
-        http.request<Card>(`/catalog/cards/${seg(cardId)}`, { signal: opts?.signal }),
+        gql<{ card: Card }>(gcfg, `query($id:ID!){ card(cardId:$id){ ${CARD_FIELDS} } }`, { id: cardId }, opts?.signal).then(
+          (d) => d.card,
+        ),
       )
     },
     listExpansions(opts) {
