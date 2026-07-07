@@ -1,0 +1,51 @@
+{
+  "_comment": "Single tuning surface for MADE fair-play. Adjust these when an exploit emerges — no code change needed. Read by validate.mjs (CI gate) and, once the rules engine lands, by the match runtime so live-balancing is data-driven.",
+  "version": 1,
+
+  "resources": {
+    "juiceStart": 1,
+    "juiceGainPerTurn": 1,
+    "juiceCap": 10,
+    "bossStartingHp": 30,
+    "bossPowerCost": 2
+  },
+
+  "heat": {
+    "min": 0,
+    "max": 10,
+    "copEventThreshold": 10,
+    "copEventResetTo": 3
+  },
+
+  "deck": {
+    "size": 30,
+    "copyCapDefault": 2,
+    "copyCapLegendary": 1
+  },
+
+  "cost": { "min": 0, "max": 10 },
+
+  "statBudget": {
+    "_comment": "A body's ATK+HP must not exceed slope*cost + base. Lower these if aggressive stat-lines dominate; raise if bodies feel too weak.",
+    "slope": 2,
+    "base": 3,
+    "appliesTo": ["Operator", "Vehicle"]
+  },
+
+  "starterDecks": {
+    "_comment": "Preconstructed starter decks should be close in tempo; widen/narrow spread as the meta shifts.",
+    "avgCostSpreadMax": 1.0
+  },
+
+  "answerDensity": {
+    "_comment": "Formats need answers or an unanswered bomb becomes a complete advantage. Require removal to exist.",
+    "requireDirectDamage": true,
+    "requireTempoRemoval": false
+  },
+
+  "wildcards": {
+    "_comment": "Street-Event trigger chances (the luck layer). Tune to keep variance fun but not swingy.",
+    "accidentalBiteChance": 0.30,
+    "dookieChance": 0.25
+  }
+}

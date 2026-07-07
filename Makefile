@@ -63,6 +63,12 @@ clippy:
 content-validate:
 	cargo run -q -p domain --bin content-validator -- content/catalog
 
+# Fair-play validator for the async data service's card catalog: enforces the
+# tunable thresholds in services/data/balance.json (cost curve, copy caps, stat
+# budget, starter-deck parity, answer density). Exits non-zero on any ERROR.
+balance-validate:
+	node services/data/validate.mjs
+
 # Render + lint the Helm chart for both overlays without a cluster (what CI
 # runs on PRs). Requires helm on PATH.
 helm-lint:
