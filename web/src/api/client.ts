@@ -142,7 +142,7 @@ export function createApiClient({ http, config = apiConfig }: CreateApiClientCon
 
   // Reads go through GraphQL (queries, searchable); mutations stay REST (below).
   const gcfg = { url: config.graphqlUrl, onUnauthorized: redirectToLogin }
-  const CARD_FIELDS = 'cardId name cost cardClass cardType rarity keywords effectScriptRef copyCap'
+  const CARD_FIELDS = 'cardId name cost cardClass cardType rarity keywords effectScriptRef copyCap art text heat atk hp'
 
   const collection: CollectionApi = {
     get(playerId, opts) {

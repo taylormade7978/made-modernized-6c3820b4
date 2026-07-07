@@ -1363,3 +1363,71 @@ body {
 }
 .deck__tag--legendary { color: var(--amber); border-color: rgba(255,176,31,0.4); text-shadow: var(--glow-amber); }
 .deck__owned { font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); justify-self: start; }
+
+/* ============================================================================
+   Card design — matched to the made-site reference: art band, cost coin,
+   colored type badge, rules text, heat, rarity-tinted border. Applies to the
+   collection/deck grid cards.
+   ============================================================================ */
+.deck__cards {
+  grid-template-columns: repeat(auto-fill, minmax(184px, 1fr));
+  gap: 0.9rem;
+}
+.deck__card {
+  position: relative;
+  overflow: visible;
+  background: linear-gradient(180deg, #131a2e 0%, #06080f 100%);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-height: 0;
+  transition: transform 0.13s ease, box-shadow 0.13s ease, border-color 0.13s ease;
+}
+.deck__card:hover { transform: translateY(-4px); border-color: var(--accent); box-shadow: 0 12px 28px rgba(0,0,0,0.7), var(--glow-cyan); z-index: 5; }
+/* Rarity-tinted borders (demo: legendary amber, epic purple, rare blue…). */
+.deck__card--legendary { border-color: var(--amber); box-shadow: inset 0 0 16px rgba(255,176,31,0.12); }
+.deck__card--legendary:hover { box-shadow: var(--glow-amber); }
+.deck__card--epic { border-color: var(--purple); }
+.deck__card--rare { border-color: var(--blue); }
+.deck__card--uncommon { border-color: var(--green); }
+
+.deck__card-btn {
+  display: flex; flex-direction: column; gap: 0.35rem;
+  width: 100%; padding: 0.6rem; background: none; border: none; color: inherit;
+  cursor: pointer; text-align: left;
+}
+.deck__card-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+/* Cost coin — cyan neon, top-left, overhanging. */
+.deck__cost {
+  position: absolute; top: -10px; left: -10px; width: 30px; height: 30px; border-radius: 50%;
+  background: radial-gradient(circle at 30% 25%, var(--accent-glow), #044a5a);
+  color: #04141a; border: 2px solid #021e26; display: grid; place-items: center;
+  font-family: var(--font-display); font-size: 1.05rem; box-shadow: var(--glow-cyan); z-index: 2;
+}
+/* Art band — the generated card art fills the top; initial-letter fallback. */
+.deck__art {
+  width: 100%; height: 88px; border-radius: 3px; margin-bottom: 0.15rem;
+  background-color: #0a0f1c; background-size: cover; background-position: center top;
+  display: grid; place-items: center;
+  font-family: var(--font-display); font-size: 2.4rem; color: rgba(255,255,255,0.5);
+}
+.deck__card-name { font-family: var(--font-tech); font-weight: 600; font-size: 0.9rem; color: var(--text); }
+.deck__badges { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+.deck__type {
+  font-family: var(--font-mono); font-size: 0.56rem; font-weight: 700; letter-spacing: 0.08em;
+  padding: 1px 5px; border-radius: 2px; text-transform: uppercase; color: var(--bg-void, #04050a);
+}
+.deck__type--operator { background: var(--purple); color: #fff; }
+.deck__type--job { background: var(--accent); color: #04141a; }
+.deck__type--piece { background: var(--amber); color: #04141a; }
+.deck__type--vehicle { background: var(--green); color: #04141a; }
+.deck__type--heist { background: var(--magenta); color: #fff; }
+.deck__type--operation { background: #14b86a; color: #04141a; }
+.deck__class-chip {
+  font-family: var(--font-mono); font-size: 0.56rem; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); border: 1px solid var(--line-hot); border-radius: 2px; padding: 1px 5px;
+}
+.deck__text { font-size: 0.68rem; color: var(--muted); line-height: 1.35; min-height: 2.4em; }
+.deck__foot { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-top: 0.15rem; }
+.deck__heat { font-family: var(--font-mono); font-size: 0.6rem; color: var(--amber); }
+.deck__owned { font-family: var(--font-mono); font-size: 0.68rem; color: var(--muted); }

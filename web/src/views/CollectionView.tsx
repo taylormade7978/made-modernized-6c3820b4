@@ -90,7 +90,7 @@ export default function CollectionView() {
               const cap = Math.min(row.owned, copyCapFor(row.card))
               const full = row.inDeck >= cap
               return (
-                <li key={row.card.cardId} className="deck__card">
+                <li key={row.card.cardId} className={`deck__card deck__card--${row.card.rarity}`}>
                   <button
                     type="button"
                     className="deck__card-btn"
@@ -99,12 +99,25 @@ export default function CollectionView() {
                     aria-label={`Add ${row.card.name}`}
                   >
                     <span className="deck__cost" aria-hidden="true">{row.card.cost}</span>
+                    <span
+                      className="deck__art"
+                      aria-hidden="true"
+                      style={row.card.art ? { backgroundImage: `url(${row.card.art})` } : undefined}
+                    >
+                      {!row.card.art ? row.card.name.charAt(0) : null}
+                    </span>
                     <span className="deck__card-name">{row.card.name}</span>
-                    <span className={`deck__tag deck__tag--${row.card.cardClass}`}>{row.card.cardClass}</span>
-                    {row.card.rarity === 'legendary' ? (
-                      <span className="deck__tag deck__tag--legendary">legendary</span>
-                    ) : null}
-                    <span className="deck__owned">{row.inDeck}/{cap}</span>
+                    <span className="deck__badges">
+                      <span className={`deck__type deck__type--${(row.card.cardType || '').toString().toLowerCase()}`}>
+                        {row.card.cardType}
+                      </span>
+                      <span className="deck__class-chip">{row.card.cardClass}</span>
+                    </span>
+                    {row.card.text ? <span className="deck__text">{row.card.text}</span> : null}
+                    <span className="deck__foot">
+                      {row.card.heat ? <span className="deck__heat">+{row.card.heat} HEAT</span> : null}
+                      <span className="deck__owned">{row.inDeck}/{cap}</span>
+                    </span>
                   </button>
                 </li>
               )

@@ -7,7 +7,7 @@ RUN npm install --omit=dev --no-audit --no-fund
 FROM gcr.io/distroless/nodejs22-debian12:nonroot AS runtime
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
-COPY server.js package.json ./
+COPY server.js package.json cards.json ./
 ENV PORT=8080
 EXPOSE 8080
 CMD ["server.js"]

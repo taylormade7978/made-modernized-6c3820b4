@@ -13,46 +13,23 @@
 // with the frontend/backend contract reconciliation (vforce360 #1508).
 
 import { createServer } from 'node:http'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import { createYoga, createSchema } from 'graphql-yoga'
 import { useServer } from 'graphql-ws/lib/use/ws'
 import { WebSocketServer } from 'ws'
 import { createPubSub } from 'graphql-yoga'
 
 const pubSub = createPubSub()
+const __dir = dirname(fileURLToPath(import.meta.url))
+// Real MADE card catalog (names, cost, type, class, text, heat, art) parsed
+// from the game's own data; see cards.json.
+const CATALOG = JSON.parse(readFileSync(join(__dir, 'cards.json'), 'utf8'))
 
 // ── Seed state (mutable; mutations edit it and publish) ───────────────────────
-const CARDS = [
-  { cardId: 'card.getaway_driver', name: 'Getaway Driver', cost: 3, cardClass: 'tempo', cardType: 'unit', rarity: 'common', keywords: ['Recruit', 'Wheels'], effectScriptRef: 'fx.recruit', copyCap: 3 },
-  { cardId: 'card.safecracker', name: 'Safecracker', cost: 2, cardClass: 'combo', cardType: 'unit', rarity: 'uncommon', keywords: ['Heist'], effectScriptRef: 'fx.crack', copyCap: 3 },
-  { cardId: 'card.muscle', name: 'The Muscle', cost: 4, cardClass: 'aggression', cardType: 'unit', rarity: 'common', keywords: ['Bruiser'], effectScriptRef: 'fx.slam', copyCap: 3 },
-  { cardId: 'card.hacker', name: 'Ghost Hacker', cost: 3, cardClass: 'control', cardType: 'unit', rarity: 'rare', keywords: ['Intrusion', 'Silence'], effectScriptRef: 'fx.hack', copyCap: 2 },
-  { cardId: 'card.smoke_bomb', name: 'Smoke Bomb', cost: 1, cardClass: 'tempo', cardType: 'spell', rarity: 'common', keywords: ['Evasion'], effectScriptRef: 'fx.smoke', copyCap: 3 },
-  { cardId: 'card.tripwire', name: 'Tripwire', cost: 2, cardClass: 'control', cardType: 'trap', rarity: 'uncommon', keywords: ['Ambush'], effectScriptRef: 'fx.snare', copyCap: 3 },
-  { cardId: 'card.armored_van', name: 'Armored Van', cost: 5, cardClass: 'control', cardType: 'unit', rarity: 'epic', keywords: ['Vehicle', 'Shield'], effectScriptRef: 'fx.armor', copyCap: 2 },
-  { cardId: 'card.kingpin', name: 'The Kingpin', cost: 7, cardClass: 'aggression', cardType: 'leader', rarity: 'legendary', keywords: ['Boss', 'Command'], effectScriptRef: 'fx.command', copyCap: 1 },
-  { cardId: 'card.wildcard', name: 'Wildcard', cost: 0, cardClass: 'neutral', cardType: 'spell', rarity: 'rare', keywords: ['Draw'], effectScriptRef: 'fx.draw', copyCap: 2 },
-  { cardId: 'card.overclock', name: 'Overclock', cost: 2, cardClass: 'combo', cardType: 'spell', rarity: 'epic', keywords: ['Juice', 'Ramp'], effectScriptRef: 'fx.ramp', copyCap: 2 },
-]
-
-const COLLECTIONS = {
-  guest: {
-    playerId: 'guest',
-    ownedCards: [
-      { cardId: 'card.getaway_driver', quantity: 3, cosmeticSkinRef: null },
-      { cardId: 'card.safecracker', quantity: 2, cosmeticSkinRef: null },
-      { cardId: 'card.muscle', quantity: 3, cosmeticSkinRef: null },
-      { cardId: 'card.hacker', quantity: 2, cosmeticSkinRef: 'skin.chrome' },
-      { cardId: 'card.smoke_bomb', quantity: 3, cosmeticSkinRef: null },
-      { cardId: 'card.armored_van', quantity: 1, cosmeticSkinRef: null },
-      { cardId: 'card.kingpin', quantity: 1, cosmeticSkinRef: 'skin.gold' },
-      { cardId: 'card.overclock', quantity: 2, cosmeticSkinRef: null },
-    ],
-    decks: [
-      { deckId: 'deck.aggro', name: 'Smash & Grab', cardIds: ['card.muscle', 'card.muscle', 'card.getaway_driver', 'card.kingpin', 'card.smoke_bomb'], active: true },
-      { deckId: 'deck.control', name: 'Ghost Protocol', cardIds: ['card.hacker', 'card.armored_van', 'card.tripwire', 'card.overclock', 'card.wildcard'], active: false },
-    ],
-  },
-}
+const CARDS = CATALOG.cards
+const COLLECTIONS = { guest: CATALOG.collection }
 
 const LEADERBOARD = {
   seasonId: 'S1', page: 1, pageSize: 10, total: 8,
@@ -78,7 +55,7 @@ const SHOP_ITEMS = [
 
 // ── Schema: queries (searchable) + subscriptions (push) ───────────────────────
 const typeDefs = /* GraphQL */ `
-  type Card { cardId: ID!, name: String!, cost: Int!, cardClass: String!, cardType: String!, rarity: String!, keywords: [String!]!, effectScriptRef: String!, copyCap: Int! }
+  type Card { cardId: ID!, name: String!, cost: Int!, cardClass: String!, cardType: String!, rarity: String!, keywords: [String!]!, effectScriptRef: String!, copyCap: Int!, art: String, text: String, heat: Int, atk: Int, hp: Int }
   type OwnedCard { cardId: ID!, quantity: Int!, cosmeticSkinRef: String }
   type Deck { deckId: ID!, name: String!, cardIds: [String!]!, active: Boolean! }
   type Collection { playerId: ID!, ownedCards: [OwnedCard!]!, decks: [Deck!]! }
