@@ -1092,3 +1092,47 @@ body {
   border-color: var(--accent);
   box-shadow: var(--glow-cyan);
 }
+
+/* ── Branded HUD header + responsive nav rail ──────────────────────────────
+   Mobile: brand on top, nav as a thumb-reachable bottom tab bar.
+   Wide (>=720px): brand + nav read as a top HUD console. */
+.app__brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--line-hot);
+  background: var(--surface-glass);
+  backdrop-filter: blur(8px);
+}
+.app__wordmark {
+  font-family: var(--font-display);
+  font-size: 1.9rem;
+  line-height: 1;
+  letter-spacing: 0.1em;
+  color: var(--text);
+  text-shadow: 0 0 22px rgba(0, 229, 255, 0.5), 2px 2px 0 rgba(255, 45, 142, 0.6);
+}
+.app__tagline {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--muted);
+  letter-spacing: 0.08em;
+}
+
+/* Bottom tab bar on narrow screens keeps thumb reach (order: content, nav). */
+@media (max-width: 719px) {
+  .app__nav { order: 3; border-top: 1px solid var(--line-hot); border-bottom: none; }
+  .app__content { order: 2; }
+}
+/* Wide screens: nav becomes a centered top rail under the brand. */
+@media (min-width: 720px) {
+  .app__nav {
+    justify-content: center;
+    gap: 0.5rem;
+    border-bottom: 1px solid var(--line-hot);
+    border-top: none;
+  }
+  .app__nav-link { flex: 0 0 auto; padding: 0.5rem 1.1rem; }
+  .app__content { max-width: 1100px; margin: 0 auto; width: 100%; }
+}

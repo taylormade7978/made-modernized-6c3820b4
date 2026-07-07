@@ -24,15 +24,18 @@ if (__CAP_WALLET__) gatedNav.push({ to: '/wallet', label: 'Wallet' })
 const navItems = [...coreNav, ...gatedNav]
 
 /**
- * App shell: a persistent bottom tab bar (mobile-first) wrapping the routed
- * <Outlet>. Nav entries mirror the capability-gated route table.
+ * App shell: a branded HUD header + a nav rail that sits at the top on wide
+ * (desktop) viewports and drops to a thumb-reachable bottom tab bar on mobile
+ * (see `.app__nav` media query). Nav entries mirror the capability-gated route
+ * table.
  */
 export default function AppLayout() {
   return (
     <div className="app">
-      <main className="app__content">
-        <Outlet />
-      </main>
+      <header className="app__brand">
+        <span className="app__wordmark">MADE</span>
+        <span className="app__tagline">// deckbuilder</span>
+      </header>
       <nav className="app__nav" aria-label="Primary">
         {navItems.map((item) => (
           <NavLink
@@ -46,6 +49,9 @@ export default function AppLayout() {
           </NavLink>
         ))}
       </nav>
+      <main className="app__content">
+        <Outlet />
+      </main>
     </div>
   )
 }
