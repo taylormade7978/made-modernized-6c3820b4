@@ -53,6 +53,32 @@ const SHOP_ITEMS = [
   { sku: 'exp.heist', name: 'Neon Heist (expansion)', description: 'Unlock the full Neon Heist set', kind: 'expansion', settlement: 'fiat', priceMinor: 2999, currency: 'USD' },
 ]
 
+// ── Story campaign: one mission per Crown City boss, escalating tiers ─────────
+// A Mission joins a boss + its AI profile. The first three tiers are unlocked;
+// later crews unlock as the campaign is cleared (unlocked flag). Launching a
+// mission (POST attempts) returns a MissionAttempt whose matchTicket seats the
+// player against the AI opponent.
+function mission(id, name, desc, tier, bossId, bossName, power, strategy, unlocked) {
+  return {
+    missionId: id, name, description: desc, difficultyTier: tier,
+    boss: { bossId, name: bossName, startingHp: 30, heroPower: power, trademark: power, signatureCardIds: [] },
+    aiProfile: { profileId: `ai.${bossId}`, difficultyTier: tier, strategyKind: strategy, mctsBudget: strategy === 'Mcts' ? 4000 : 0 },
+    firstClearRewardClaimed: false, unlocked,
+  }
+}
+const MISSIONS = [
+  mission('m1', 'First Blood', 'Cain Akaw is looking for a face to put his rage on. Don’t let it be yours.', 'Prologue', 'cain', 'Cain Akaw', 'Mark', 'Scripted', true),
+  mission('m2', 'Two-Day Delivery', 'Solomon Vault settles disputes by splitting the shipment. Take the whole thing.', 'Standard', 'solomon', 'Solomon Vault', 'Pull Order', 'Scripted', true),
+  mission('m3', 'Royal Court', 'Cleo Reign runs her court like a cartel. Break the entourage, break the throne.', 'Standard', 'cleo', 'Cleo Reign', 'Royal Court', 'Mcts', true),
+  mission('m4', 'Shipped Late', 'Nimrod II stacks machinery until you can’t punch through. Punch through.', 'Standard', 'nimrod', 'Nimrod II', 'Tower', 'Mcts', false),
+  mission('m5', 'The Demo', 'Moshe Stone will unveil the one play that leaves you holding the bill. Refuse it.', 'Brutal', 'moshe', 'Moshe Stone', 'The Tablet', 'Mcts', false),
+  mission('m6', 'Smile for the Camera', 'Lady Homestead is beloved on broadcast, lethal in the alley. Get her off-camera.', 'Brutal', 'homestead', 'Lady Homestead', 'Smile for the Camera', 'Mcts', false),
+  mission('m7', 'First Contact', 'Ambassador Zhrrx knows your hand before you draw it. Change the game.', 'Brutal', 'zhrrx', 'Ambassador Zhrrx', 'First Contact', 'Mcts', false),
+  mission('m8', 'Thirty Pieces', 'Judith Coin sells you the future and is three borders away before the wallets drain.', 'Legendary', 'judas', 'Judith Coin', 'Thirty Pieces', 'Mcts', false),
+  mission('m9', 'Hold the Floor', 'Hollis Crowe out-talks you and buries you in noise. Get a word in edgewise.', 'Legendary', 'crowe', 'Hollis Crowe', 'Hold the Floor', 'Mcts', false),
+  mission('m10', 'Mirror Match', 'CL-7N plays your own deck back at you. Beat yourself.', 'Legendary', 'clyde', 'CL-7N “Clyde”', 'Mirror Match', 'Mcts', false),
+]
+
 // ── Schema: queries (searchable) + subscriptions (push) ───────────────────────
 const typeDefs = /* GraphQL */ `
   type Card { cardId: ID!, name: String!, cost: Int!, cardClass: String!, cardType: String!, rarity: String!, keywords: [String!]!, effectScriptRef: String!, copyCap: Int!, art: String, text: String, heat: Int, atk: Int, hp: Int, artTint: Int }
@@ -144,7 +170,8 @@ const server = createServer(async (req, res) => {
     if (col) return rjson(COLLECTIONS[col[1]] || { playerId: col[1], ownedCards: [], decks: [] })
     if (url.pathname === '/v1/leaderboard') return rjson(LEADERBOARD)
     if (url.pathname === '/v1/shop/items') return rjson(SHOP_ITEMS)
-    if (url.pathname.startsWith('/v1/story/')) return rjson({ playerId: 'guest', missions: [] })
+    const story = url.pathname.match(/^\/v1\/story\/([^/]+)\/missions$/)
+    if (story) return rjson({ playerId: story[1], missions: MISSIONS })
     if (url.pathname.startsWith('/v1/')) return rjson([])
   }
 
@@ -160,6 +187,19 @@ const server = createServer(async (req, res) => {
     publishCollection(playerId) // ← live push, no polling
     res.writeHead(200, { 'Content-Type': 'application/json' })
     return res.end(JSON.stringify(deck))
+  }
+  // Launch a story mission → a MissionAttempt with a match ticket the board joins.
+  const att = req.method === 'POST' && url.pathname.match(/^\/v1\/story\/([^/]+)\/missions\/([^/]+)\/attempts$/)
+  if (att) {
+    const [, playerId, missionId] = att
+    const m = MISSIONS.find((x) => x.missionId === missionId)
+    const order = {
+      attemptId: 'att.' + Math.abs(hash(playerId + missionId + Date.now())).toString(36),
+      missionId, playerId, difficultyTier: m ? m.difficultyTier : 'Standard',
+      matchTicket: `mission:${missionId}:${playerId}`, scriptedStateStep: 0, missionCompleted: false,
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    return res.end(JSON.stringify(order))
   }
   if (req.method === 'POST' && url.pathname === '/v1/shop/orders') {
     const body = await readJson(req)

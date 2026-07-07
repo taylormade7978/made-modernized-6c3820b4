@@ -1488,3 +1488,62 @@ body {
 .rules__row { display: grid; grid-template-columns: minmax(90px, 34%) 1fr; gap: 0.5rem; padding: 0.3rem 0; border-top: 1px solid rgba(255,255,255,0.05); }
 .rules__term { font-family: var(--font-mono); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); }
 .rules__def { font-size: 0.74rem; color: var(--muted); line-height: 1.4; margin: 0; }
+
+/* ── Economy (Tokens / Wallet) ─────────────────────────────────────────────── */
+.econ { padding: 1.5rem 2.5rem; }
+.econ__head { margin-bottom: 1rem; }
+.econ__title { font-family: var(--font-display); font-size: 1.6rem; color: var(--amber); text-shadow: 0 0 12px rgba(255,190,60,0.35); margin: 0; }
+.econ__sub { font-family: var(--font-mono); font-size: 0.8rem; color: var(--muted); margin: 0.25rem 0 0; }
+.econ__balance {
+  display: flex; flex-direction: column; gap: 0.15rem; padding: 1rem 1.25rem; margin-bottom: 1.25rem;
+  background: linear-gradient(120deg, rgba(60,40,10,0.55), rgba(8,11,22,0.9));
+  border: 1px solid var(--amber); border-radius: 8px; box-shadow: 0 0 22px rgba(255,190,60,0.18);
+}
+.econ__balance-label { font-family: var(--font-mono); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.econ__balance-amount { font-family: var(--font-display); font-size: 2rem; color: var(--amber); }
+.econ__balance-amount em { font-style: normal; font-size: 1rem; color: var(--muted); }
+.econ__cols { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); align-items: start; }
+.econ__card { background: linear-gradient(180deg, rgba(20,26,44,0.85), rgba(8,11,22,0.95)); border: 1px solid var(--line-hot, #2a3350); border-radius: 6px; padding: 0.9rem 1rem; }
+.econ__card-title { font-family: var(--font-display); font-size: 1rem; color: var(--accent); margin: 0 0 0.5rem; }
+.econ__rows { list-style: none; margin: 0; padding: 0; }
+.econ__row { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; padding: 0.4rem 0; border-top: 1px solid rgba(255,255,255,0.05); }
+.econ__row-main { display: flex; flex-direction: column; font-size: 0.8rem; color: var(--text); }
+.econ__row-main small { font-family: var(--font-mono); font-size: 0.62rem; color: var(--muted); }
+.econ__row-amt { font-family: var(--font-mono); font-size: 0.82rem; font-weight: 700; }
+.econ__row-amt--pos { color: var(--green, #38e08a); }
+.econ__row-amt--neg { color: var(--magenta); }
+.econ__balances { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem; }
+.econ__bal-chip { display: flex; flex-direction: column; gap: 0.15rem; padding: 0.8rem 1rem; min-width: 180px; background: rgba(20,26,44,0.8); border: 1px solid var(--line-hot, #2a3350); border-radius: 6px; }
+.econ__bal-cur { font-family: var(--font-mono); font-size: 0.65rem; text-transform: uppercase; color: var(--accent); }
+.econ__bal-amt { font-family: var(--font-display); font-size: 1.4rem; color: var(--text); }
+.econ__bal-hint { font-size: 0.66rem; color: var(--muted); }
+.econ__ledger { display: flex; flex-direction: column; border: 1px solid var(--line-hot, #2a3350); border-radius: 6px; overflow: hidden; }
+.econ__ledger-head, .econ__ledger-row { display: grid; grid-template-columns: 110px 1fr 130px 90px; gap: 0.5rem; padding: 0.55rem 0.9rem; align-items: center; }
+.econ__ledger-head { background: rgba(255,255,255,0.04); font-family: var(--font-mono); font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.econ__ledger-row { border-top: 1px solid rgba(255,255,255,0.05); font-size: 0.78rem; color: var(--text); }
+.econ__ledger-date { font-family: var(--font-mono); font-size: 0.7rem; color: var(--muted); }
+.econ__ledger-amt { font-family: var(--font-mono); font-weight: 700; }
+.econ__ledger-amt--earn { color: var(--green, #38e08a); }
+.econ__ledger-amt--spend { color: var(--magenta); }
+.econ__ledger-amt--fiat { color: var(--accent); }
+.econ__ledger-bal { font-family: var(--font-mono); color: var(--muted); }
+
+/* ── Marketplace ───────────────────────────────────────────────────────────── */
+.market { padding: 1.5rem 2.5rem; }
+.market__head { margin-bottom: 1.25rem; }
+.market__title { font-family: var(--font-display); font-size: 1.6rem; color: var(--green, #38e08a); text-shadow: 0 0 12px rgba(56,224,138,0.3); margin: 0; }
+.market__sub { font-family: var(--font-mono); font-size: 0.8rem; color: var(--muted); margin: 0.25rem 0 0; }
+.market__grid { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.9rem; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.market__listing { display: grid; grid-template-columns: 64px 1fr auto; gap: 0.6rem; align-items: center; padding: 0.6rem; background: linear-gradient(180deg, rgba(20,26,44,0.9), rgba(8,11,22,0.95)); border: 1px solid var(--line-hot, #2a3350); border-left-width: 3px; border-radius: 6px; }
+.market__listing--rare { border-left-color: var(--accent); }
+.market__listing--epic { border-left-color: var(--magenta); }
+.market__listing--legendary { border-left-color: var(--amber); box-shadow: 0 0 16px rgba(255,190,60,0.15); }
+.market__art { width: 64px; height: 64px; border-radius: 4px; background-size: cover; background-position: center; background-color: #0a0f1c; }
+.market__info { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+.market__name { font-family: var(--font-tech); font-weight: 600; font-size: 0.85rem; color: var(--text); }
+.market__rarity { font-family: var(--font-mono); font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.market__seller { font-family: var(--font-mono); font-size: 0.62rem; color: var(--accent); }
+.market__buy { display: flex; flex-direction: column; align-items: center; gap: 0; padding: 0.4rem 0.6rem; background: rgba(56,224,138,0.12); border: 1px solid var(--green, #38e08a); border-radius: 4px; color: var(--green, #38e08a); cursor: pointer; transition: background 0.12s; }
+.market__buy:hover { background: rgba(56,224,138,0.24); }
+.market__price { font-family: var(--font-display); font-size: 0.95rem; line-height: 1; }
+.market__cur { font-family: var(--font-mono); font-size: 0.52rem; letter-spacing: 0.06em; }
