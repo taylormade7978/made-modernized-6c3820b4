@@ -11,6 +11,11 @@
  * Metadata (name / tagline / class / boss power) mirrors `heroes()` in
  * `made-site/src/data.rs` — the canonical roster.
  */
+// Bumped when the living-portrait clips are regenerated. The mp4s live at
+// stable URLs served with a 1-year immutable cache, so this query param is what
+// forces browsers to refetch the new render instead of the cached old one.
+const CLIP_VERSION = 2
+
 interface Boss {
   id: string
   name: string
@@ -54,7 +59,7 @@ export default function HeroesView() {
             <div className="boss__portrait">
               <video
                 className="boss__video"
-                src={`/assets/living/${b.id}.mp4`}
+                src={`/assets/living/${b.id}.mp4?v=${CLIP_VERSION}`}
                 poster={`/assets/heroes/${b.id}.webp`}
                 autoPlay
                 loop
