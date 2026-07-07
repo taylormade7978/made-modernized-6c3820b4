@@ -1295,18 +1295,13 @@ body {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1rem; margin-top: 1rem;
 }
 .story__boss {
-  padding: 1rem; border: 1px solid var(--line-hot);
-  background: linear-gradient(160deg, rgba(255,45,142,0.08), var(--surface-glass));
-  box-shadow: 0 12px 40px rgba(0,0,0,0.6), 0 0 24px rgba(255,45,142,0.15);
+  display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.6rem; align-items: baseline;
+  margin: 0.5rem 0; padding: 0.6rem 0.75rem; border: 1px solid var(--line-hot);
+  border-radius: 6px; background: rgba(255,45,142,0.06);
 }
-.story__boss-label { color: var(--magenta); font-size: 0.7rem; }
-.story__boss-name { font-family: var(--font-display); font-size: 1.4rem; letter-spacing: 0.04em; text-shadow: var(--glow-magenta); }
-.story__boss-hp {
-  height: 0.55rem; border-radius: 999px; overflow: hidden;
-  background: var(--bg-deep); border: 1px solid var(--line);
-  background-image: linear-gradient(90deg, var(--magenta), var(--amber));
-  box-shadow: 0 0 14px rgba(255,45,142,0.4);
-}
+.story__boss-label { color: var(--magenta); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.05em; align-self: center; }
+.story__boss-name { font-family: var(--font-display); font-size: 1.05rem; letter-spacing: 0.03em; line-height: 1.2; min-width: 0; }
+.story__boss-hp { font-family: var(--font-mono); font-size: 0.75rem; color: var(--amber); white-space: nowrap; }
 .story__mission-name { font-family: var(--font-tech); letter-spacing: 0.02em; }
 .story__mission-desc { color: var(--muted); font-size: 0.85rem; }
 .story__ai-budget { font-family: var(--font-mono); font-size: 0.72rem; color: var(--purple); }
