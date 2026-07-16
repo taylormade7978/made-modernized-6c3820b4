@@ -824,6 +824,18 @@ pub struct FatigueDamageDealt {
     pub boss_hp_remaining: i32,
 }
 
+/// The incoming seat's board units readied at the start of its turn, carried
+/// by [`Event::OperatorsReadied`] and thus by the emitted `operators.readied`
+/// event. Clears summoning sickness so a unit summoned last turn can attack
+/// this turn (spec §1b step 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorsReadied {
+    /// The match the readying happened in.
+    pub match_id: String,
+    /// The incoming seat whose units were readied at its turn start.
+    pub player: Player,
+}
+
 /// A passed turn, carried by [`Event::TurnEnded`] and thus by the emitted
 /// `turn.ended` event. The turn passes from the ending seat to its opponent,
 /// whose available Juice ramps for the turn now beginning.
@@ -913,6 +925,8 @@ pub enum Event {
     HeroPowerActivated(HeroPowerActivated),
     /// Ending a turn resolved the incoming seat's start-of-turn draw.
     FatigueDamageDealt(FatigueDamageDealt),
+    /// The incoming seat's board units were readied at its turn start.
+    OperatorsReadied(OperatorsReadied),
     /// The turn passed from the ending seat to its opponent.
     TurnEnded(TurnEnded),
     /// A Cop Event (fired when Heat hit the upper bound) was resolved from the
@@ -938,6 +952,7 @@ impl DomainEvent for Event {
             Event::OperatorSummoned(_) => "operator.summoned",
             Event::HeroPowerActivated(_) => "hero_power.activated",
             Event::FatigueDamageDealt(_) => "fatigue.damage.dealt",
+            Event::OperatorsReadied(_) => "operators.readied",
             Event::TurnEnded(_) => "turn.ended",
             Event::CopEventTriggered(_) => "cop.event.triggered",
             Event::MatchCompleted(_) => "match.completed",
@@ -2216,6 +2231,17 @@ impl GameSession {
             outfit.available_juice = next_player_juice;
             outfit.boss_hp = boss_hp_remaining;
         }
+
+        // Ready the incoming seat's board units (clear summoning sickness). This is
+        // spec §1b step 4 — a unit summoned last turn becomes able to attack now.
+        for u in self.seat_state_at_mut(incoming).board.iter_mut() {
+            u.ready = true;
+        }
+        let readied = Event::OperatorsReadied(OperatorsReadied {
+            match_id: cmd.match_id.clone(),
+            player: incoming,
+        });
+
         self.opening_player = Some(incoming);
 
         // A successful end of turn resolves the start-of-turn draw first, then
@@ -2235,9 +2261,10 @@ impl GameSession {
             next_player_juice,
             next_player_max_juice,
         });
+        self.root.record(Box::new(readied.clone()));
         self.root.record(Box::new(fatigue.clone()));
         self.root.record(Box::new(ended.clone()));
-        Ok(vec![fatigue, ended])
+        Ok(vec![readied, fatigue, ended])
     }
 
     /// Cop-Event-draw invariant: the Cop Event is drawn from a seeded d10 table,
@@ -4097,8 +4124,8 @@ mod tests {
         EndTurn::new("m-1", "m-1-a")
     }
 
-    // Scenario: Successfully execute EndTurnCmd — a fatigue.damage.dealt event
-    // and a turn.ended event are emitted.
+    // Scenario: Successfully execute EndTurnCmd — an operators.readied event, a
+    // fatigue.damage.dealt event, and a turn.ended event are emitted.
     #[test]
     fn ends_turn_and_emits_fatigue_damage_dealt_and_turn_ended_events() {
         let mut session = valid_session();
@@ -4107,10 +4134,20 @@ mod tests {
             .execute(valid_end_turn().into_command())
             .expect("a valid end of turn should succeed");
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type(), "fatigue.damage.dealt");
-        assert_eq!(events[1].event_type(), "turn.ended");
+        // Three events: the incoming seat is readied first, then its
+        // start-of-turn draw resolves, then the turn is marked passed.
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_type(), "operators.readied");
+        assert_eq!(events[1].event_type(), "fatigue.damage.dealt");
+        assert_eq!(events[2].event_type(), "turn.ended");
         match &events[0] {
+            Event::OperatorsReadied(readied) => {
+                assert_eq!(readied.match_id, "m-1");
+                assert_eq!(readied.player, Player::B);
+            }
+            other => panic!("expected OperatorsReadied, got {other:?}"),
+        }
+        match &events[1] {
             Event::FatigueDamageDealt(fatigue) => {
                 assert_eq!(fatigue.match_id, "m-1");
                 // The turn passes to player B, who draws at the start of its turn.
@@ -4123,7 +4160,7 @@ mod tests {
             }
             other => panic!("expected FatigueDamageDealt, got {other:?}"),
         }
-        match &events[1] {
+        match &events[2] {
             Event::TurnEnded(ended) => {
                 assert_eq!(ended.match_id, "m-1");
                 assert_eq!(ended.player_id, "m-1-a");
@@ -4135,14 +4172,18 @@ mod tests {
             }
             other => panic!("expected TurnEnded, got {other:?}"),
         }
-        // Two events recorded on the root: the version advances by two.
-        assert_eq!(session.version(), 2);
-        assert_eq!(session.uncommitted_events().len(), 2);
+        // Three events recorded on the root: the version advances by three.
+        assert_eq!(session.version(), 3);
+        assert_eq!(session.uncommitted_events().len(), 3);
         assert_eq!(
             session.uncommitted_events()[0].event_type(),
+            "operators.readied"
+        );
+        assert_eq!(
+            session.uncommitted_events()[1].event_type(),
             "fatigue.damage.dealt"
         );
-        assert_eq!(session.uncommitted_events()[1].event_type(), "turn.ended");
+        assert_eq!(session.uncommitted_events()[2].event_type(), "turn.ended");
     }
 
     // The incoming seat's Juice ramps but stays hard-capped at JUICE_CAP.
@@ -4159,7 +4200,9 @@ mod tests {
         let events = session
             .execute(valid_end_turn().into_command())
             .expect("ending the turn should succeed");
-        match &events[1] {
+        // events[0] is now OperatorsReadied, events[1] FatigueDamageDealt; TurnEnded
+        // moved to events[2] with the new operators.readied delta.
+        match &events[2] {
             Event::TurnEnded(ended) => {
                 assert_eq!(ended.next_player_max_juice, JUICE_CAP);
                 assert_eq!(ended.next_player_juice, JUICE_CAP);
@@ -4392,6 +4435,47 @@ mod tests {
         assert_eq!(command.name, EndTurn::COMMAND);
         let decoded: EndTurn = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_end_turn());
+    }
+
+    // Regression for the readying gap: at the start of a seat's turn, that seat's
+    // board units are readied (summoning sickness cleared) so a unit summoned last
+    // turn can attack this turn.
+    #[test]
+    fn end_turn_readies_incoming_seats_units() {
+        let mut session = valid_session();
+        session.set_opening_player(Some(Player::A));
+        // B (the incoming seat) has an UNREADY unit (as if summoned last turn).
+        session.seat_state_at_mut(Player::B).board.push(test_unit("B-op", 2, 2, false, false, &[]));
+
+        let events = session
+            .execute(EndTurn::new("m-1", "m-1-a").into_command())
+            .expect("A ends its turn; B becomes active");
+
+        // The incoming seat's unit is now ready...
+        assert!(
+            session.seat_state_at(Player::B).board.iter().all(|u| u.ready),
+            "incoming seat's units must be readied at turn start"
+        );
+        // ...and an OperatorsReadied delta was emitted for B.
+        assert!(events.iter().any(|e| matches!(e, Event::OperatorsReadied(r) if r.player == Player::B)));
+    }
+
+    // The OUTGOING seat's units are NOT readied by the opponent's turn start.
+    #[test]
+    fn end_turn_does_not_ready_outgoing_seats_units() {
+        let mut session = valid_session();
+        session.set_opening_player(Some(Player::A));
+        session.seat_state_at_mut(Player::A).board.push(test_unit("A-op", 2, 2, false, false, &[]));
+
+        session
+            .execute(EndTurn::new("m-1", "m-1-a").into_command())
+            .expect("A ends its turn");
+
+        // A is now the outgoing seat; its freshly-summoned unit stays unready until A's next turn.
+        assert!(
+            session.seat_state_at(Player::A).board.iter().all(|u| !u.ready),
+            "the outgoing seat's units must not be readied by the opponent's turn start"
+        );
     }
 
     // ---- ResolveCopEventCmd (S-8) ------------------------------------------

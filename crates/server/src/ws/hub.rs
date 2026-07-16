@@ -548,6 +548,10 @@ fn delta_event_json(event: &Event) -> serde_json::Value {
             "amount": e.amount,
             "bossHpRemaining": e.boss_hp_remaining,
         }),
+        Event::OperatorsReadied(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+        }),
         Event::TurnEnded(e) => json!({
             "matchId": e.match_id,
             "playerId": e.player_id,
