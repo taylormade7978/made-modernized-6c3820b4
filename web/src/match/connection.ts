@@ -38,6 +38,13 @@ export class MatchConnection {
   constructor(
     private readonly handlers: ConnectionHandlers,
     private readonly matchId: string,
+    /**
+     * The local player's identity — the name of the Outfit it was seated as
+     * (`<matchId>-a` for seat A). The server's `seat_for_player` resolves this
+     * to a seat, and its `ClientMessage::Action` requires it, so it must ride in
+     * every action envelope for the frame to deserialize server-side.
+     */
+    private readonly playerId: string,
     private readonly ticket?: string,
   ) {}
 
@@ -59,18 +66,22 @@ export class MatchConnection {
 
   /**
    * Forward a player action to the authoritative server as the structured
-   * envelope its `ClientMessage` already parses — `{ type:"action", matchId,
-   * command, payload }` — where `command` is the action's wire `kind` and
-   * `payload` carries the remaining fields (`seat`, `targetRef`, …). This
-   * activates the real online command path; the old bare-`kind` frame arrived
-   * unparseable (no matchId, no payload). Returns `false` when the socket is not
-   * open (the caller keeps the prediction pending and the reconnect/resync path
+   * envelope its `ClientMessage::Action` requires — `{ type:"action", matchId,
+   * playerId, command, payload }` — where `command` is the action's wire `kind`
+   * and `payload` carries the remaining fields (`seat`, `targetRef`, …).
+   * `playerId` is MANDATORY server-side (no serde default): omitting it made the
+   * whole frame fail to deserialize, so `apply_action` never ran. This activates
+   * the real online command path; the old frame arrived unparseable (no matchId,
+   * no playerId, no payload). Returns `false` when the socket is not open (the
+   * caller keeps the prediction pending and the reconnect/resync path
    * reconciles it).
    */
   send(action: MatchAction): boolean {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false
     const { kind, ...fields } = action
-    this.socket.send(JSON.stringify({ type: 'action', matchId: this.matchId, command: kind, payload: fields }))
+    this.socket.send(
+      JSON.stringify({ type: 'action', matchId: this.matchId, playerId: this.playerId, command: kind, payload: fields }),
+    )
     return true
   }
 

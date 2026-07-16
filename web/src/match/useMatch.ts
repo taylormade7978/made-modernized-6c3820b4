@@ -98,6 +98,11 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
       return
     }
 
+    // The local player's identity is the name of the Outfit it is seated as —
+    // `<matchId>-a` for seat A — matching the domain's `OutfitConfig` naming
+    // (`startMatch` above) and what the server's `seat_for_player` resolves.
+    const selfPlayerId = `${matchId}-${SELF_SEAT.toLowerCase()}`
+
     const conn = new MatchConnection(
       {
         onStatus: setStatus,
@@ -127,6 +132,8 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
       },
       // The match this connection acts on; rides in every action envelope.
       matchId,
+      // The local player's identity; the server requires it on every action.
+      selfPlayerId,
       // A mission launch joins the AI-opponent's authoritative match via its ticket.
       ticket,
     )

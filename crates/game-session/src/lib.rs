@@ -2786,7 +2786,7 @@ mod wasm_bindings {
 /// browser prediction engine and the authoritative server agree at the event
 /// level. `target_arch = "wasm32"`-gated so it compiles out of the native suite;
 /// run it with `wasm-pack test --node crates/game-session -- --features wasm`.
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(all(test, target_arch = "wasm32", feature = "wasm"))]
 mod wasm_tests {
     use super::wasm_bindings::WasmGameSession;
     use super::{GameSession, StartMatch};
