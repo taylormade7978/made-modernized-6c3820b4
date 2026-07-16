@@ -215,6 +215,10 @@ pub struct DefineCardCmd {
     /// Board health. Must be >= 1 for Operator/Vehicle; 0 for Job/Piece/Heist.
     #[serde(default)]
     pub hp: u8,
+    /// If `Some(boss_id)`, only that Boss's Outfit may deck this card. A
+    /// boss-locked card must be of class [`CardClass::Boss`] (Task 8).
+    #[serde(default)]
+    pub boss_lock: Option<String>,
 }
 
 impl DefineCardCmd {
@@ -266,6 +270,10 @@ pub struct ReviseCardCmd {
     /// Revised board health. Must be >= 1 for Operator/Vehicle; 0 for Job/Piece/Heist.
     #[serde(default)]
     pub hp: u8,
+    /// If `Some(boss_id)`, only that Boss's Outfit may deck this card. A
+    /// boss-locked card must be of class [`CardClass::Boss`] (Task 8).
+    #[serde(default)]
+    pub boss_lock: Option<String>,
 }
 
 impl ReviseCardCmd {
@@ -306,6 +314,7 @@ fn validate_card_fields(
     copy_cap: u32,
     atk: u8,
     hp: u8,
+    boss_lock: &Option<String>,
 ) -> Result<ValidatedCardFields, DomainError> {
     if name.trim().is_empty() {
         return Err(DomainError::InvariantViolation(
@@ -318,6 +327,13 @@ fn validate_card_fields(
     // Invariant: exactly one class, or Neutral.
     let class = CardClass::parse(raw_class)?;
     let rarity = Rarity::parse(raw_rarity)?;
+
+    // Invariant: a boss-locked card must be a Boss-class card.
+    if boss_lock.is_some() && class != CardClass::Boss {
+        return Err(DomainError::InvariantViolation(
+            "a boss-locked card must be of class Boss".to_string(),
+        ));
+    }
 
     // Invariant: Juice cost within the legal range for the card's type.
     let (min, max) = card_type.legal_cost_range();
@@ -386,6 +402,7 @@ pub struct CardDefined {
     pub copy_cap: u32,
     pub atk: u8,
     pub hp: u8,
+    pub boss_lock: Option<String>,
 }
 
 /// A validated card revision, produced once every invariant has been re-checked
@@ -404,6 +421,7 @@ pub struct CardRevised {
     pub copy_cap: u32,
     pub atk: u8,
     pub hp: u8,
+    pub boss_lock: Option<String>,
 }
 
 /// Domain events emitted by [`CardDefinition`].
@@ -481,6 +499,7 @@ impl CardDefinition {
             cmd.copy_cap,
             cmd.atk,
             cmd.hp,
+            &cmd.boss_lock,
         )?;
 
         let event = Event::CardDefined(CardDefined {
@@ -495,6 +514,7 @@ impl CardDefinition {
             copy_cap: cmd.copy_cap,
             atk: cmd.atk,
             hp: cmd.hp,
+            boss_lock: cmd.boss_lock,
         });
 
         self.root.record(Box::new(event.clone()));
@@ -524,6 +544,7 @@ impl CardDefinition {
             cmd.copy_cap,
             cmd.atk,
             cmd.hp,
+            &cmd.boss_lock,
         )?;
 
         let event = Event::CardRevised(CardRevised {
@@ -538,6 +559,7 @@ impl CardDefinition {
             copy_cap: cmd.copy_cap,
             atk: cmd.atk,
             hp: cmd.hp,
+            boss_lock: cmd.boss_lock,
         });
 
         self.root.record(Box::new(event.clone()));
@@ -594,6 +616,7 @@ mod tests {
             copy_cap: 0,
             atk: 2,
             hp: 2,
+            boss_lock: None,
         }
     }
 
@@ -703,6 +726,7 @@ mod tests {
             copy_cap: 0,
             atk: 2,
             hp: 2,
+            boss_lock: None,
         }
     }
 
@@ -852,6 +876,44 @@ mod tests {
             agg.execute(cmd.into_command()),
             Err(DomainError::InvariantViolation(_))
         ));
+    }
+
+    // Scenario: DefineCardCmd rejected — a boss-locked card must be of class
+    // Boss (Task 8).
+    #[test]
+    fn define_card_rejects_boss_lock_on_non_boss_class() {
+        let mut agg = CardDefinition::new("card-001");
+        // valid_cmd() is class "Driver"; locking it to a Boss is illegal.
+        let cmd = DefineCardCmd {
+            boss_lock: Some("boss-solomon".to_string()),
+            ..valid_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+        assert_eq!(agg.version(), 0);
+    }
+
+    // Scenario: a boss-locked card of class Boss is accepted.
+    #[test]
+    fn boss_locked_card_of_boss_class_is_accepted() {
+        let mut agg = CardDefinition::new("card-boss");
+        let cmd = DefineCardCmd {
+            class: "Boss".to_string(),
+            boss_lock: Some("boss-solomon".to_string()),
+            ..valid_cmd()
+        };
+        let events = agg
+            .execute(cmd.into_command())
+            .expect("a Boss-class boss-locked card is legal");
+        match &events[0] {
+            Event::CardDefined(d) => {
+                assert_eq!(d.boss_lock, Some("boss-solomon".to_string()));
+                assert_eq!(d.class, CardClass::Boss);
+            }
+            other => panic!("expected CardDefined, got {other:?}"),
+        }
     }
 
     #[test]

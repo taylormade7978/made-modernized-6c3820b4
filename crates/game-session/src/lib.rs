@@ -1432,6 +1432,34 @@ impl GameSession {
         Ok(())
     }
 
+    /// Boss-lock invariant (Task 8, server-authoritative anti-cheat backstop):
+    /// every card dealt into a seat's deck or hand that is locked to a Boss
+    /// (`CardInstance.boss_lock`) must be locked to *that seat's own* Boss.
+    /// Since a deck backs a tradeable asset, this is re-checked here even
+    /// though the Outfit aggregate already enforces the same rule at
+    /// deck-build time — a client cannot be trusted to have gone through it.
+    fn ensure_boss_locks_honored(&self) -> Result<(), DomainError> {
+        for seat in [Player::A, Player::B] {
+            let boss = self.outfit_at(seat).boss_name.clone();
+            for c in self
+                .seat_state_at(seat)
+                .deck
+                .iter()
+                .chain(self.seat_state_at(seat).hand.iter())
+            {
+                if let Some(b) = &c.boss_lock {
+                    if b != &boss {
+                        return Err(DomainError::InvariantViolation(format!(
+                            "seat {seat:?} decks card '{}' locked to Boss '{b}', but its Boss is '{boss}'",
+                            c.card_id
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Turn-ownership invariant: a command is valid only for the player whose
     /// turn it currently is, so a started match must designate an opening player.
     fn ensure_opening_player_designated(&self) -> Result<Player, DomainError> {
@@ -1500,6 +1528,11 @@ impl GameSession {
             st.deck = deck;
             st.board = Vec::new();
         }
+
+        // Server-authoritative anti-cheat backstop: re-validate every dealt
+        // card's boss lock against the seat's actual Boss, since decks back
+        // tradeable assets (Task 8).
+        self.ensure_boss_locks_honored()?;
 
         let event = Event::MatchStarted(MatchStarted {
             match_id: cmd.match_id,
@@ -2826,6 +2859,47 @@ mod tests {
             .map(|c| c.instance_id.clone())
             .collect();
         assert_eq!(ids_a, ids_a2, "the seeded deal is deterministic");
+    }
+
+    // Scenario: StartMatch's server-authoritative anti-cheat backstop rejects a
+    // dealt card locked to a Boss other than the seat's own (Task 8). The
+    // ported CARD_POOL never carries a boss lock, so a legitimate deal can
+    // never trip this check through the public StartMatchCmd path alone; this
+    // seeds a seat's deck with a mismatched-lock card and calls the exact
+    // validation `start_match` runs (`ensure_boss_locks_honored`) directly —
+    // the same private method invoked at the end of `start_match`.
+    #[test]
+    fn start_match_rejects_mismatched_boss_lock() {
+        let mut session = valid_session();
+        // OutfitConfig::new gives player A's Boss the name "m-1-a-boss".
+        assert_eq!(session.outfit_at(Player::A).boss_name, "m-1-a-boss");
+        session.seat_state_at_mut(Player::A).deck.push(CardInstance {
+            instance_id: "A-locked-0".to_string(),
+            card_id: "boss-card".to_string(),
+            cost: 0,
+            card_type: CardType::Job,
+            effect: CardEffect::None,
+            atk: 0,
+            hp: 0,
+            keywords: vec![],
+            boss_lock: Some("some-other-boss".to_string()),
+        });
+
+        let err = session
+            .ensure_boss_locks_honored()
+            .expect_err("a card locked to a mismatched Boss must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // Scenario: a legitimately dealt match (no boss-locked cards) passes the
+    // boss-lock backstop cleanly.
+    #[test]
+    fn start_match_accepts_deal_with_no_boss_locked_cards() {
+        let mut session = valid_session();
+        session
+            .execute(valid_cmd().into_command())
+            .expect("a legitimate deal carries no boss-locked cards");
+        assert!(session.ensure_boss_locks_honored().is_ok());
     }
 
     // The Rust mulberry32 port must reproduce the client's JS PRNG bit-for-bit,
