@@ -73,6 +73,7 @@ use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Serialize};
 
+use domain::boss_definition::{HeroPowerEffect, TrademarkEffect, TrademarkTrigger};
 use domain::card_definition::CardType;
 use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Repository};
 
@@ -204,6 +205,21 @@ pub struct OutfitConfig {
     /// Outstanding prerequisites in this Outfit's Heist prerequisite queue. A
     /// Heist may only resolve once this reaches zero.
     pub outstanding_heist_prereqs: usize,
+    /// The Boss's typed, resolvable hero-power effect (`domain::boss_definition`
+    /// design note): threaded onto the Outfit at match configuration so
+    /// [`GameSession::activate_hero_power`] can resolve it without a
+    /// cross-aggregate lookup. Defaults to `DealDamage { amount: 2 }`, matching
+    /// the client's hardcoded 2-poke (web/src/match/rules.ts:250).
+    pub hero_power_effect: HeroPowerEffect,
+    /// The Boss hero power's declared Juice cost. A command activating the
+    /// power must claim exactly this cost (see
+    /// [`GameSession::activate_hero_power`]'s anti-cheat cost-parity check).
+    pub hero_power_cost: u8,
+    /// The Boss's typed trademark effect, if any. `None` (the default) is a
+    /// no-op — [`GameSession::end_turn`]'s start-of-turn trademark seam only
+    /// fires when this is `Some` with `trigger: StartOfTurn`. The trademark
+    /// catalog itself is Subsystem 2.
+    pub trademark_effect: Option<TrademarkEffect>,
 }
 
 impl OutfitConfig {
@@ -227,6 +243,9 @@ impl OutfitConfig {
             max_juice: 3,
             heist_resolved: false,
             outstanding_heist_prereqs: 0,
+            hero_power_effect: HeroPowerEffect::DealDamage { amount: 2 },
+            hero_power_cost: 2,
+            trademark_effect: None,
         }
     }
 }
@@ -2127,6 +2146,16 @@ impl GameSession {
             )));
         }
 
+        // Anti-cheat: the command's claimed cost must equal the Boss's declared
+        // hero_power_cost — a client cannot understate (or overstate) it.
+        let declared_cost = self.outfit_at(seat).hero_power_cost;
+        if cmd.juice_cost != declared_cost {
+            return Err(DomainError::InvariantViolation(format!(
+                "hero power costs {declared_cost} Juice but the command claims {}",
+                cmd.juice_cost
+            )));
+        }
+
         // The Boss hero power is paid for out of the seat's available Juice; it
         // may only be activated when its cost does not exceed that pool.
         self.ensure_card_affordable(seat, cmd.juice_cost)?;
@@ -2138,6 +2167,7 @@ impl GameSession {
         outfit.available_juice -= cmd.juice_cost;
         let remaining_juice = outfit.available_juice;
 
+        let target_ref = cmd.target_ref.clone();
         let activated = Event::HeroPowerActivated(HeroPowerActivated {
             match_id: cmd.match_id,
             player_id: cmd.player_id,
@@ -2147,7 +2177,90 @@ impl GameSession {
             remaining_juice,
         });
         self.root.record(Box::new(activated.clone()));
-        Ok(vec![activated])
+
+        // Resolve the Boss's declared hero-power effect against the target,
+        // emitting its deltas (boss.damaged, operator.summoned, ...) after
+        // HeroPowerActivated.
+        let effect = self.outfit_at(seat).hero_power_effect;
+        let mut effect_events = self.resolve_hero_power(seat, effect, &target_ref);
+        for e in &effect_events {
+            self.root.record(Box::new(e.clone()));
+        }
+        let mut all = vec![activated];
+        all.append(&mut effect_events);
+        Ok(all)
+    }
+
+    /// Resolve a Boss's [`HeroPowerEffect`] for the activating `seat` against
+    /// `target_ref`, mirroring [`GameSession::resolve_effect`]'s shape (and
+    /// reusing its Task-6 helpers) but for hero powers. `DealDamage` hits the
+    /// target (reusing [`GameSession::damage_target`]); `GainArmor` raises the
+    /// activating seat's own Boss HP; `Cool` lowers the activating seat's own
+    /// Heat, floored at [`HEAT_BOUNDS`]'s start; `SummonToken` puts an unready
+    /// token [`BoardUnit`] on the activating seat's board, respecting
+    /// [`GameSession::ensure_summon_capacity`] — a full board simply skips the
+    /// summon (mirrors Hearthstone: a hero power never fizzles the whole
+    /// activation just because the board is full).
+    fn resolve_hero_power(
+        &mut self,
+        seat: Player,
+        effect: HeroPowerEffect,
+        target_ref: &str,
+    ) -> Vec<Event> {
+        let foe = Self::opponent_of(seat);
+        match effect {
+            HeroPowerEffect::DealDamage { amount } => {
+                let tref = if target_ref.is_empty() {
+                    format!("boss:{foe:?}")
+                } else {
+                    target_ref.to_string()
+                };
+                self.damage_target(&tref, amount, foe)
+            }
+            HeroPowerEffect::GainArmor { amount } => {
+                let outfit = self.outfit_at_mut(seat);
+                outfit.boss_hp += amount as i32;
+                Vec::new()
+            }
+            HeroPowerEffect::Cool { amount } => {
+                let outfit = self.outfit_at_mut(seat);
+                outfit.starting_heat =
+                    (outfit.starting_heat - amount as i32).max(*HEAT_BOUNDS.start());
+                Vec::new()
+            }
+            HeroPowerEffect::SummonToken { atk, hp } => {
+                // A full board is not a rejection — the token is just not
+                // summoned, mirroring Hearthstone hero powers.
+                if self
+                    .ensure_summon_capacity(seat, CardType::Operator)
+                    .is_err()
+                {
+                    return Vec::new();
+                }
+                let instance_id = format!(
+                    "{}-hero-token-{}",
+                    seat_label(seat),
+                    self.seat_state_at(seat).board.len()
+                );
+                let unit = BoardUnit {
+                    instance_id,
+                    card_id: "hero_power_token".to_string(),
+                    atk,
+                    hp,
+                    max_hp: hp,
+                    ready: false,
+                    is_vehicle: false,
+                    keywords: Vec::new(),
+                };
+                self.seat_state_at_mut(seat).board.push(unit.clone());
+                let mid = self.match_id.clone();
+                vec![Event::OperatorSummoned(OperatorSummoned {
+                    match_id: mid,
+                    player: seat,
+                    unit,
+                })]
+            }
+        }
     }
 
     /// Grow the seat's max-Juice crystal by one, capped at `JUICE_CAP`.
@@ -2244,6 +2357,21 @@ impl GameSession {
 
         self.opening_player = Some(incoming);
 
+        // Trademark seam (Task 7): if the incoming seat's Boss carries a
+        // StartOfTurn trademark, resolve its effect and fold its deltas in,
+        // reusing the same resolution as a hero power. Default `None` is a
+        // no-op, so an Outfit that never sets `trademark_effect` sees no
+        // behavior change — existing end_turn tests stay green. The trademark
+        // catalog itself is Subsystem 2; this only lands the trigger point.
+        let mut trademark_events = Vec::new();
+        if let Some(TrademarkEffect {
+            trigger: TrademarkTrigger::StartOfTurn,
+            effect,
+        }) = self.outfit_at(incoming).trademark_effect
+        {
+            trademark_events = self.resolve_hero_power(incoming, effect, "");
+        }
+
         // A successful end of turn resolves the start-of-turn draw first, then
         // marks the turn passed.
         let fatigue = Event::FatigueDamageDealt(FatigueDamageDealt {
@@ -2262,9 +2390,16 @@ impl GameSession {
             next_player_max_juice,
         });
         self.root.record(Box::new(readied.clone()));
+        for e in &trademark_events {
+            self.root.record(Box::new(e.clone()));
+        }
         self.root.record(Box::new(fatigue.clone()));
         self.root.record(Box::new(ended.clone()));
-        Ok(vec![readied, fatigue, ended])
+        let mut all = vec![readied];
+        all.append(&mut trademark_events);
+        all.push(fatigue);
+        all.push(ended);
+        Ok(all)
     }
 
     /// Cop-Event-draw invariant: the Cop Event is drawn from a seeded d10 table,
@@ -3893,7 +4028,9 @@ mod tests {
     }
 
     // Scenario: Successfully execute ActivateHeroPowerCmd — a
-    // hero_power.activated event is emitted and the GameSession state is updated.
+    // hero_power.activated event is emitted, the GameSession state is updated,
+    // and (Task 7) the default DealDamage{2} hero-power effect resolves against
+    // the target, following with a boss.damaged delta.
     #[test]
     fn activates_hero_power_and_emits_hero_power_activated_event() {
         let mut session = valid_session();
@@ -3902,7 +4039,8 @@ mod tests {
             .execute(valid_activate_hero_power().into_command())
             .expect("a valid hero power activation should succeed");
 
-        assert_eq!(events.len(), 1);
+        // HeroPowerActivated first, then the resolved effect's delta.
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type(), "hero_power.activated");
         match &events[0] {
             Event::HeroPowerActivated(activated) => {
@@ -3916,14 +4054,26 @@ mod tests {
             }
             other => panic!("expected HeroPowerActivated, got {other:?}"),
         }
+        // The default hero-power effect (DealDamage{2}) resolves against the
+        // enemy Boss (targetRef "target-1" is not an "op:" ref), dealing 2.
+        assert_eq!(events[1].event_type(), "boss.damaged");
+        match &events[1] {
+            Event::BossDamaged(damaged) => {
+                assert_eq!(damaged.player, Player::B);
+                assert_eq!(damaged.amount, 2);
+                assert_eq!(damaged.new_hp, 28); // default boss_hp 30 - 2
+            }
+            other => panic!("expected BossDamaged, got {other:?}"),
+        }
         // The paid Juice cost is deducted from the seat's available pool — the
-        // GameSession state is updated — and the single event advances version.
-        assert_eq!(session.version(), 1);
-        assert_eq!(session.uncommitted_events().len(), 1);
+        // GameSession state is updated — and both events advance the version.
+        assert_eq!(session.version(), 2);
+        assert_eq!(session.uncommitted_events().len(), 2);
         assert_eq!(
             session.uncommitted_events()[0].event_type(),
             "hero_power.activated"
         );
+        assert_eq!(session.uncommitted_events()[1].event_type(), "boss.damaged");
     }
 
     // Scenario: rejected — a hero power may only be activated when its Juice cost
@@ -4114,6 +4264,208 @@ mod tests {
         assert_eq!(command.name, ActivateHeroPower::COMMAND);
         let decoded: ActivateHeroPower = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_activate_hero_power());
+    }
+
+    // Scenario (Task 7): activating the hero power resolves its declared
+    // HeroPowerEffect (DealDamage) against the target, on top of the existing
+    // Juice deduction/HeroPowerActivated event.
+    #[test]
+    fn hero_power_deals_declared_damage_and_spends_juice() {
+        let mut session = seated_match();
+        let mut a = OutfitConfig::new("m-1-a");
+        a.max_juice = 5;
+        a.available_juice = 5;
+        a.hero_power_effect = HeroPowerEffect::DealDamage { amount: 2 };
+        a.hero_power_cost = 2;
+        session.configure_player_a(a);
+        let mut b = OutfitConfig::new("m-1-b");
+        b.boss_hp = 10;
+        session.configure_player_b(b);
+        session.set_opening_player(Some(Player::A));
+
+        let events = session
+            .execute(ActivateHeroPower::new("m-1", "m-1-a", "boss:B", 2).into_command())
+            .expect("affordable hero power");
+
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::BossDamaged(d) if d.amount == 2 && d.new_hp == 8)));
+        assert_eq!(session.outfit_at(Player::A).available_juice, 3, "5 - 2");
+    }
+
+    // Scenario (Task 7): a command that claims a lower cost than the Boss's
+    // declared hero_power_cost is rejected outright (anti-cheat) — it never
+    // reaches the Juice deduction or effect resolution.
+    #[test]
+    fn hero_power_rejects_understated_cost() {
+        let mut session = seated_match();
+        let mut a = OutfitConfig::new("m-1-a");
+        a.max_juice = 5;
+        a.available_juice = 5;
+        a.hero_power_cost = 2;
+        session.configure_player_a(a);
+        session.set_opening_player(Some(Player::A));
+        let err = session
+            .execute(ActivateHeroPower::new("m-1", "m-1-a", "boss:B", 0).into_command())
+            .expect_err("client cannot understate the declared cost");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // Scenario (Task 7): a GainArmor hero power raises the activating seat's
+    // own Boss HP, with no target-side event (mirrors CardEffect::GainJuice /
+    // Cool, which likewise mutate quietly).
+    #[test]
+    fn hero_power_gain_armor_raises_own_boss_hp() {
+        let mut session = seated_match();
+        let mut a = OutfitConfig::new("m-1-a");
+        a.max_juice = 5;
+        a.available_juice = 5;
+        a.boss_hp = 20;
+        a.hero_power_effect = HeroPowerEffect::GainArmor { amount: 5 };
+        a.hero_power_cost = 2;
+        session.configure_player_a(a);
+        session.set_opening_player(Some(Player::A));
+
+        let events = session
+            .execute(ActivateHeroPower::new("m-1", "m-1-a", "boss:B", 2).into_command())
+            .expect("affordable hero power");
+
+        assert_eq!(events.len(), 1, "GainArmor mutates quietly, no extra delta");
+        assert_eq!(session.outfit_at(Player::A).boss_hp, 25);
+    }
+
+    // Scenario (Task 7): a Cool hero power lowers the activating seat's own
+    // Heat, floored at HEAT_BOUNDS's start (never negative).
+    #[test]
+    fn hero_power_cool_lowers_own_heat_floored_at_bounds_start() {
+        let mut session = seated_match();
+        let mut a = OutfitConfig::new("m-1-a");
+        a.max_juice = 5;
+        a.available_juice = 5;
+        a.starting_heat = 1;
+        a.hero_power_effect = HeroPowerEffect::Cool { amount: 5 };
+        a.hero_power_cost = 2;
+        session.configure_player_a(a);
+        session.set_opening_player(Some(Player::A));
+
+        session
+            .execute(ActivateHeroPower::new("m-1", "m-1-a", "boss:B", 2).into_command())
+            .expect("affordable hero power");
+
+        assert_eq!(
+            session.outfit_at(Player::A).starting_heat,
+            *HEAT_BOUNDS.start()
+        );
+    }
+
+    // Scenario (Task 7): a SummonToken hero power puts an unready token unit on
+    // the activating seat's board, emitting operator.summoned after
+    // hero_power.activated.
+    #[test]
+    fn hero_power_summon_token_puts_unready_unit_on_board() {
+        let mut session = seated_match();
+        let mut a = OutfitConfig::new("m-1-a");
+        a.max_juice = 5;
+        a.available_juice = 5;
+        a.hero_power_effect = HeroPowerEffect::SummonToken { atk: 1, hp: 1 };
+        a.hero_power_cost = 2;
+        session.configure_player_a(a);
+        session.set_opening_player(Some(Player::A));
+
+        let events = session
+            .execute(ActivateHeroPower::new("m-1", "m-1-a", "boss:B", 2).into_command())
+            .expect("affordable hero power");
+
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::OperatorSummoned(s) if s.unit.atk == 1 && s.unit.hp == 1 && !s.unit.ready)));
+        assert_eq!(session.seat_state_at(Player::A).board.len(), 1);
+    }
+
+    // Scenario (Task 7): SummonToken does NOT reject the activation when the
+    // board is already at the Operator cap — the token is simply not summoned
+    // (mirrors Hearthstone hero powers), and the Juice is still spent.
+    #[test]
+    fn hero_power_summon_token_skips_silently_when_board_is_full() {
+        let mut session = seated_match();
+        let mut a = OutfitConfig::new("m-1-a");
+        a.max_juice = 5;
+        a.available_juice = 5;
+        a.hero_power_effect = HeroPowerEffect::SummonToken { atk: 1, hp: 1 };
+        a.hero_power_cost = 2;
+        session.configure_player_a(a);
+        session.set_opening_player(Some(Player::A));
+        for i in 0..MAX_OPERATORS {
+            session.seat_state_at_mut(Player::A).board.push(test_unit(
+                &format!("A-filler-{i}"),
+                1,
+                1,
+                true,
+                false,
+                &[],
+            ));
+        }
+
+        let events = session
+            .execute(ActivateHeroPower::new("m-1", "m-1-a", "boss:B", 2).into_command())
+            .expect("a full board does not reject the hero power activation");
+
+        assert_eq!(
+            events.len(),
+            1,
+            "no OperatorSummoned when the board is full"
+        );
+        assert_eq!(session.seat_state_at(Player::A).board.len(), MAX_OPERATORS);
+        assert_eq!(
+            session.outfit_at(Player::A).available_juice,
+            3,
+            "Juice is still spent"
+        );
+    }
+
+    // Scenario (Task 7): end_turn's start-of-turn trademark seam resolves the
+    // incoming seat's Boss trademark when it is Some(StartOfTurn), folding its
+    // deltas into the returned events.
+    #[test]
+    fn end_turn_resolves_incoming_seats_start_of_turn_trademark() {
+        let mut session = seated_match();
+        let mut b = OutfitConfig::new("m-1-b");
+        b.boss_hp = 10;
+        b.trademark_effect = Some(TrademarkEffect {
+            trigger: TrademarkTrigger::StartOfTurn,
+            effect: HeroPowerEffect::DealDamage { amount: 3 },
+        });
+        session.configure_player_b(b);
+        session.set_opening_player(Some(Player::A));
+
+        let events = session
+            .execute(EndTurn::new("m-1", "m-1-a").into_command())
+            .expect("a legal end of turn should succeed");
+
+        // The trademark deals 3 to the enemy Boss (A) — B's own trademark hits
+        // the opponent, same targeting convention as a hero power's default.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::BossDamaged(d) if d.amount == 3 && d.player == Player::A)));
+    }
+
+    // A default (None) trademark_effect is a no-op — the existing end_turn
+    // tests (elsewhere in this module) already cover this, but this test pins
+    // the exact event count/shape so a future change to the seam is caught.
+    #[test]
+    fn end_turn_with_no_trademark_effect_emits_no_extra_events() {
+        let mut session = seated_match();
+        session.set_opening_player(Some(Player::A));
+
+        let events = session
+            .execute(EndTurn::new("m-1", "m-1-a").into_command())
+            .expect("a legal end of turn should succeed");
+
+        assert_eq!(
+            events.len(),
+            3,
+            "readied, fatigue, ended — no trademark delta"
+        );
     }
 
     // ---- EndTurnCmd (S-7) ---------------------------------------------------

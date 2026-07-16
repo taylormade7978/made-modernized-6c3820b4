@@ -63,6 +63,62 @@ pub const LEGAL_STARTING_HP: std::ops::RangeInclusive<i64> = 30..=90;
 /// many Bosses before a launch is validated.
 pub const AUTHORITATIVE_ROSTER_SIZE: usize = 18;
 
+/// Default Juice cost of a Boss's hero power when a `DefineBossCmd` payload
+/// omits `heroPowerCost` (legacy payloads deserializing via `#[serde(default)]`).
+/// Matches the client's hardcoded 2-poke (web/src/match/rules.ts:250).
+fn default_hero_power_cost() -> u8 {
+    2
+}
+
+/// A Boss hero power's typed, resolvable effect — what `activate_hero_power`
+/// (in `game-session`) actually applies, as opposed to the inert display
+/// strings carried by [`BossDefinition`]'s `hero_powers`. Defaults to
+/// `DealDamage { amount: 2 }` (matching [`default_hero_power_cost`]) so a
+/// `DefineBossCmd`/`BossDefined` payload that omits `heroPowerEffect` still
+/// deserializes to a legal, resolvable effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum HeroPowerEffect {
+    /// Deal `amount` damage to the target (a Boss or, for `op:` refs, a unit).
+    DealDamage { amount: u8 },
+    /// Raise the activating seat's own Boss HP by `amount`.
+    GainArmor { amount: u8 },
+    /// Put a token unit with these stats on the activating seat's board.
+    SummonToken { atk: u8, hp: u8 },
+    /// Lower the activating seat's own Heat by `amount`.
+    Cool { amount: u8 },
+}
+
+impl Default for HeroPowerEffect {
+    /// The client's hardcoded 2-poke (web/src/match/rules.ts:250).
+    fn default() -> Self {
+        HeroPowerEffect::DealDamage { amount: 2 }
+    }
+}
+
+/// When a [`TrademarkEffect`] fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrademarkTrigger {
+    /// Fires at the start of the Boss's owner's turn.
+    StartOfTurn,
+    /// Fires when the Boss's owner plays a card.
+    OnPlay,
+}
+
+/// A Boss's typed, resolvable trademark: a [`TrademarkTrigger`] paired with the
+/// [`HeroPowerEffect`] it resolves. `BossDefinition` carries at most one, via
+/// `Option<TrademarkEffect>` — `None` is a legal, inert trademark (Subsystem 1
+/// default; the trademark catalog is Subsystem 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrademarkEffect {
+    /// When this trademark fires.
+    pub trigger: TrademarkTrigger,
+    /// The effect it resolves when triggered.
+    pub effect: HeroPowerEffect,
+}
+
 /// The `DefineBossCmd` payload: a proposed Boss definition in its raw,
 /// as-submitted form. Field names are the catalog's `camelCase` schema.
 ///
@@ -91,6 +147,19 @@ pub struct DefineBoss {
     /// The signature card set to launch the Boss with. Must be non-empty and
     /// every id must resolve to a valid card definition in the catalog.
     pub signature_card_ids: Vec<String>,
+    /// The Boss hero power's typed, resolvable effect. Defaults to
+    /// `DealDamage { amount: 2 }` so a payload that omits this field still
+    /// deserializes to a legal effect.
+    #[serde(default)]
+    pub hero_power_effect: HeroPowerEffect,
+    /// The Boss hero power's Juice cost. Defaults to 2 (the client's hardcoded
+    /// 2-poke) so a payload that omits this field still deserializes.
+    #[serde(default = "default_hero_power_cost")]
+    pub hero_power_cost: u8,
+    /// The Boss's typed trademark effect, if any. Defaults to `None` — an inert
+    /// trademark is legal (Subsystem 1); the trademark catalog is Subsystem 2.
+    #[serde(default)]
+    pub trademark_effect: Option<TrademarkEffect>,
 }
 
 impl DefineBoss {
@@ -123,6 +192,13 @@ pub struct BossDefined {
     pub trademark: String,
     /// The signature card set the Boss was defined with.
     pub signature_card_ids: Vec<String>,
+    /// The Boss hero power's typed, resolvable effect.
+    pub hero_power_effect: HeroPowerEffect,
+    /// The Boss hero power's Juice cost.
+    pub hero_power_cost: u8,
+    /// The Boss's typed trademark effect, if any (`None` = inert, Subsystem 1
+    /// default).
+    pub trademark_effect: Option<TrademarkEffect>,
 }
 
 /// The `AssignSignatureCardsCmd` payload: the Boss to bind and the signature
@@ -514,6 +590,9 @@ impl BossDefinition {
             hero_power,
             trademark,
             signature_card_ids: cmd.signature_card_ids,
+            hero_power_effect: cmd.hero_power_effect,
+            hero_power_cost: cmd.hero_power_cost,
+            trademark_effect: cmd.trademark_effect,
         });
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
@@ -675,6 +754,9 @@ mod tests {
             hero_powers: vec!["Smash and Grab".to_string()],
             trademarks: vec!["The Vault Door".to_string()],
             signature_card_ids: vec!["card-001".to_string(), "card-002".to_string()],
+            hero_power_effect: HeroPowerEffect::DealDamage { amount: 2 },
+            hero_power_cost: 2,
+            trademark_effect: None,
         }
     }
 
@@ -703,6 +785,33 @@ mod tests {
         assert_eq!(boss.version(), 1);
         assert_eq!(boss.uncommitted_events().len(), 1);
         assert_eq!(boss.uncommitted_events()[0].event_type(), "boss.defined");
+    }
+
+    // Scenario: a DefineBossCmd's typed hero-power effect and cost pass through
+    // untouched onto the emitted BossDefined event, alongside the existing
+    // display-string hero_power/trademark.
+    #[test]
+    fn define_boss_carries_hero_power_effect_and_cost() {
+        let mut boss = valid_boss();
+        let cmd = DefineBoss {
+            hero_power_effect: HeroPowerEffect::DealDamage { amount: 2 },
+            hero_power_cost: 2,
+            ..valid_define_cmd()
+        };
+
+        let events = boss.execute(cmd.into_command()).expect("valid boss");
+
+        match &events[0] {
+            Event::BossDefined(d) => {
+                assert_eq!(
+                    d.hero_power_effect,
+                    HeroPowerEffect::DealDamage { amount: 2 }
+                );
+                assert_eq!(d.hero_power_cost, 2);
+                assert_eq!(d.trademark_effect, None);
+            }
+            other => panic!("expected BossDefined, got {other:?}"),
+        }
     }
 
     // Scenario: DefineBossCmd rejected — every Boss has exactly one hero power and
