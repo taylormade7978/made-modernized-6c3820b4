@@ -274,6 +274,13 @@ pub struct StartMatch {
     /// Deterministic RNG seed for the match. Must be non-zero to be a valid,
     /// reproducible seed.
     pub rng_seed: u64,
+    /// The venue this match is played at (Task 10, City-pillar hook). Absent
+    /// from existing `StartMatchCmd` payloads deserializes to `None` (see
+    /// [`GameSession::apply_location_modifiers`]'s identity behavior), so this
+    /// is additive: the command path can now carry a location, matching the
+    /// [`GameSession::set_location`] server-side config method.
+    #[serde(default)]
+    pub location: Option<LocationModifier>,
 }
 
 impl StartMatch {
@@ -293,6 +300,7 @@ impl StartMatch {
             player_a_outfit: player_a.into(),
             player_b_outfit: player_b.into(),
             rng_seed: seed,
+            location: None,
         }
     }
 
@@ -1231,7 +1239,7 @@ pub struct SeatState {
 /// tables, the growing map) — Subsystem 1 ships the plumbing only, so
 /// [`GameSession`]'s `location` defaults `None` and every existing test stays
 /// green (see [`GameSession::apply_location_modifiers`]).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LocationModifier {
     pub location_id: String,
     /// Data-driven venue kind, e.g. `"bank"` | `"chop_shop"`.
@@ -1244,6 +1252,22 @@ pub struct LocationModifier {
     pub heat_multiplier: u8,
     /// Reference into the venue event table, drawn by [`ResolveVenueEvent`].
     pub event_table_ref: Option<String>,
+}
+
+/// Hand-rolled: `#[derive(Default)]` would give `heat_multiplier: 0`, silently
+/// zeroing out Heat gain at any venue built via `..Default::default()`. The
+/// documented/intended default is `1` (a no-op multiplier); every other field
+/// keeps its natural zero/empty default.
+impl Default for LocationModifier {
+    fn default() -> Self {
+        Self {
+            location_id: String::new(),
+            location_type: String::new(),
+            class_boosts: vec![],
+            heat_multiplier: 1,
+            event_table_ref: None,
+        }
+    }
 }
 
 /// One entry in the closed practice card pool: a card definition's fixed
@@ -1688,6 +1712,13 @@ impl GameSession {
             st.deck = deck;
             st.board = Vec::new();
         }
+
+        // Thread the command's venue (Task 10, Global Constraint: a match
+        // must be startable AT a venue via the command path, not only via
+        // the server-side `set_location` config method) into live state.
+        // `None` (an existing StartMatchCmd payload with no `location`)
+        // leaves `apply_location_modifiers` an identity, same as before.
+        self.location = cmd.location;
 
         let event = Event::MatchStarted(MatchStarted {
             match_id: cmd.match_id,
@@ -3096,6 +3127,51 @@ mod tests {
             session.uncommitted_events()[0].event_type(),
             "match.started"
         );
+    }
+
+    // Scenario: the Global Constraint (Task 10) requires a match be startable
+    // AT a venue via the command path, not only via the server-side
+    // `set_location` config method. A `StartMatch` carrying `Some(location)`
+    // must thread it into session state.
+    #[test]
+    fn start_match_command_carries_location_into_session() {
+        let mut session = valid_session();
+        let mut cmd = valid_cmd();
+        let location = LocationModifier {
+            location_id: "farm-1".into(),
+            location_type: "server_farm".into(),
+            class_boosts: vec![(CardClass::Hacker, 1)],
+            heat_multiplier: 2,
+            event_table_ref: Some("table-farm".into()),
+        };
+        cmd.location = Some(location.clone());
+
+        session
+            .execute(cmd.into_command())
+            .expect("a valid start carrying a location should succeed");
+
+        assert_eq!(session.location, Some(location));
+    }
+
+    // Scenario: an existing StartMatchCmd payload with no `location` field
+    // still deserializes cleanly (via `#[serde(default)]`) and leaves the
+    // session's location at `None`, exactly as before this field existed.
+    #[test]
+    fn start_match_without_location_field_deserializes_to_none() {
+        let payload = serde_json::json!({
+            "matchId": "m-1",
+            "playerAOutfit": "m-1-a",
+            "playerBOutfit": "m-1-b",
+            "rngSeed": 0xC0FFEEu64,
+        });
+        let decoded: StartMatch = serde_json::from_value(payload).unwrap();
+        assert_eq!(decoded.location, None);
+
+        let mut session = valid_session();
+        session
+            .execute(decoded.into_command())
+            .expect("a legacy payload with no location still starts the match");
+        assert_eq!(session.location, None);
     }
 
     // Scenario: StartMatch deals a deterministic opening hand from a seeded deck.
@@ -5845,6 +5921,20 @@ mod tests {
     // The City pillar's neutral venue modifier: `location: None` (the
     // default) must leave every pre-existing test above green — the hook
     // only does anything when a location is present.
+
+    // Scenario: `LocationModifier::default()` must NOT zero out Heat gain.
+    // A derived `Default` would give `heat_multiplier: 0`; the hand-rolled
+    // impl fixes it at `1` (a no-op multiplier) while every other field
+    // keeps its natural zero/empty default.
+    #[test]
+    fn location_modifier_default_heat_multiplier_is_one() {
+        let loc = LocationModifier::default();
+        assert_eq!(loc.heat_multiplier, 1);
+        assert_eq!(loc.location_id, "");
+        assert_eq!(loc.location_type, "");
+        assert!(loc.class_boosts.is_empty());
+        assert_eq!(loc.event_table_ref, None);
+    }
 
     #[test]
     fn location_none_is_identity() {
