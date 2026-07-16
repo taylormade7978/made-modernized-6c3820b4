@@ -48,7 +48,7 @@ pub const REGISTERED_EFFECTS: &[&str] = &[
 ];
 
 /// The five card types every card is exactly one of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CardType {
     Operator,
     Job,

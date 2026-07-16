@@ -71,6 +71,7 @@ use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Serialize};
 
+use domain::card_definition::CardType;
 use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Repository};
 
 /// Stable aggregate type name, surfaced in [`DomainError::UnknownCommand`] and
@@ -110,6 +111,10 @@ pub const MAX_OPERATORS: usize = 7;
 
 /// A player's board may hold at most this many Vehicles simultaneously.
 pub const MAX_VEHICLES: usize = 3;
+
+/// Cards dealt to each seat's opening hand at match start (matches the client's
+/// `OPENING_HAND`, web/src/match/rules.ts:68).
+pub const OPENING_HAND: usize = 4;
 
 /// Juice a player starts a match with (it ramps +1 each of the owner's turns).
 pub const STARTING_JUICE: u8 = 1;
@@ -897,6 +902,137 @@ impl Keyword {
     }
 }
 
+/// A card instance in a hand or deck: a definition ref + per-copy identity +
+/// resolved play-stats. Populated from CardDefinition fields at deck-build.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CardInstance {
+    pub instance_id: String,       // e.g. "A-w_the_homie-3"
+    pub card_id: String,           // definition id
+    pub cost: u8,
+    pub card_type: CardType,       // Operator/Job/Piece/Vehicle/Heist
+    pub effect: CardEffect,        // resolved effect + amount
+    pub atk: u8,                   // 0 for non-unit cards
+    pub hp: u8,                    // 0 for non-unit cards
+    pub keywords: Vec<Keyword>,
+    pub boss_lock: Option<String>, // Some(boss_id) if boss-locked (Task 8)
+}
+
+/// A unit on the board (summoned Operator or Vehicle).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BoardUnit {
+    pub instance_id: String,
+    pub card_id: String,
+    pub atk: u8,
+    pub hp: u8,
+    pub max_hp: u8,
+    pub ready: bool,      // false the turn it arrives (summoning sickness)
+    pub is_vehicle: bool, // counts against MAX_VEHICLES vs MAX_OPERATORS
+    pub keywords: Vec<Keyword>,
+}
+
+/// Live per-seat state that the scalar OutfitConfig cannot express: the hand,
+/// the ordered secret deck, and the board. Resource scalars (juice/heat/boss_hp)
+/// stay on OutfitConfig for Subsystem 1 (see Task 4 design note).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SeatState {
+    pub hand: Vec<CardInstance>,
+    pub deck: Vec<CardInstance>, // server-secret; ordered
+    pub board: Vec<BoardUnit>,
+}
+
+/// One entry in the closed practice card pool: a card definition's fixed
+/// play-stats, ported from the client's `CARD_POOL` (web/src/match/rules.ts:50).
+struct PoolCard {
+    card_id: &'static str,
+    cost: u8,
+    card_type: CardType,
+    effect: CardEffect,
+    atk: u8,
+    hp: u8,
+    keywords: &'static [Keyword],
+}
+
+/// The 14-card pool a seeded 30-card deck is drawn from. A faithful port of the
+/// client's `CARD_POOL` (web/src/match/rules.ts:50-65) — same ids, costs, types,
+/// effects+amounts, stats, and keywords — so a Rust-dealt deck matches a
+/// WASM-predicted one.
+const CARD_POOL: &[PoolCard] = &[
+    PoolCard { card_id: "bolt", cost: 1, card_type: CardType::Job, effect: CardEffect::DealDamage { amount: 3 }, atk: 0, hp: 0, keywords: &[] },
+    PoolCard { card_id: "w_corner_boy", cost: 1, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 1, hp: 2, keywords: &[] },
+    PoolCard { card_id: "pd_beat_cop", cost: 1, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 1, hp: 2, keywords: &[] },
+    PoolCard { card_id: "w_young_buck", cost: 1, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 2, hp: 1, keywords: &[] },
+    PoolCard { card_id: "w_drive_by", cost: 2, card_type: CardType::Job, effect: CardEffect::DealDamage { amount: 4 }, atk: 0, hp: 0, keywords: &[] },
+    PoolCard { card_id: "w_the_homie", cost: 2, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 3, hp: 2, keywords: &[] },
+    PoolCard { card_id: "w_the_enforcer", cost: 3, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 2, hp: 5, keywords: &[Keyword::Spotlight] },
+    PoolCard { card_id: "pd_riot_squad", cost: 5, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 4, hp: 5, keywords: &[Keyword::Spotlight] },
+    PoolCard { card_id: "pd_the_crib", cost: 2, card_type: CardType::Piece, effect: CardEffect::Cool { amount: 2 }, atk: 0, hp: 0, keywords: &[] },
+    PoolCard { card_id: "ht_the_come_up", cost: 2, card_type: CardType::Piece, effect: CardEffect::GainJuice { amount: 2 }, atk: 0, hp: 0, keywords: &[] },
+    PoolCard { card_id: "w_stolen_whip", cost: 3, card_type: CardType::Vehicle, effect: CardEffect::Summon, atk: 4, hp: 3, keywords: &[Keyword::DriveBy] },
+    PoolCard { card_id: "w_blow_the_safe", cost: 3, card_type: CardType::Job, effect: CardEffect::DrawCards { amount: 2 }, atk: 0, hp: 0, keywords: &[] },
+    PoolCard { card_id: "w_shot_caller", cost: 4, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 5, hp: 5, keywords: &[] },
+    PoolCard { card_id: "w_the_big_one", cost: 5, card_type: CardType::Heist, effect: CardEffect::DealDamage { amount: 7 }, atk: 0, hp: 0, keywords: &[] },
+];
+
+/// The client's mulberry32 PRNG (web/src/match/rules.ts:71), reproduced exactly
+/// so a Rust-dealt deck matches a WASM-predicted one bit-for-bit. JS `Math.imul`
+/// is u32 `wrapping_mul`, JS `>>>` is `>>` on `u32`, and the result is already a
+/// `u32` (no `>>> 0` coercion needed).
+fn mulberry32(mut state: u32) -> impl FnMut() -> f64 {
+    move || {
+        state = state.wrapping_add(0x6D2B_79F5);
+        let mut t = state;
+        t = (t ^ (t >> 15)).wrapping_mul(t | 1);
+        t ^= t.wrapping_add((t ^ (t >> 7)).wrapping_mul(t | 61));
+        ((t ^ (t >> 14)) as f64) / 4_294_967_296.0
+    }
+}
+
+/// Render a seat as the single-character label the client uses in instance ids.
+fn seat_label(seat: Player) -> char {
+    match seat {
+        Player::A => 'A',
+        Player::B => 'B',
+    }
+}
+
+/// Build a shuffled 30-card deck of instanced cards for `seat`, seeded. A port of
+/// the client's `buildDeck` (web/src/match/rules.ts:82): the seat's stream is
+/// `seed ^ 0x1111` (A) / `seed ^ 0x2222` (B); 30 cards are drawn from the pool
+/// then Fisher–Yates shuffled with the same stream, so instance ids and order
+/// match the client bit-for-bit.
+fn build_deck(seed: u64, seat: Player) -> Vec<CardInstance> {
+    let seat_salt: u32 = match seat {
+        Player::A => 0x1111,
+        Player::B => 0x2222,
+    };
+    let mut rng = mulberry32((seed as u32) ^ seat_salt);
+    let pool_len = CARD_POOL.len();
+    let mut cards: Vec<CardInstance> = Vec::with_capacity(30);
+    let mut n = 0usize;
+    while cards.len() < 30 {
+        let idx = (rng() * pool_len as f64).floor() as usize;
+        let def = &CARD_POOL[idx];
+        cards.push(CardInstance {
+            instance_id: format!("{}-{}-{}", seat_label(seat), def.card_id, n),
+            card_id: def.card_id.to_string(),
+            cost: def.cost,
+            card_type: def.card_type,
+            effect: def.effect,
+            atk: def.atk,
+            hp: def.hp,
+            keywords: def.keywords.to_vec(),
+            boss_lock: None,
+        });
+        n += 1;
+    }
+    // Fisher–Yates with the same seeded stream (mirrors the client's loop).
+    for i in (1..cards.len()).rev() {
+        let j = (rng() * (i as f64 + 1.0)).floor() as usize;
+        cards.swap(i, j);
+    }
+    cards
+}
+
 /// The GameSession aggregate: the authoritative state of a single match.
 ///
 /// Mirrors the shape produced by [`shared::stub_aggregate!`] (identity plus an
@@ -923,6 +1059,12 @@ pub struct GameSession {
     /// ill-formed setup with no whose-turn-it-is — an invalid start, since a
     /// command is only valid for the player whose turn it currently is.
     opening_player: Option<Player>,
+    /// Live per-seat state for player `A` (hand/deck/board). Starts empty and is
+    /// populated by [`GameSession::start_match`]; coexists with [`OutfitConfig`],
+    /// which remains the opening input and the home of the resource scalars.
+    seat_a: SeatState,
+    /// Live per-seat state for player `B` (hand/deck/board).
+    seat_b: SeatState,
 }
 
 impl GameSession {
@@ -940,6 +1082,8 @@ impl GameSession {
             player_a,
             player_b,
             opening_player: Some(Player::A),
+            seat_a: SeatState::default(),
+            seat_b: SeatState::default(),
         }
     }
 
@@ -1152,6 +1296,20 @@ impl GameSession {
         self.ensure_bosses_alive()?;
         let opening_player = self.ensure_opening_player_designated()?;
 
+        // Deal both seats from the seeded 30-card deck: the opening hand is the
+        // first OPENING_HAND cards, the rest stays as the ordered secret deck.
+        // build_deck ports the client's mulberry32/buildDeck so a WASM-predicted
+        // deal matches this one bit-for-bit.
+        let seed = cmd.rng_seed;
+        for seat in [Player::A, Player::B] {
+            let mut deck = build_deck(seed, seat);
+            let hand: Vec<CardInstance> = deck.drain(0..OPENING_HAND.min(deck.len())).collect();
+            let st = self.seat_state_at_mut(seat);
+            st.hand = hand;
+            st.deck = deck;
+            st.board = Vec::new();
+        }
+
         let event = Event::MatchStarted(MatchStarted {
             match_id: cmd.match_id,
             player_a_outfit: cmd.player_a_outfit,
@@ -1191,6 +1349,22 @@ impl GameSession {
         match seat {
             Player::A => &mut self.player_a,
             Player::B => &mut self.player_b,
+        }
+    }
+
+    /// The live [`SeatState`] (hand/deck/board) seated at `seat`.
+    pub fn seat_state_at(&self, seat: Player) -> &SeatState {
+        match seat {
+            Player::A => &self.seat_a,
+            Player::B => &self.seat_b,
+        }
+    }
+
+    /// Mutable access to the live [`SeatState`] seated at `seat`.
+    pub fn seat_state_at_mut(&mut self, seat: Player) -> &mut SeatState {
+        match seat {
+            Player::A => &mut self.seat_a,
+            Player::B => &mut self.seat_b,
         }
     }
 
@@ -1969,6 +2143,49 @@ mod tests {
             session.uncommitted_events()[0].event_type(),
             "match.started"
         );
+    }
+
+    // Scenario: StartMatch deals a deterministic opening hand from a seeded deck.
+    #[test]
+    fn start_match_deals_opening_hands_from_seeded_deck() {
+        let mut session = valid_session();
+        let events = session
+            .execute(valid_cmd().into_command())
+            .expect("a valid StartMatch deals hands");
+        assert!(events.iter().any(|e| matches!(e, Event::MatchStarted(_))));
+        // Both seats hold OPENING_HAND cards; the rest is the ordered deck.
+        assert_eq!(session.seat_state_at(Player::A).hand.len(), OPENING_HAND);
+        assert_eq!(session.seat_state_at(Player::B).hand.len(), OPENING_HAND);
+        // The remainder of the 30-card deck stays behind the hand.
+        assert_eq!(session.seat_state_at(Player::A).deck.len(), 30 - OPENING_HAND);
+        // Deterministic: same seed => identical opening hand instance ids.
+        let mut again = valid_session();
+        again.execute(valid_cmd().into_command()).unwrap();
+        let ids_a: Vec<_> = session
+            .seat_state_at(Player::A)
+            .hand
+            .iter()
+            .map(|c| c.instance_id.clone())
+            .collect();
+        let ids_a2: Vec<_> = again
+            .seat_state_at(Player::A)
+            .hand
+            .iter()
+            .map(|c| c.instance_id.clone())
+            .collect();
+        assert_eq!(ids_a, ids_a2, "the seeded deal is deterministic");
+    }
+
+    // The Rust mulberry32 port must reproduce the client's JS PRNG bit-for-bit,
+    // or a WASM-predicted deal (Task 9) diverges from the server. The expected
+    // f64s below were computed from web/src/match/rules.ts's mulberry32 for
+    // seed 0xc0ffee (first three draws).
+    #[test]
+    fn mulberry32_matches_client_js_bit_for_bit() {
+        let mut rng = mulberry32(0xc0ffee);
+        assert_eq!(rng(), 0.021141508361324668);
+        assert_eq!(rng(), 0.6661099966149777);
+        assert_eq!(rng(), 0.7799714196007699);
     }
 
     // Scenario: rejected — Juice starts at 1 (hard-capped at 10).
