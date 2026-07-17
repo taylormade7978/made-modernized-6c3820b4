@@ -80,6 +80,9 @@ pub struct CreateOutfit {
     pub outfit_class: String,
     /// Human-readable Outfit name; must be non-empty.
     pub name: String,
+    /// The Boss this Outfit is built around; must be non-empty. Only this
+    /// Boss's Outfit may deck a card locked to it (Task 8).
+    pub boss_id: String,
 }
 
 impl CreateOutfit {
@@ -87,18 +90,20 @@ impl CreateOutfit {
     pub const COMMAND: &'static str = CREATE_OUTFIT;
 
     /// Build a command starting `outfit_id` for `player_id` in `outfit_class`
-    /// with display `name`.
+    /// with display `name`, fielding Boss `boss_id`.
     pub fn new(
         outfit_id: impl Into<String>,
         player_id: impl Into<String>,
         outfit_class: impl Into<String>,
         name: impl Into<String>,
+        boss_id: impl Into<String>,
     ) -> Self {
         Self {
             outfit_id: outfit_id.into(),
             player_id: player_id.into(),
             outfit_class: outfit_class.into(),
             name: name.into(),
+            boss_id: boss_id.into(),
         }
     }
 
@@ -163,18 +168,31 @@ pub struct AddCardToOutfit {
     pub outfit_id: String,
     /// The card being added; must be non-empty.
     pub card_id: String,
+    /// The Boss the added card is locked to, if any (as recorded by the
+    /// catalog — the Outfit cannot look up the catalog cross-aggregate, so
+    /// the caller supplies the lock). `None` means the card carries no lock.
+    #[serde(default)]
+    pub boss_lock: Option<String>,
 }
 
 impl AddCardToOutfit {
     /// The command name this maps to.
     pub const COMMAND: &'static str = ADD_CARD_TO_OUTFIT;
 
-    /// Build a command adding `card_id` to `outfit_id`.
+    /// Build a command adding `card_id` (carrying no boss lock) to `outfit_id`.
     pub fn new(outfit_id: impl Into<String>, card_id: impl Into<String>) -> Self {
         Self {
             outfit_id: outfit_id.into(),
             card_id: card_id.into(),
+            boss_lock: None,
         }
+    }
+
+    /// Attach a boss lock to this command (e.g. to test the lock-enforcement
+    /// invariant), naming the Boss the catalog recorded the card as locked to.
+    pub fn with_boss_lock(mut self, boss_id: impl Into<String>) -> Self {
+        self.boss_lock = Some(boss_id.into());
+        self
     }
 
     /// Encode this command as a [`shared::Command`] carrying a JSON payload,
@@ -369,6 +387,9 @@ pub struct Outfit {
     /// Whether every card in the deck is owned in the player's collection at
     /// validation time.
     all_cards_owned: bool,
+    /// The Boss this Outfit is built around. Only this Boss may deck a card
+    /// locked to it (Task 8) — see [`Outfit::ensure_boss_lock_honored`].
+    boss_id: String,
 }
 
 impl Outfit {
@@ -388,6 +409,7 @@ impl Outfit {
             only_own_class_or_neutral: true,
             within_copy_limits: true,
             all_cards_owned: true,
+            boss_id: String::new(),
         }
     }
 
@@ -409,6 +431,11 @@ impl Outfit {
     /// Human-readable Outfit name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The Boss this Outfit is built around.
+    pub fn boss_id(&self) -> &str {
+        &self.boss_id
     }
 
     /// The number of cards currently in the deck.
@@ -463,6 +490,12 @@ impl Outfit {
         self.all_cards_owned = ok;
     }
 
+    /// Set the Boss this Outfit is built around (e.g. to test the boss-lock
+    /// enforcement invariant against a matching or mismatched lock).
+    pub fn set_boss_id(&mut self, boss_id: impl Into<String>) {
+        self.boss_id = boss_id.into();
+    }
+
     /// Legal-size invariant: an Outfit contains exactly 30 cards to be legal for
     /// saving/play.
     fn ensure_exactly_thirty(&self) -> Result<(), DomainError> {
@@ -515,6 +548,23 @@ impl Outfit {
         Ok(())
     }
 
+    /// Boss-lock invariant: a card locked to a Boss may only be added to that
+    /// Boss's Outfit. `boss_lock` is the lock the catalog recorded on the card
+    /// being added (the Outfit cannot look up the catalog cross-aggregate, so
+    /// the caller supplies it); `None` means the card carries no lock and is
+    /// always honored.
+    fn ensure_boss_lock_honored(&self, boss_lock: &Option<String>) -> Result<(), DomainError> {
+        if let Some(b) = boss_lock {
+            if b != &self.boss_id {
+                return Err(DomainError::InvariantViolation(format!(
+                    "card is locked to Boss '{b}' but this Outfit's Boss is '{}'",
+                    self.boss_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Handle `CreateOutfitCmd`: verify the command carries a valid outfit id
     /// (naming this Outfit), player id, Outfit class, and name; enforce every
     /// invariant (exactly 30 cards, own-class-or-Neutral, copy caps, and
@@ -545,6 +595,12 @@ impl Outfit {
                 self.id
             )));
         }
+        if cmd.boss_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "outfit '{}' requires a valid bossId to be created",
+                self.id
+            )));
+        }
         // The command must name the Outfit it is dispatched to.
         if cmd.outfit_id != self.id {
             return Err(DomainError::InvariantViolation(format!(
@@ -562,6 +618,7 @@ impl Outfit {
         self.player_id = cmd.player_id.clone();
         self.outfit_class = cmd.outfit_class.clone();
         self.name = cmd.name.clone();
+        self.boss_id = cmd.boss_id.clone();
 
         let event = Event::OutfitCreated(OutfitCreated {
             outfit_id: cmd.outfit_id,
@@ -599,7 +656,9 @@ impl Outfit {
             )));
         }
 
-        // Enforce every invariant before recording the addition.
+        // Enforce every invariant before recording the addition. The boss-lock
+        // check runs first: only Boss X's Outfit may deck a card locked to X.
+        self.ensure_boss_lock_honored(&cmd.boss_lock)?;
         self.ensure_exactly_thirty()?;
         self.ensure_only_own_class_or_neutral()?;
         self.ensure_within_copy_limits()?;
@@ -800,12 +859,14 @@ mod tests {
         outfit.set_only_own_class_or_neutral(true);
         outfit.set_within_copy_limits(true);
         outfit.set_all_cards_owned(true);
+        outfit.set_boss_id("boss-solomon");
         outfit
     }
 
-    /// A command starting outfit `o-01` for player `p-01` as a Hacker Outfit.
+    /// A command starting outfit `o-01` for player `p-01` as a Hacker Outfit
+    /// fielding Boss `boss-solomon`.
     fn valid_create_cmd() -> CreateOutfit {
-        CreateOutfit::new("o-01", "p-01", "Hacker", "Trace Route")
+        CreateOutfit::new("o-01", "p-01", "Hacker", "Trace Route", "boss-solomon")
     }
 
     // Scenario: Successfully execute CreateOutfitCmd.
@@ -905,7 +966,7 @@ mod tests {
     #[test]
     fn create_rejects_command_for_a_different_outfit() {
         let mut outfit = ready_outfit();
-        let cmd = CreateOutfit::new("o-99", "p-01", "Hacker", "Trace Route");
+        let cmd = CreateOutfit::new("o-99", "p-01", "Hacker", "Trace Route", "boss-solomon");
 
         let err = outfit
             .execute(cmd.into_command())
@@ -918,10 +979,11 @@ mod tests {
     #[test]
     fn create_rejects_command_with_missing_fields() {
         for cmd in [
-            CreateOutfit::new("   ", "p-01", "Hacker", "Trace Route"),
-            CreateOutfit::new("o-01", "   ", "Hacker", "Trace Route"),
-            CreateOutfit::new("o-01", "p-01", "   ", "Trace Route"),
-            CreateOutfit::new("o-01", "p-01", "Hacker", "   "),
+            CreateOutfit::new("   ", "p-01", "Hacker", "Trace Route", "boss-solomon"),
+            CreateOutfit::new("o-01", "   ", "Hacker", "Trace Route", "boss-solomon"),
+            CreateOutfit::new("o-01", "p-01", "   ", "Trace Route", "boss-solomon"),
+            CreateOutfit::new("o-01", "p-01", "Hacker", "   ", "boss-solomon"),
+            CreateOutfit::new("o-01", "p-01", "Hacker", "Trace Route", "   "),
         ] {
             let mut outfit = ready_outfit();
             let err = outfit
@@ -1340,6 +1402,35 @@ mod tests {
         assert_eq!(command.name, AddCardToOutfit::COMMAND);
         let decoded: AddCardToOutfit = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_add_cmd());
+    }
+
+    // Scenario: AddCardToOutfitCmd rejected — a card locked to a Boss may only
+    // be added to that Boss's Outfit (Task 8).
+    #[test]
+    fn outfit_rejects_boss_locked_card_for_wrong_boss() {
+        let mut outfit = ready_outfit(); // boss_id = "boss-solomon"
+        let cmd = valid_add_cmd().with_boss_lock("boss-someone-else");
+
+        let err = outfit
+            .execute(cmd.into_command())
+            .expect_err("a card locked to a different Boss must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(outfit.version(), 0);
+    }
+
+    // Scenario: AddCardToOutfitCmd accepted — a card locked to this Outfit's own
+    // Boss is legal to deck (Task 8).
+    #[test]
+    fn outfit_accepts_boss_locked_card_for_matching_boss() {
+        let mut outfit = ready_outfit(); // boss_id = "boss-solomon"
+        let cmd = valid_add_cmd().with_boss_lock("boss-solomon");
+
+        let events = outfit
+            .execute(cmd.into_command())
+            .expect("a card locked to this Outfit's own Boss is legal");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "card.added.to.outfit");
+        assert_eq!(outfit.version(), 1);
     }
 
     /// A command saving outfit `o-01`.

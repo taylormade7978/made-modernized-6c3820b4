@@ -32,6 +32,17 @@ export interface Card {
   readonly effectScriptRef: string
   /** Max copies of this card allowed in a single deck. */
   readonly copyCap: number
+  /** Generated card art path (served under /assets/cards). */
+  readonly art?: string | null
+  /** Rules text printed on the card. */
+  readonly text?: string | null
+  /** Heat (wanted-level) cost printed bottom-left. */
+  readonly heat?: number | null
+  /** Attack / HP for board cards (Operators, Vehicles). */
+  readonly atk?: number | null
+  readonly hp?: number | null
+  /** Hue-rotate degrees applied to reused art so cards read distinct. */
+  readonly artTint?: number | null
 }
 
 /** Release channel of an expansion set (mirrors `ExpansionReleased.release_channel`). */

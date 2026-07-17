@@ -1,9 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap');
+
 :root {
-  --bg: #0b0d12;
-  --surface: #151a23;
-  --text: #e7ecf3;
-  --muted: #8b97a8;
-  --accent: #4c8bf5;
+  /* MADE cyberpunk theme — ported from the made-site design reference:
+     cyan/magenta/amber neon on near-black, synthwave-grid mood. */
+  --bg: #04050a;
+  --bg-deep: #070912;
+  --surface: #12172a;
+  --surface-glass: rgba(18, 23, 42, 0.55);
+  --text: #e6f1ff;
+  --muted: #8493b4;
+  --faint: #4c5878;
+  --line: #1d2438;
+  --line-hot: rgba(0, 229, 255, 0.28);
+  --accent: #00e5ff;
+  --accent-glow: #6ef6ff;
+  --magenta: #ff2d8e;
+  --amber: #ffb01f;
+  --purple: #b14aff;
+  --font-display: 'Bebas Neue', 'Impact', sans-serif;
+  --font-tech: 'Chakra Petch', 'Bebas Neue', sans-serif;
+  --font-body: 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Menlo', monospace;
+  --glow-cyan: 0 0 18px rgba(0, 229, 255, 0.45);
+  --glow-magenta: 0 0 18px rgba(255, 45, 142, 0.45);
+  --glow-amber: 0 0 18px rgba(255, 176, 31, 0.4);
   color-scheme: dark;
 }
 
@@ -19,9 +39,15 @@ body,
 }
 
 body {
-  background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-family: var(--font-body);
+  /* Synthwave ground: deep radial neon wash over a faint scanline grid. */
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(1200px 600px at 50% -10%, rgba(0, 229, 255, 0.08), transparent 60%),
+    radial-gradient(900px 500px at 100% 110%, rgba(255, 45, 142, 0.07), transparent 60%),
+    linear-gradient(to bottom, transparent 0 2px, rgba(0, 229, 255, 0.035) 2px 4px);
+  background-attachment: fixed;
   /* Respect device safe areas (notches) in a native/standalone shell. */
   padding: env(safe-area-inset-top) env(safe-area-inset-right)
     env(safe-area-inset-bottom) env(safe-area-inset-left);
@@ -37,6 +63,9 @@ body {
   flex: 1;
   overflow-y: auto;
   padding: 1.25rem;
+  /* Positioning context so the absolutely-positioned Match view fills the
+     content area (below the HUD header + nav), not the whole viewport. */
+  position: relative;
 }
 
 .app__nav {
@@ -289,6 +318,116 @@ body {
   grid-template-columns: repeat(2, 1fr);
   gap: 0.5rem;
 }
+
+/* ── Board operators (attackers) + hand (playable cards) ────────────────────── */
+.match__board { display: flex; flex-wrap: wrap; gap: 0.5rem; min-height: 2.4rem; padding: 0.5rem 0; align-items: center; }
+.match__hand { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.5rem 0 0.75rem; align-items: stretch; }
+.match__hint { font-family: var(--font-mono, monospace); font-size: 0.72rem; color: var(--muted); }
+.op {
+  display: flex; flex-direction: column; align-items: center; gap: 0.1rem; padding: 0.4rem 0.7rem;
+  border-radius: 6px; border: 1px solid var(--line-hot, #2a3350); background: rgba(20,26,44,0.9); color: var(--text); cursor: default;
+}
+.op--ready { border-color: var(--accent); box-shadow: 0 0 12px rgba(80,220,255,0.35); cursor: pointer; }
+.op--ready:hover { background: rgba(80,220,255,0.14); }
+.op:disabled { opacity: 0.55; }
+.op__name { font-family: var(--font-tech, sans-serif); font-size: 0.78rem; }
+.op__stats { font-family: var(--font-mono, monospace); font-size: 0.72rem; color: var(--amber); }
+.handcard {
+  display: grid; grid-template-rows: auto auto 1fr; gap: 0.15rem; width: 116px; min-height: 92px; padding: 0.45rem 0.5rem 0.5rem;
+  position: relative; text-align: left; border-radius: 7px; border: 1px solid var(--line-hot, #2a3350);
+  background: linear-gradient(180deg, rgba(28,34,56,0.95), rgba(10,14,26,0.98)); color: var(--text); cursor: pointer;
+  transition: transform 0.1s, box-shadow 0.1s;
+}
+.handcard:hover:not(:disabled) { transform: translateY(-4px); box-shadow: 0 8px 20px rgba(0,0,0,0.5), 0 0 16px rgba(80,220,255,0.3); }
+.handcard:disabled { opacity: 0.5; cursor: not-allowed; }
+.handcard__cost {
+  position: absolute; top: -8px; left: -8px; width: 24px; height: 24px; border-radius: 50%;
+  display: grid; place-items: center; font-family: var(--font-display, sans-serif); font-size: 0.85rem; color: #04141a;
+  background: radial-gradient(circle at 30% 25%, var(--accent-glow, #7ff), #044a5a); border: 2px solid #021e26;
+}
+.handcard { padding-top: 44px; }
+.handcard__art {
+  position: absolute; top: 0; left: 0; right: 0; height: 40px; border-radius: 6px 6px 0 0;
+  background-size: cover; background-position: center; background-color: #0a0f1c;
+}
+.handcard__name { font-family: var(--font-tech, sans-serif); font-weight: 600; font-size: 0.8rem; margin-top: 0.1rem; }
+.handcard__text { font-size: 0.66rem; color: var(--muted); line-height: 1.3; }
+.handcard__cost { z-index: 2; }
+
+/* ── Match result (win / loss) ─────────────────────────────────────────────── */
+.match__result {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.6rem;
+  background: rgba(4,6,12,0.82); backdrop-filter: blur(3px); border-radius: 10px; z-index: 5;
+}
+.match__result-title { font-family: var(--font-display, sans-serif); font-size: 2rem; }
+.match__result--win .match__result-title { color: var(--green, #38e08a); text-shadow: 0 0 18px rgba(56,224,138,0.5); }
+.match__result--loss .match__result-title { color: var(--magenta); text-shadow: 0 0 18px rgba(255,45,142,0.5); }
+.match__result-sub { font-family: var(--font-mono, monospace); font-size: 0.8rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+
+/* ── DOM board (phase 1: interactive over the canvas) ──────────────────────── */
+.match__canvas--hidden { display: none; }
+.match__mid { text-align: center; font-family: var(--font-mono, monospace); font-size: 0.7rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); padding: 0.2rem 0; }
+.bossbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.5rem 0.9rem;
+  border: 1px solid var(--line-hot, #2a3350); border-radius: 7px; background: linear-gradient(180deg, rgba(20,26,44,0.9), rgba(8,11,22,0.95));
+}
+.bossbar--target { cursor: pointer; border-color: var(--magenta); box-shadow: 0 0 16px rgba(255,45,142,0.4); }
+.bossbar--target:hover { background: rgba(255,45,142,0.14); }
+.bossbar__id { display: flex; align-items: baseline; gap: 0.6rem; }
+.bossbar__seat { font-family: var(--font-mono, monospace); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.bossbar__hp { font-family: var(--font-display, sans-serif); font-size: 1.2rem; color: #ff5b7a; }
+.bossbar__meters { display: flex; gap: 1rem; font-family: var(--font-mono, monospace); font-size: 0.72rem; }
+.bossbar__heat { color: var(--amber); } .bossbar__juice { color: var(--accent); }
+.bossbar__aim { font-family: var(--font-mono, monospace); font-size: 0.7rem; color: var(--magenta); }
+
+.board { display: flex; flex-wrap: wrap; gap: 0.5rem; min-height: 4.2rem; padding: 0.5rem; border-radius: 7px; align-items: center; background: rgba(255,255,255,0.015); border: 1px dashed transparent; }
+.board--targeting { border-color: rgba(255,45,142,0.4); }
+.board--you { background: rgba(80,220,255,0.04); }
+
+.unit {
+  position: relative; display: flex; flex-direction: column; align-items: center; gap: 0.1rem; width: 88px; padding: 0.35rem;
+  border-radius: 6px; border: 1px solid var(--line-hot, #2a3350); background: rgba(12,16,28,0.95); color: var(--text); cursor: pointer;
+}
+.unit__art { width: 100%; height: 42px; border-radius: 4px; background-size: cover; background-position: center; background-color: #0a0f1c; }
+.unit__name { font-family: var(--font-tech, sans-serif); font-size: 0.72rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 80px; }
+.unit__stats { font-family: var(--font-mono, monospace); font-size: 0.72rem; color: var(--amber); }
+.unit__kw { position: absolute; top: 2px; right: 2px; font-family: var(--font-mono, monospace); font-size: 0.5rem; text-transform: uppercase; color: #04141a; background: var(--accent); padding: 0 3px; border-radius: 2px; }
+.unit--armed { border-color: var(--accent); box-shadow: 0 0 10px rgba(80,220,255,0.3); }
+.unit--sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent), 0 0 16px rgba(80,220,255,0.6); transform: translateY(-3px); }
+.unit--spotlight { border-color: var(--amber); }
+.unit--target { border-color: var(--magenta); box-shadow: 0 0 14px rgba(255,45,142,0.5); cursor: crosshair; }
+.unit--target:hover { background: rgba(255,45,142,0.16); }
+
+.handcard--sel { border-color: var(--magenta); box-shadow: 0 0 0 2px var(--magenta), 0 8px 20px rgba(0,0,0,0.5); transform: translateY(-4px); }
+.handcard__cost--short { background: radial-gradient(circle at 30% 25%, #ff6b8a, #7a0a1e) !important; }
+
+.match__targeting { text-align: center; font-family: var(--font-mono, monospace); font-size: 0.75rem; color: var(--magenta); padding: 0.3rem; }
+.match__cancel { background: none; border: none; color: var(--accent); cursor: pointer; text-decoration: underline; font: inherit; }
+
+.detail {
+  position: fixed; right: 1rem; bottom: 5.5rem; width: 230px; z-index: 20; padding: 0.6rem; display: flex; gap: 0.6rem;
+  border: 1px solid var(--accent); border-radius: 8px; background: rgba(8,11,22,0.97); box-shadow: 0 12px 40px rgba(0,0,0,0.6), 0 0 20px rgba(80,220,255,0.25);
+}
+.detail__x { position: absolute; top: 2px; right: 6px; background: none; border: none; color: var(--muted); font-size: 1rem; cursor: pointer; }
+.detail__art { flex: 0 0 60px; height: 84px; border-radius: 5px; background-size: cover; background-position: center; background-color: #0a0f1c; }
+.detail__body { flex: 1; min-width: 0; }
+.detail__head { display: flex; justify-content: space-between; align-items: center; gap: 0.4rem; }
+.detail__name { font-family: var(--font-display, sans-serif); font-size: 0.95rem; }
+.detail__cost { font-family: var(--font-mono, monospace); font-size: 0.72rem; color: #04141a; background: var(--accent); border-radius: 50%; width: 20px; height: 20px; display: grid; place-items: center; }
+.detail__type { font-family: var(--font-mono, monospace); font-size: 0.6rem; text-transform: uppercase; color: var(--accent); }
+.detail__text { font-size: 0.72rem; color: var(--muted); line-height: 1.35; margin: 0.3rem 0 0; }
+.match__actions { grid-template-columns: repeat(3, 1fr); }
+
+/* drag-and-drop affordances */
+.board--drop { border-color: var(--accent); background: rgba(80,220,255,0.1); box-shadow: inset 0 0 20px rgba(80,220,255,0.15); }
+.handcard--drag { opacity: 0.45; }
+.handcard { cursor: grab; }
+.handcard:active { cursor: grabbing; }
+.detail__play {
+  margin-top: 0.5rem; width: 100%; padding: 0.4rem; font-family: var(--font-tech, sans-serif); font-weight: 600; font-size: 0.8rem;
+  color: #04141a; background: var(--accent); border: none; border-radius: 5px; cursor: pointer;
+}
+.detail__play:hover { filter: brightness(1.1); }
 
 .match__action {
   padding: 0.75rem 0.5rem;
@@ -920,3 +1059,596 @@ body {
     grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
   }
 }
+
+/* ============================================================================
+   MADE cyberpunk theme layer — ported from the made-site design reference.
+   Applies the neon aesthetic on top of the existing BEM layout: display-font
+   headings with cyan glow, tech-font neon nav, glowing controls, glass cards,
+   scanline chrome. Kept as an append-only override so layout rules are intact.
+   ============================================================================ */
+
+/* Titles: condensed display face, uppercase, cyan neon with a magenta offset. */
+.view__title,
+.login__title,
+.shop__title,
+.deck__title,
+.ranks__title,
+.story__title,
+.match__title {
+  font-family: var(--font-display);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+  text-shadow: 0 0 22px rgba(0, 229, 255, 0.35), 2px 2px 0 rgba(255, 45, 142, 0.55);
+}
+
+/* Section/sub headings + labels in the tech face. */
+.shop__section-title,
+.deck__pane-title,
+.shop__card-name,
+.deck__field-label,
+.story__boss-label,
+.app__nav-link {
+  font-family: var(--font-tech);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Numbers / costs / meta in mono. */
+.deck__cost,
+.deck__count,
+.shop__price,
+.deck__count-badge,
+.deck__meta,
+.match__action {
+  font-family: var(--font-mono);
+}
+
+/* Bottom nav: glass bar, hot cyan top line, glowing active tab. */
+.app__nav {
+  background: var(--surface-glass);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid var(--line-hot);
+}
+.app__nav-link {
+  color: var(--muted);
+  border: 1px solid transparent;
+}
+.app__nav-link--active {
+  color: var(--accent);
+  background: linear-gradient(180deg, rgba(0, 229, 255, 0.16), rgba(0, 229, 255, 0.04));
+  border: 1px solid var(--line-hot);
+  box-shadow: var(--glow-cyan);
+  text-shadow: 0 0 10px rgba(0, 229, 255, 0.6);
+}
+
+/* Primary actions: neon cyan slab with glow; hover ramps the glow. */
+.deck__btn--primary,
+.shop__btn,
+.ranks__btn,
+.story__btn,
+.login__cta {
+  font-family: var(--font-tech);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #04141a;
+  background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  border: 1px solid var(--accent);
+  border-radius: 0.5rem;
+  box-shadow: var(--glow-cyan);
+  transition: box-shadow 0.15s ease, transform 0.05s ease;
+}
+/* Secondary text link ("use a different account"): keep it quiet, cyan tint. */
+.login__link {
+  color: var(--accent);
+  text-decoration-color: var(--line-hot);
+}
+.deck__btn--primary:hover,
+.shop__btn:hover,
+.ranks__btn:hover,
+.story__btn:hover,
+.login__cta:hover {
+  box-shadow: 0 0 26px rgba(0, 229, 255, 0.7);
+}
+.deck__btn--primary:active,
+.shop__btn:active,
+.ranks__btn:active,
+.story__btn:active {
+  transform: translateY(1px);
+}
+
+/* Cards / panels: dark glass with a hot cyan edge + depth glow. */
+.shop__card,
+.deck__pane,
+.deck__saved,
+.story,
+.ranks {
+  background: var(--surface-glass);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), inset 0 0 0 1px rgba(0, 229, 255, 0.06);
+}
+.shop__card:hover {
+  border-color: var(--line-hot);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), var(--glow-cyan);
+}
+
+/* Legendary / rarity accents pick up magenta + amber neon. */
+.deck__tag--legendary {
+  color: var(--amber);
+  text-shadow: var(--glow-amber);
+  border-color: var(--amber);
+}
+
+/* Errors in crit-magenta. */
+.deck__error,
+.shop__error,
+.story__error,
+.login__error {
+  color: var(--magenta);
+  text-shadow: var(--glow-magenta);
+}
+
+/* Inputs: dark field, cyan focus ring. */
+.deck__input,
+.deck__select,
+.deck__field {
+  background: var(--bg-deep);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  font-family: var(--font-mono);
+}
+.deck__input:focus,
+.deck__select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--glow-cyan);
+}
+
+/* ── Branded HUD header + responsive nav rail ──────────────────────────────
+   Mobile: brand on top, nav as a thumb-reachable bottom tab bar.
+   Wide (>=720px): brand + nav read as a top HUD console. */
+.app__brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--line-hot);
+  background: var(--surface-glass);
+  backdrop-filter: blur(8px);
+}
+.app__wordmark {
+  font-family: var(--font-display);
+  font-size: 1.9rem;
+  line-height: 1;
+  letter-spacing: 0.1em;
+  color: var(--text);
+  text-shadow: 0 0 22px rgba(0, 229, 255, 0.5), 2px 2px 0 rgba(255, 45, 142, 0.6);
+}
+.app__tagline {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--muted);
+  letter-spacing: 0.08em;
+}
+
+/* Bottom tab bar on narrow screens keeps thumb reach (order: content, nav). */
+@media (max-width: 719px) {
+  .app__nav { order: 3; border-top: 1px solid var(--line-hot); border-bottom: none; }
+  .app__content { order: 2; }
+}
+/* Wide screens: nav becomes a centered top rail under the brand. */
+@media (min-width: 720px) {
+  .app__nav {
+    justify-content: center;
+    gap: 0.5rem;
+    border-bottom: 1px solid var(--line-hot);
+    border-top: none;
+  }
+  .app__nav-link { flex: 0 0 auto; padding: 0.5rem 1.1rem; }
+  /* Use the page width: a wide reading measure with comfortable gutters, not a
+     narrow centered column. Content stretches to the viewport minus padding. */
+  .app__content { max-width: 1800px; margin: 0 auto; width: 100%; padding: 1.5rem 2.5rem; }
+}
+
+/* ============================================================================
+   Data-screen cyberpunk pass — leaderboard, shop grid, collection grid.
+   Targets each view's own BEM classes on top of the theme token layer.
+   ============================================================================ */
+
+/* ── Leaderboard: a neon ranked table ─────────────────────────────────────── */
+.ranks__head { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+.ranks__season { font-family: var(--font-mono); color: var(--muted); font-size: 0.8rem; }
+.ranks__season-id { color: var(--accent); }
+.ranks__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+.ranks__list > * ,
+.ranks__row {
+  display: grid;
+  grid-template-columns: 3rem 1fr auto auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.7rem 0.9rem;
+  background: var(--surface-glass);
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+}
+.ranks__rank {
+  font-family: var(--font-display);
+  font-size: 1.3rem;
+  text-align: center;
+  color: var(--muted);
+}
+/* Top-3 get medal glows: cyan / magenta / amber. */
+.ranks__list > *:nth-child(1) { border-color: var(--line-hot); box-shadow: var(--glow-cyan); }
+.ranks__list > *:nth-child(1) .ranks__rank { color: var(--accent); text-shadow: 0 0 12px rgba(0,229,255,0.7); }
+.ranks__list > *:nth-child(2) .ranks__rank { color: var(--magenta); text-shadow: var(--glow-magenta); }
+.ranks__list > *:nth-child(3) .ranks__rank { color: var(--amber); text-shadow: var(--glow-amber); }
+.ranks__name { font-family: var(--font-tech); letter-spacing: 0.03em; }
+.ranks__rating { font-family: var(--font-mono); color: var(--accent); }
+.ranks__stars { font-family: var(--font-mono); color: var(--amber); }
+.ranks__pager { display: flex; align-items: center; gap: 0.75rem; justify-content: center; margin-top: 1rem; }
+.ranks__page-label { font-family: var(--font-mono); color: var(--muted); font-size: 0.85rem; }
+
+/* ── Shop: responsive neon card grid ──────────────────────────────────────── */
+.shop__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.shop__card { display: flex; flex-direction: column; gap: 0.5rem; padding: 1rem; }
+.shop__card-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.shop__card-name { font-size: 1.05rem; }
+.shop__card-desc { color: var(--muted); font-size: 0.85rem; flex: 1; }
+.shop__kind {
+  font-family: var(--font-mono); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em;
+  padding: 0.15rem 0.5rem; border-radius: 999px; border: 1px solid var(--line-hot); color: var(--accent);
+}
+.shop__kind--token { color: var(--magenta); border-color: rgba(255,45,142,0.4); }
+.shop__card--token { border-color: rgba(255,45,142,0.28); }
+.shop__card--token:hover { box-shadow: var(--glow-magenta); border-color: var(--magenta); }
+.shop__price { font-family: var(--font-mono); font-size: 1.15rem; color: var(--amber); text-shadow: var(--glow-amber); }
+
+/* ── Collection / deck builder: card grid with cost + rarity chips ─────────── */
+.deck__filters { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.75rem 0; }
+.deck__cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.75rem;
+}
+.deck__card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.75rem;
+  min-height: 84px;
+  background: linear-gradient(160deg, var(--surface-glass), rgba(4,20,26,0.6));
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.05s ease;
+}
+.deck__card:hover { border-color: var(--line-hot); box-shadow: var(--glow-cyan); transform: translateY(-2px); }
+.deck__card-name { font-family: var(--font-tech); font-size: 0.9rem; letter-spacing: 0.02em; }
+/* Juice cost: a glowing cyan coin in the top-left. */
+.deck__cost {
+  position: absolute; top: -0.5rem; left: -0.5rem;
+  width: 1.7rem; height: 1.7rem; display: grid; place-items: center;
+  font-family: var(--font-mono); font-weight: 600; font-size: 0.85rem;
+  color: #04141a; background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  border-radius: 50%; box-shadow: var(--glow-cyan);
+}
+.deck__count-badge {
+  align-self: flex-end; font-family: var(--font-mono); font-size: 0.7rem;
+  color: var(--muted); padding: 0.1rem 0.4rem; border: 1px solid var(--line); border-radius: 999px;
+}
+.deck__head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+.deck__empty, .shop__empty, .ranks__empty {
+  color: var(--muted); font-family: var(--font-mono); text-align: center; padding: 2rem;
+}
+
+/* ============================================================================
+   Match / Story / Login cyberpunk pass.
+   ============================================================================ */
+
+/* ── Match: HUD bar, neon segmented mode toggle, framed stage ──────────────── */
+.match__bar {
+  padding: 0.5rem 0.75rem;
+  background: var(--surface-glass);
+  border: 1px solid var(--line-hot);
+  border-radius: 0.6rem;
+}
+.match__modes {
+  display: inline-flex;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px;
+}
+.match__mode {
+  border: none; background: none; cursor: pointer;
+  font-family: var(--font-tech); text-transform: uppercase; letter-spacing: 0.05em;
+  font-size: 0.72rem; color: var(--muted); padding: 0.35rem 0.9rem; border-radius: 999px;
+}
+.match__mode--on {
+  color: #04141a;
+  background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  box-shadow: var(--glow-cyan);
+}
+.match__status {
+  font-family: var(--font-mono); font-size: 0.72rem;
+  padding: 0.25rem 0.6rem; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--bg-deep);
+}
+.match__status--open, .match__status--practice { color: var(--green); border-color: rgba(43,255,136,0.35); }
+.match__status--reconnecting { color: var(--amber); border-color: rgba(255,176,31,0.35); }
+.match__status--closed { color: var(--magenta); border-color: rgba(255,45,142,0.35); }
+.match__stage {
+  border: 1px solid var(--line-hot);
+  box-shadow: inset 0 0 40px rgba(0,229,255,0.06), 0 12px 40px rgba(0,0,0,0.6);
+  background:
+    linear-gradient(to bottom, transparent 0 2px, rgba(0,229,255,0.04) 2px 4px),
+    radial-gradient(120% 80% at 50% 0%, rgba(0,229,255,0.06), transparent 60%),
+    var(--bg-deep);
+}
+.match__action--primary {
+  color: #04141a; border-color: var(--accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  box-shadow: var(--glow-cyan);
+}
+.match__action--danger { color: var(--magenta); border-color: rgba(255,45,142,0.5); background: rgba(255,45,142,0.08); }
+.match__correction { background: rgba(255,45,142,0.12); border-color: rgba(255,45,142,0.5); color: var(--magenta-glow, #ff77c0); }
+
+/* ── Story: mission grid + boss HP bar ────────────────────────────────────── */
+.story__grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1rem; margin-top: 1rem;
+}
+.story__boss {
+  display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.6rem; align-items: baseline;
+  margin: 0.5rem 0; padding: 0.6rem 0.75rem; border: 1px solid var(--line-hot);
+  border-radius: 6px; background: rgba(255,45,142,0.06);
+}
+.story__boss-label { color: var(--magenta); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.05em; align-self: center; }
+.story__boss-name { font-family: var(--font-display); font-size: 1.05rem; letter-spacing: 0.03em; line-height: 1.2; min-width: 0; }
+.story__boss-hp { font-family: var(--font-mono); font-size: 0.75rem; color: var(--amber); white-space: nowrap; }
+.story__mission-name { font-family: var(--font-tech); letter-spacing: 0.02em; }
+.story__mission-desc { color: var(--muted); font-size: 0.85rem; }
+.story__ai-budget { font-family: var(--font-mono); font-size: 0.72rem; color: var(--purple); }
+.story__cleared {
+  font-family: var(--font-mono); font-size: 0.7rem; color: var(--green);
+  border: 1px solid rgba(43,255,136,0.4); border-radius: 999px; padding: 0.1rem 0.5rem;
+  text-shadow: 0 0 10px rgba(43,255,136,0.5);
+}
+
+/* ── Login polish ─────────────────────────────────────────────────────────── */
+.login { gap: 1.25rem; }
+.login__identity {
+  background: var(--surface-glass);
+  border: 1px solid var(--line-hot);
+  box-shadow: inset 0 0 0 1px rgba(0,229,255,0.05);
+}
+.login__identity dt { font-family: var(--font-mono); }
+.login__identity dd { font-family: var(--font-tech); }
+.login__note { font-family: var(--font-mono); color: var(--faint); }
+
+/* Deck card button: stack cost-coin(row) / full-width name / tag+count so names
+   are never truncated (the button's default row squeezed the name to ~33px). */
+.deck__card-btn {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.3rem;
+  width: 100%;
+  padding: 0.2rem 0.1rem;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.deck__card-name {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  width: auto;
+  font-family: var(--font-tech);
+  font-size: 0.9rem;
+  line-height: 1.15;
+}
+.deck__card-btn .deck__tag {
+  justify-self: start;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.05rem 0.45rem;
+}
+.deck__tag--legendary { color: var(--amber); border-color: rgba(255,176,31,0.4); text-shadow: var(--glow-amber); }
+.deck__owned { font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); justify-self: start; }
+
+/* ============================================================================
+   Card design — matched to the made-site reference: art band, cost coin,
+   colored type badge, rules text, heat, rarity-tinted border. Applies to the
+   collection/deck grid cards.
+   ============================================================================ */
+.deck__cards {
+  grid-template-columns: repeat(auto-fill, minmax(184px, 1fr));
+  gap: 0.9rem;
+}
+.deck__card {
+  position: relative;
+  overflow: visible;
+  background: linear-gradient(180deg, #131a2e 0%, #06080f 100%);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-height: 0;
+  transition: transform 0.13s ease, box-shadow 0.13s ease, border-color 0.13s ease;
+}
+.deck__card:hover { transform: translateY(-4px); border-color: var(--accent); box-shadow: 0 12px 28px rgba(0,0,0,0.7), var(--glow-cyan); z-index: 5; }
+/* Rarity-tinted borders (demo: legendary amber, epic purple, rare blue…). */
+.deck__card--legendary { border-color: var(--amber); box-shadow: inset 0 0 16px rgba(255,176,31,0.12); }
+.deck__card--legendary:hover { box-shadow: var(--glow-amber); }
+.deck__card--epic { border-color: var(--purple); }
+.deck__card--rare { border-color: var(--blue); }
+.deck__card--uncommon { border-color: var(--green); }
+
+.deck__card-btn {
+  display: flex; flex-direction: column; gap: 0.35rem;
+  width: 100%; padding: 0.6rem; background: none; border: none; color: inherit;
+  cursor: pointer; text-align: left;
+}
+.deck__card-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+/* Cost coin — cyan neon, top-left, overhanging. */
+.deck__cost {
+  position: absolute; top: -10px; left: -10px; width: 30px; height: 30px; border-radius: 50%;
+  background: radial-gradient(circle at 30% 25%, var(--accent-glow), #044a5a);
+  color: #04141a; border: 2px solid #021e26; display: grid; place-items: center;
+  font-family: var(--font-display); font-size: 1.05rem; box-shadow: var(--glow-cyan); z-index: 2;
+}
+/* Art band — the generated card art fills the top; initial-letter fallback. */
+.deck__art {
+  width: 100%; height: 88px; border-radius: 3px; margin-bottom: 0.15rem;
+  background-color: #0a0f1c; background-size: cover; background-position: center top;
+  display: grid; place-items: center;
+  font-family: var(--font-display); font-size: 2.4rem; color: rgba(255,255,255,0.5);
+}
+.deck__card-name { font-family: var(--font-tech); font-weight: 600; font-size: 0.9rem; color: var(--text); }
+.deck__badges { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+.deck__type {
+  font-family: var(--font-mono); font-size: 0.56rem; font-weight: 700; letter-spacing: 0.08em;
+  padding: 1px 5px; border-radius: 2px; text-transform: uppercase; color: var(--bg-void, #04050a);
+}
+.deck__type--operator { background: var(--purple); color: #fff; }
+.deck__type--job { background: var(--accent); color: #04141a; }
+.deck__type--piece { background: var(--amber); color: #04141a; }
+.deck__type--vehicle { background: var(--green); color: #04141a; }
+.deck__type--heist { background: var(--magenta); color: #fff; }
+.deck__type--operation { background: #14b86a; color: #04141a; }
+.deck__class-chip {
+  font-family: var(--font-mono); font-size: 0.56rem; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); border: 1px solid var(--line-hot); border-radius: 2px; padding: 1px 5px;
+}
+.deck__text { font-size: 0.68rem; color: var(--muted); line-height: 1.35; min-height: 2.4em; }
+.deck__foot { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-top: 0.15rem; }
+.deck__heat { font-family: var(--font-mono); font-size: 0.6rem; color: var(--amber); }
+.deck__owned { font-family: var(--font-mono); font-size: 0.68rem; color: var(--muted); }
+
+/* ── Bosses gallery (living portraits) ─────────────────────────────────────── */
+.bosses { padding: 1.5rem 2.5rem; }
+.bosses__head { margin-bottom: 1.25rem; }
+.bosses__title {
+  font-family: var(--font-display); font-size: 1.6rem; letter-spacing: 0.02em;
+  color: var(--magenta); text-shadow: 0 0 12px rgba(255,60,180,0.45); margin: 0;
+}
+.bosses__sub { font-family: var(--font-mono); font-size: 0.8rem; color: var(--muted); margin: 0.25rem 0 0; }
+.bosses__grid {
+  list-style: none; margin: 0; padding: 0; display: grid; gap: 1rem;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+.boss {
+  background: linear-gradient(180deg, rgba(20,26,44,0.9), rgba(8,11,22,0.95));
+  border: 1px solid var(--line-hot, #2a3350); border-radius: 6px; overflow: hidden;
+  display: flex; flex-direction: column; transition: transform 0.15s, box-shadow 0.15s;
+}
+.boss:hover { transform: translateY(-3px); box-shadow: 0 8px 24px rgba(0,0,0,0.5), 0 0 18px rgba(80,220,255,0.25); }
+.boss__portrait { position: relative; aspect-ratio: 9 / 14; background: #0a0f1c; overflow: hidden; }
+.boss__video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.boss__power {
+  position: absolute; bottom: 6px; left: 6px; font-family: var(--font-mono); font-size: 0.56rem;
+  letter-spacing: 0.06em; text-transform: uppercase; color: #04141a; background: var(--accent);
+  padding: 2px 6px; border-radius: 2px; box-shadow: var(--glow-cyan, 0 0 8px rgba(80,220,255,0.6));
+}
+.boss__meta { padding: 0.6rem 0.7rem 0.8rem; display: flex; flex-direction: column; gap: 0.2rem; }
+.boss__name { font-family: var(--font-display); font-size: 0.98rem; color: var(--text); }
+.boss__class {
+  font-family: var(--font-mono); font-size: 0.58rem; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--magenta); align-self: flex-start;
+}
+.boss__tagline { font-size: 0.72rem; color: var(--muted); line-height: 1.35; }
+
+/* ── Rules / How-to-Play ───────────────────────────────────────────────────── */
+.rules { padding: 1.5rem 2.5rem; }
+.rules__head { margin-bottom: 1.25rem; }
+.rules__title {
+  font-family: var(--font-display); font-size: 1.6rem; color: var(--accent);
+  text-shadow: 0 0 12px rgba(80,220,255,0.4); margin: 0;
+}
+.rules__sub { font-family: var(--font-mono); font-size: 0.82rem; color: var(--amber); margin: 0.25rem 0 0; }
+.rules__grid {
+  display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); align-items: start;
+}
+.rules__card {
+  background: linear-gradient(180deg, rgba(20,26,44,0.85), rgba(8,11,22,0.95));
+  border: 1px solid var(--line-hot, #2a3350); border-radius: 6px; padding: 1rem 1.1rem;
+}
+.rules__card-title {
+  font-family: var(--font-display); font-size: 1.05rem; color: var(--magenta); margin: 0 0 0.35rem;
+}
+.rules__blurb { font-size: 0.82rem; color: var(--text); line-height: 1.45; margin: 0 0 0.7rem; }
+.rules__list { margin: 0; }
+.rules__row { display: grid; grid-template-columns: minmax(90px, 34%) 1fr; gap: 0.5rem; padding: 0.3rem 0; border-top: 1px solid rgba(255,255,255,0.05); }
+.rules__term { font-family: var(--font-mono); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); }
+.rules__def { font-size: 0.74rem; color: var(--muted); line-height: 1.4; margin: 0; }
+
+/* ── Economy (Tokens / Wallet) ─────────────────────────────────────────────── */
+.econ { padding: 1.5rem 2.5rem; }
+.econ__head { margin-bottom: 1rem; }
+.econ__title { font-family: var(--font-display); font-size: 1.6rem; color: var(--amber); text-shadow: 0 0 12px rgba(255,190,60,0.35); margin: 0; }
+.econ__sub { font-family: var(--font-mono); font-size: 0.8rem; color: var(--muted); margin: 0.25rem 0 0; }
+.econ__balance {
+  display: flex; flex-direction: column; gap: 0.15rem; padding: 1rem 1.25rem; margin-bottom: 1.25rem;
+  background: linear-gradient(120deg, rgba(60,40,10,0.55), rgba(8,11,22,0.9));
+  border: 1px solid var(--amber); border-radius: 8px; box-shadow: 0 0 22px rgba(255,190,60,0.18);
+}
+.econ__balance-label { font-family: var(--font-mono); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.econ__balance-amount { font-family: var(--font-display); font-size: 2rem; color: var(--amber); }
+.econ__balance-amount em { font-style: normal; font-size: 1rem; color: var(--muted); }
+.econ__cols { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); align-items: start; }
+.econ__card { background: linear-gradient(180deg, rgba(20,26,44,0.85), rgba(8,11,22,0.95)); border: 1px solid var(--line-hot, #2a3350); border-radius: 6px; padding: 0.9rem 1rem; }
+.econ__card-title { font-family: var(--font-display); font-size: 1rem; color: var(--accent); margin: 0 0 0.5rem; }
+.econ__rows { list-style: none; margin: 0; padding: 0; }
+.econ__row { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; padding: 0.4rem 0; border-top: 1px solid rgba(255,255,255,0.05); }
+.econ__row-main { display: flex; flex-direction: column; font-size: 0.8rem; color: var(--text); }
+.econ__row-main small { font-family: var(--font-mono); font-size: 0.62rem; color: var(--muted); }
+.econ__row-amt { font-family: var(--font-mono); font-size: 0.82rem; font-weight: 700; }
+.econ__row-amt--pos { color: var(--green, #38e08a); }
+.econ__row-amt--neg { color: var(--magenta); }
+.econ__balances { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem; }
+.econ__bal-chip { display: flex; flex-direction: column; gap: 0.15rem; padding: 0.8rem 1rem; min-width: 180px; background: rgba(20,26,44,0.8); border: 1px solid var(--line-hot, #2a3350); border-radius: 6px; }
+.econ__bal-cur { font-family: var(--font-mono); font-size: 0.65rem; text-transform: uppercase; color: var(--accent); }
+.econ__bal-amt { font-family: var(--font-display); font-size: 1.4rem; color: var(--text); }
+.econ__bal-hint { font-size: 0.66rem; color: var(--muted); }
+.econ__ledger { display: flex; flex-direction: column; border: 1px solid var(--line-hot, #2a3350); border-radius: 6px; overflow: hidden; }
+.econ__ledger-head, .econ__ledger-row { display: grid; grid-template-columns: 110px 1fr 130px 90px; gap: 0.5rem; padding: 0.55rem 0.9rem; align-items: center; }
+.econ__ledger-head { background: rgba(255,255,255,0.04); font-family: var(--font-mono); font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.econ__ledger-row { border-top: 1px solid rgba(255,255,255,0.05); font-size: 0.78rem; color: var(--text); }
+.econ__ledger-date { font-family: var(--font-mono); font-size: 0.7rem; color: var(--muted); }
+.econ__ledger-amt { font-family: var(--font-mono); font-weight: 700; }
+.econ__ledger-amt--earn { color: var(--green, #38e08a); }
+.econ__ledger-amt--spend { color: var(--magenta); }
+.econ__ledger-amt--fiat { color: var(--accent); }
+.econ__ledger-bal { font-family: var(--font-mono); color: var(--muted); }
+
+/* ── Marketplace ───────────────────────────────────────────────────────────── */
+.market { padding: 1.5rem 2.5rem; }
+.market__head { margin-bottom: 1.25rem; }
+.market__title { font-family: var(--font-display); font-size: 1.6rem; color: var(--green, #38e08a); text-shadow: 0 0 12px rgba(56,224,138,0.3); margin: 0; }
+.market__sub { font-family: var(--font-mono); font-size: 0.8rem; color: var(--muted); margin: 0.25rem 0 0; }
+.market__grid { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.9rem; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.market__listing { display: grid; grid-template-columns: 64px 1fr auto; gap: 0.6rem; align-items: center; padding: 0.6rem; background: linear-gradient(180deg, rgba(20,26,44,0.9), rgba(8,11,22,0.95)); border: 1px solid var(--line-hot, #2a3350); border-left-width: 3px; border-radius: 6px; }
+.market__listing--rare { border-left-color: var(--accent); }
+.market__listing--epic { border-left-color: var(--magenta); }
+.market__listing--legendary { border-left-color: var(--amber); box-shadow: 0 0 16px rgba(255,190,60,0.15); }
+.market__art { width: 64px; height: 64px; border-radius: 4px; background-size: cover; background-position: center; background-color: #0a0f1c; }
+.market__info { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+.market__name { font-family: var(--font-tech); font-weight: 600; font-size: 0.85rem; color: var(--text); }
+.market__rarity { font-family: var(--font-mono); font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.market__seller { font-family: var(--font-mono); font-size: 0.62rem; color: var(--accent); }
+.market__buy { display: flex; flex-direction: column; align-items: center; gap: 0; padding: 0.4rem 0.6rem; background: rgba(56,224,138,0.12); border: 1px solid var(--green, #38e08a); border-radius: 4px; color: var(--green, #38e08a); cursor: pointer; transition: background 0.12s; }
+.market__buy:hover { background: rgba(56,224,138,0.24); }
+.market__price { font-family: var(--font-display); font-size: 0.95rem; line-height: 1; }
+.market__cur { font-family: var(--font-mono); font-size: 0.52rem; letter-spacing: 0.06em; }

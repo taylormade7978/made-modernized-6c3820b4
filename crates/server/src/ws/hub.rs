@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use tokio::sync::broadcast;
 
 use domain::match_replay::MatchReplay;
-use game_session::{Event, GameSession, Player, ResolveCopEvent};
+use game_session::{Event, GameSession, Keyword, Player, ResolveCopEvent};
 use mocks::InMemoryMatchReplayRepository;
 use shared::{Aggregate, Command, DomainEvent, Repository};
 
@@ -264,14 +264,19 @@ impl MatchHub {
 
     /// Re-run a client `command` against the match authoritatively.
     ///
-    /// `command` is the aggregate command name and `payload` its JSON body. For a
-    /// `ResolveCopEventCmd` the server injects its *own* seeded d10 draw over any
-    /// the client supplied, then only advances the RNG cursor if the command is
-    /// accepted — so a rejected attempt never perturbs the deterministic stream.
+    /// `command` is the aggregate command name and `payload` its JSON body. The
+    /// authenticated envelope's `match_id` and `player_id` are stamped onto the
+    /// body before it is decoded (see [`build_command`]), so the browser client
+    /// only sends the action-specific fields and can never spoof a different
+    /// match/player through the payload. For a `ResolveCopEventCmd` the server
+    /// also injects its *own* seeded d10 draw over any the client supplied, then
+    /// only advances the RNG cursor if the command is accepted — so a rejected
+    /// attempt never perturbs the deterministic stream.
     pub fn apply_action(
         &self,
         match_id: &str,
         command: &str,
+        player_id: &str,
         payload: &serde_json::Value,
     ) -> ApplyOutcome {
         let mut matches = self.matches.lock().expect("match registry poisoned");
@@ -296,9 +301,9 @@ impl MatchHub {
         let is_cop_event = command == ResolveCopEvent::COMMAND;
         let cmd = if is_cop_event {
             let draw = live.rng.peek_cop_event();
-            build_command(command, payload, Some(draw))
+            build_command(command, match_id, player_id, payload, Some(draw))
         } else {
-            build_command(command, payload, None)
+            build_command(command, match_id, player_id, payload, None)
         };
 
         match live.session.execute(cmd) {
@@ -390,18 +395,41 @@ impl MatchHub {
     }
 }
 
-/// Build the dispatchable [`Command`] for `command`/`payload`, optionally forcing
-/// the seeded Cop Event `rng_draw` over whatever the client sent.
-fn build_command(command: &str, payload: &serde_json::Value, rng_draw: Option<u8>) -> Command {
-    let mut body = payload.clone();
-    if let Some(draw) = rng_draw {
-        // Overwrite (or insert) the server-authoritative draw; if the client sent
-        // a non-object body, replace it with one carrying just the draw so the
-        // aggregate still gets a well-formed (if incomplete) payload to reject.
-        if !body.is_object() {
-            body = serde_json::json!({});
-        }
-        if let Some(map) = body.as_object_mut() {
+/// Build the dispatchable [`Command`] for `command`/`payload`, stamping the
+/// authenticated envelope identity (`match_id`, `player_id`) onto the body and
+/// optionally forcing the seeded Cop Event `rng_draw` over whatever the client
+/// sent.
+///
+/// The browser client sends only the action-specific fields in `payload`
+/// (`seat`, `attackerId`, `cardInstanceId`, `juiceCost`, …); the trusted
+/// `match_id`/`player_id` live on the connection envelope, not the
+/// client-controlled payload. Every domain command struct requires `matchId`
+/// and `playerId` (camelCase, no serde default), so we insert/overwrite them
+/// here before decoding — which both makes the client's slim payload
+/// deserialize *and* prevents a client from spoofing a different match/player
+/// by putting one in the payload (the envelope value always wins). A caller
+/// that already sends a full command object as the payload keeps working: the
+/// stamped ids overwrite the (already-correct) ones idempotently.
+fn build_command(
+    command: &str,
+    match_id: &str,
+    player_id: &str,
+    payload: &serde_json::Value,
+    rng_draw: Option<u8>,
+) -> Command {
+    // Normalize an object body, an omitted/empty body (serde default is `null`),
+    // or a defensively non-object body to an object we can stamp identity onto.
+    let mut body = match payload {
+        serde_json::Value::Object(_) => payload.clone(),
+        _ => serde_json::json!({}),
+    };
+    // `body` is now an object, so `as_object_mut` is `Some`.
+    if let Some(map) = body.as_object_mut() {
+        // Authenticated envelope identity wins over anything the client sent.
+        map.insert("matchId".to_string(), serde_json::json!(match_id));
+        map.insert("playerId".to_string(), serde_json::json!(player_id));
+        if let Some(draw) = rng_draw {
+            // Overwrite (or insert) the server-authoritative Cop Event draw.
             map.insert("rngDraw".to_string(), serde_json::json!(draw));
         }
     }
@@ -494,6 +522,45 @@ fn delta_event_json(event: &Event) -> serde_json::Value {
             "bossId": e.boss_id,
             "winner": player_tag(e.winner),
         }),
+        Event::OperatorDamaged(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "instanceId": e.instance_id,
+            "newHp": e.new_hp,
+        }),
+        Event::OperatorDied(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "instanceId": e.instance_id,
+        }),
+        Event::BossDamaged(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "amount": e.amount,
+            "newHp": e.new_hp,
+        }),
+        Event::OperatorExhausted(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "instanceId": e.instance_id,
+        }),
+        Event::OperatorSummoned(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "unit": {
+                "instanceId": e.unit.instance_id,
+                "cardId": e.unit.card_id,
+                "atk": e.unit.atk,
+                "hp": e.unit.hp,
+                "maxHp": e.unit.max_hp,
+                "ready": e.unit.ready,
+                "isVehicle": e.unit.is_vehicle,
+                "keywords": e.unit.keywords.iter().map(|k| match k {
+                    Keyword::Spotlight => "Spotlight",
+                    Keyword::DriveBy => "Drive-By",
+                }).collect::<Vec<_>>(),
+            },
+        }),
         Event::HeroPowerActivated(e) => json!({
             "matchId": e.match_id,
             "playerId": e.player_id,
@@ -509,12 +576,17 @@ fn delta_event_json(event: &Event) -> serde_json::Value {
             "amount": e.amount,
             "bossHpRemaining": e.boss_hp_remaining,
         }),
+        Event::OperatorsReadied(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+        }),
         Event::TurnEnded(e) => json!({
             "matchId": e.match_id,
             "playerId": e.player_id,
             "player": player_tag(e.player),
             "nextPlayer": player_tag(e.next_player),
             "nextPlayerJuice": e.next_player_juice,
+            "nextPlayerMaxJuice": e.next_player_max_juice,
         }),
         Event::CopEventTriggered(e) => json!({
             "matchId": e.match_id,
@@ -530,13 +602,35 @@ fn delta_event_json(event: &Event) -> serde_json::Value {
             "winningPlayerId": e.winning_player_id,
             "winner": player_tag(e.winner),
         }),
+        Event::JuiceGained(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "amount": e.amount,
+            "newJuice": e.new_juice,
+        }),
+        Event::HeatSet(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "newHeat": e.new_heat,
+        }),
+        Event::BossArmorGained(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "amount": e.amount,
+            "newHp": e.new_hp,
+        }),
+        Event::VenueEventResolved(e) => json!({
+            "matchId": e.match_id,
+            "eventTableRef": e.event_table_ref,
+            "rngDraw": e.rng_draw,
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use game_session::{ConcedeMatch, PlayCard, StartMatch};
+    use game_session::{ConcedeMatch, EndTurn, PlayCard, StartMatch};
 
     /// The default Outfit names a fresh session for `id` configures.
     fn outfit_a(id: &str) -> String {
@@ -553,7 +647,7 @@ mod tests {
         hub.join(id, "host", None);
         let start = StartMatch::new(id, outfit_a(id), outfit_b(id), 0xABCD);
         let payload = serde_json::to_value(&start).unwrap();
-        match hub.apply_action(id, StartMatch::COMMAND, &payload) {
+        match hub.apply_action(id, StartMatch::COMMAND, "host", &payload) {
             ApplyOutcome::Applied(_) => hub,
             other => panic!("expected StartMatch to apply, got {other:?}"),
         }
@@ -574,7 +668,7 @@ mod tests {
 
         let start = StartMatch::new("m-1", outfit_a("m-1"), outfit_b("m-1"), 7);
         let payload = serde_json::to_value(&start).unwrap();
-        let outcome = hub.apply_action("m-1", StartMatch::COMMAND, &payload);
+        let outcome = hub.apply_action("m-1", StartMatch::COMMAND, "host", &payload);
 
         let Applied { snapshot, .. } = match outcome {
             ApplyOutcome::Applied(applied) => applied,
@@ -600,7 +694,7 @@ mod tests {
         // A's opening turn.
         let play = PlayCard::new("m-1", outfit_b("m-1"), "card-1", "target-1", 1);
         let payload = serde_json::to_value(&play).unwrap();
-        match hub.apply_action("m-1", PlayCard::COMMAND, &payload) {
+        match hub.apply_action("m-1", PlayCard::COMMAND, &outfit_b("m-1"), &payload) {
             ApplyOutcome::Rejected(ServerMessage::Rejected {
                 authoritative_seq,
                 reason,
@@ -618,9 +712,51 @@ mod tests {
     fn acting_on_an_unknown_match_is_reported() {
         let hub = MatchHub::new();
         let payload = serde_json::json!({});
-        match hub.apply_action("ghost", "EndTurnCmd", &payload) {
+        match hub.apply_action("ghost", "EndTurnCmd", "p-1", &payload) {
             ApplyOutcome::UnknownMatch(ServerMessage::Error { .. }) => {}
             other => panic!("expected UnknownMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_client_shape_payload_without_envelope_ids_builds_a_valid_command() {
+        // The real browser client sends only the action-specific fields in
+        // `payload`; `matchId`/`playerId` travel on the authenticated envelope,
+        // NOT the payload (see `web/src/match/connection.ts` `send`). Here an
+        // `EndTurn` from player A — whose opening turn it is — carries an EMPTY
+        // client-shape payload. Before the envelope-injection fix this failed to
+        // deserialize ("missing field `matchId`") and every online action was
+        // rejected; now the hub stamps the envelope identity onto the body, so
+        // the command builds and executes.
+        let hub = started_hub("m-1");
+        let client_payload = serde_json::json!({});
+        match hub.apply_action("m-1", EndTurn::COMMAND, &outfit_a("m-1"), &client_payload) {
+            ApplyOutcome::Applied(applied) => {
+                assert!(
+                    applied
+                        .new_deltas
+                        .iter()
+                        .any(|d| d.event_type == "turn.ended"),
+                    "the client-shape EndTurn should pass the turn, got {:?}",
+                    applied.new_deltas
+                );
+            }
+            other => panic!("expected the client-shape EndTurn to apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_authenticated_envelope_identity_overrides_a_spoofed_payload() {
+        // A client puts a *different* player's id in the payload trying to act as
+        // them; the envelope identity (player A, whose turn it is) must win, so
+        // the action is accepted as A rather than rejected as the spoofed B
+        // acting out of turn.
+        let hub = started_hub("m-1");
+        let spoofed =
+            serde_json::json!({ "playerId": outfit_b("m-1"), "matchId": "somewhere-else" });
+        match hub.apply_action("m-1", EndTurn::COMMAND, &outfit_a("m-1"), &spoofed) {
+            ApplyOutcome::Applied(_) => {}
+            other => panic!("envelope identity should override the payload, got {other:?}"),
         }
     }
 
@@ -632,13 +768,14 @@ mod tests {
         // Concede is exempt from the turn rule; player B forfeits, A wins.
         let concede = ConcedeMatch::new("m-1", outfit_b("m-1"));
         let payload = serde_json::to_value(&concede).unwrap();
-        let completion = match hub.apply_action("m-1", ConcedeMatch::COMMAND, &payload) {
-            ApplyOutcome::Applied(Applied {
-                completion: Some(c),
-                ..
-            }) => c,
-            other => panic!("expected a completion, got {other:?}"),
-        };
+        let completion =
+            match hub.apply_action("m-1", ConcedeMatch::COMMAND, &outfit_b("m-1"), &payload) {
+                ApplyOutcome::Applied(Applied {
+                    completion: Some(c),
+                    ..
+                }) => c,
+                other => panic!("expected a completion, got {other:?}"),
+            };
 
         assert_eq!(completion.winner, "A");
         assert_eq!(completion.replay_id, "m-1");
@@ -650,7 +787,12 @@ mod tests {
         let again = ConcedeMatch::new("m-1", outfit_a("m-1"));
         let again_payload = serde_json::to_value(&again).unwrap();
         assert!(matches!(
-            hub.apply_action("m-1", ConcedeMatch::COMMAND, &again_payload),
+            hub.apply_action(
+                "m-1",
+                ConcedeMatch::COMMAND,
+                &outfit_a("m-1"),
+                &again_payload
+            ),
             ApplyOutcome::Rejected(_)
         ));
     }
@@ -672,7 +814,7 @@ mod tests {
         let concede = ConcedeMatch::new("m-1", outfit_b("m-1"));
         let payload = serde_json::to_value(&concede).unwrap();
         assert!(matches!(
-            hub.apply_action("m-1", ConcedeMatch::COMMAND, &payload),
+            hub.apply_action("m-1", ConcedeMatch::COMMAND, &outfit_b("m-1"), &payload),
             ApplyOutcome::Applied(_)
         ));
     }

@@ -23,7 +23,7 @@ mod common;
 
 use serde_json::Value;
 
-use game_session::{DeclareAttack, PlayCard, StartMatch};
+use game_session::{ConcedeMatch, StartMatch};
 use persistence::repositories::match_play::{GameSessionRepository, MatchReplayRepository};
 use persistence::PgPool;
 use server::ws::hub::{ApplyOutcome, MatchHub};
@@ -31,13 +31,22 @@ use server::ws::protocol::MatchSnapshot;
 use server::ws::{persist_applied, WsState};
 
 /// The authoritative command stream for one full match, deterministic in the
-/// given `seed`: open the match (player `A` to move), have `A` play an affordable
-/// card, then declare the lethal attack into `B`'s Boss — which completes the
-/// match with `A` the winner. `A`'s outfit is the session default `<id>-a`, and
-/// `B`'s Boss target is `<id>-b-boss`.
+/// given `seed`: open the match (player `A` to move), then have `B` concede —
+/// forfeiting the match to `A`. Concede is turn-exempt, so `B` may forfeit on
+/// `A`'s opening turn, and the winner (`A`) is a seed-robust outcome of this
+/// stream (only the sealed checksum, which embeds the seed via the
+/// `match.started` frame, varies across seeds).
+///
+/// NOTE (Task 6): Summon effect resolution now puts units on the board, but a
+/// summoned unit arrives with summoning sickness that no command in the current
+/// set clears, and `B`'s Boss opens at full HP — so a *lethal attack* cannot
+/// drive a match to completion here yet. This concede stream is the seed-robust
+/// completion the cross-seed replay assertion below requires; restore an
+/// attack-driven completion once a turn-start readiness step and a reachable
+/// lethal line exist. Summon resolution itself is covered by the
+/// `game-session` unit tests.
 fn match_script(match_id: &str, seed: u64) -> Vec<(&'static str, Value)> {
-    let outfit_a = format!("{match_id}-a");
-    let boss_b = format!("{match_id}-b-boss");
+    let outfit_b = format!("{match_id}-b");
     vec![
         (
             StartMatch::COMMAND,
@@ -50,22 +59,22 @@ fn match_script(match_id: &str, seed: u64) -> Vec<(&'static str, Value)> {
             .unwrap(),
         ),
         (
-            PlayCard::COMMAND,
-            serde_json::to_value(PlayCard::new(
-                match_id,
-                outfit_a.clone(),
-                "card-1",
-                "target-1",
-                1,
-            ))
-            .unwrap(),
-        ),
-        (
-            DeclareAttack::COMMAND,
-            serde_json::to_value(DeclareAttack::new(match_id, outfit_a, "attacker-1", boss_b))
-                .unwrap(),
+            ConcedeMatch::COMMAND,
+            serde_json::to_value(ConcedeMatch::new(match_id, outfit_b)).unwrap(),
         ),
     ]
+}
+
+/// The acting player id for a script step: the authenticated envelope identity
+/// the socket handler would carry. These full-command payloads already embed the
+/// acting `playerId` (except `StartMatch`, which names no acting player — the
+/// host stands in, and the hub stamps a harmless `playerId` the aggregate
+/// ignores), so reading it back mirrors what the real `/ws` envelope supplies.
+fn actor_of(payload: &Value) -> &str {
+    payload
+        .get("playerId")
+        .and_then(Value::as_str)
+        .unwrap_or("host-player")
 }
 
 /// Play the whole script against a fresh in-memory hub (no IO), returning the
@@ -78,7 +87,7 @@ fn play_pure(match_id: &str, seed: u64) -> (String, String, Vec<(u64, String)>) 
     let mut checksum = String::new();
     let mut winner = String::new();
     for (command, payload) in match_script(match_id, seed) {
-        match hub.apply_action(match_id, command, &payload) {
+        match hub.apply_action(match_id, command, actor_of(&payload), &payload) {
             ApplyOutcome::Applied(applied) => {
                 for d in &applied.new_deltas {
                     deltas.push((d.seq, d.event_type.clone()));
@@ -112,7 +121,10 @@ async fn full_ws_match_persists_replay_and_reproduces_from_seed(pool: PgPool) {
     let mut applied_deltas: Vec<(u64, String)> = Vec::new();
     let mut completion = None;
     for (command, payload) in match_script(match_id, SEED) {
-        let applied = match state.hub.apply_action(match_id, command, &payload) {
+        let applied = match state
+            .hub
+            .apply_action(match_id, command, actor_of(&payload), &payload)
+        {
             ApplyOutcome::Applied(applied) => applied,
             other => panic!("{command} was not applied: {other:?}"),
         };
@@ -147,7 +159,7 @@ async fn full_ws_match_persists_replay_and_reproduces_from_seed(pool: PgPool) {
     let completion = completion.expect("the match reached a terminal state");
     assert_eq!(
         completion.winner, "A",
-        "declaring the lethal attack wins for seat A"
+        "B conceding forfeits the match to seat A"
     );
 
     // ---- The sealed MatchReplay is persisted and retrievable ----

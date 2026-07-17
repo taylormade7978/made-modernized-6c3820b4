@@ -80,6 +80,63 @@ export function defaultOutfit(name: string): OutfitConfig {
   }
 }
 
+// ── Cards, effects & board units ───────────────────────────────────────────────
+
+/**
+ * How a card resolves when played (a deliberately small, closed set so the
+ * client rules stay a faithful, testable mirror):
+ *  - `damage` — deal `amount` to the enemy boss;
+ *  - `summon` — put an Operator with `atk`/`hp` on your board;
+ *  - `draw`   — draw `amount` cards;
+ *  - `juice`  — gain `amount` Juice this turn;
+ *  - `cool`   — lower your own Heat by `amount` (the Police lever).
+ */
+export type EffectKind = 'damage' | 'summon' | 'draw' | 'juice' | 'cool'
+
+/** A card definition (the printed card). */
+export interface CardDef {
+  readonly cardId: string
+  readonly name: string
+  readonly cost: number
+  readonly type: string
+  readonly effect: EffectKind
+  readonly amount: number
+  readonly atk?: number
+  readonly hp?: number
+  /** Evergreen keywords, e.g. 'Spotlight' (taunt), 'Drive-By' (arrival damage). */
+  readonly keywords?: readonly string[]
+  /** Rules text shown in the card-detail panel. */
+  readonly text?: string
+}
+
+/** A card in a hand/deck — a {@link CardDef} plus a per-copy instance id. */
+export interface HandCard extends CardDef {
+  readonly instanceId: string
+}
+
+/** An Operator on the board: it can attack an enemy target when `ready`. */
+export interface BoardUnit {
+  readonly instanceId: string
+  readonly name: string
+  readonly cardId: string
+  readonly atk: number
+  readonly hp: number
+  readonly maxHp: number
+  /** False the turn it arrives (summoning sickness), true from your next turn. */
+  readonly ready: boolean
+  readonly keywords: readonly string[]
+}
+
+/** True if `unit` has Spotlight (must be dealt with before other targets). */
+export function hasSpotlight(unit: BoardUnit): boolean {
+  return unit.keywords.includes('Spotlight')
+}
+
+/** How much a boss is dealt when a Cop Event raids the hottest player. */
+export const COP_EVENT_THRESHOLD = HEAT_MAX
+export const COP_EVENT_RESET_TO = 3
+export const COP_EVENT_DAMAGE = 3
+
 // ── Live match state ───────────────────────────────────────────────────────────
 
 /** The live, mutable-through-events state of one seat during a match. */
@@ -90,6 +147,18 @@ export interface SeatState {
   readonly heat: number
   /** Currently available Juice pool (ramps each of the seat's turns). */
   readonly juice: number
+  /**
+   * The Juice crystal — the max the available pool refills to at the start of
+   * the seat's turn. Grows (+1, capped at {@link JUICE_CAP}) each of the seat's
+   * turns; mirrors the aggregate's `next_player_max_juice`.
+   */
+  readonly maxJuice: number
+  /** Cards in hand this seat can play. */
+  readonly hand: readonly HandCard[]
+  /** Operators in play. */
+  readonly board: readonly BoardUnit[]
+  /** The undrawn deck (practice holds it locally; online it is server-secret). */
+  readonly deck: readonly HandCard[]
   readonly operators: number
   readonly vehicles: number
   readonly deckSize: number
@@ -121,6 +190,10 @@ export function seatFromOutfit(outfit: OutfitConfig): SeatState {
     bossHp: outfit.bossHp,
     heat: outfit.startingHeat,
     juice: outfit.availableJuice,
+    maxJuice: outfit.availableJuice,
+    hand: [],
+    board: [],
+    deck: [],
     operators: outfit.operators,
     vehicles: outfit.vehicles,
     deckSize: outfit.deckSize,
@@ -138,6 +211,7 @@ export function seatFromOutfit(outfit: OutfitConfig): SeatState {
  */
 export type MatchAction =
   | { readonly kind: 'PlayCardCmd'; readonly seat: Seat; readonly cardInstanceId: string; readonly targetRef: string; readonly juiceCost: number }
+  | { readonly kind: 'AttackCmd'; readonly seat: Seat; readonly attackerId: string; readonly targetRef: string }
   | { readonly kind: 'ActivateHeroPowerCmd'; readonly seat: Seat; readonly targetRef: string; readonly juiceCost: number }
   | { readonly kind: 'EndTurnCmd'; readonly seat: Seat }
   | { readonly kind: 'ConcedeMatchCmd'; readonly seat: Seat }
@@ -157,8 +231,19 @@ export type DeltaEvent =
   | { readonly type: 'match.started'; readonly matchId: string; readonly playerAOutfit: string; readonly playerBOutfit: string; readonly rngSeed: number; readonly openingPlayer: Seat }
   | { readonly type: 'card.played'; readonly player: Seat; readonly cardInstanceId: string; readonly targetRef: string; readonly juiceSpent: number }
   | { readonly type: 'heat.raised'; readonly player: Seat; readonly amount: number; readonly newHeat: number }
+  | { readonly type: 'heat.set'; readonly player: Seat; readonly newHeat: number }
   | { readonly type: 'hero_power.activated'; readonly player: Seat; readonly targetRef: string; readonly juiceSpent: number; readonly remainingJuice: number }
-  | { readonly type: 'turn.ended'; readonly player: Seat; readonly nextPlayer: Seat; readonly nextPlayerJuice: number }
+  | { readonly type: 'card.drawn'; readonly player: Seat; readonly card: HandCard }
+  | { readonly type: 'boss.damaged'; readonly player: Seat; readonly amount: number; readonly newHp: number }
+  | { readonly type: 'boss.armor.gained'; readonly player: Seat; readonly amount: number; readonly newHp: number }
+  | { readonly type: 'juice.gained'; readonly player: Seat; readonly amount: number; readonly newJuice: number }
+  | { readonly type: 'operator.summoned'; readonly player: Seat; readonly unit: BoardUnit }
+  | { readonly type: 'operator.damaged'; readonly player: Seat; readonly instanceId: string; readonly newHp: number }
+  | { readonly type: 'operator.died'; readonly player: Seat; readonly instanceId: string }
+  | { readonly type: 'operators.readied'; readonly player: Seat }
+  | { readonly type: 'operator.exhausted'; readonly player: Seat; readonly instanceId: string }
+  | { readonly type: 'cop.raided'; readonly player: Seat; readonly bossHp: number; readonly newHeat: number }
+  | { readonly type: 'turn.ended'; readonly player: Seat; readonly nextPlayer: Seat; readonly nextPlayerJuice: number; readonly nextPlayerMaxJuice: number }
   | { readonly type: 'match.completed'; readonly concedingPlayer: Seat; readonly winner: Seat }
 
 /** The `type()` string of a delta event (mirrors `event_type()`). */

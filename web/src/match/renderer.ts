@@ -14,7 +14,7 @@
  * opponent on top, the local seat on the bottom — which reads naturally when the
  * phone is held upright.
  */
-import { HEAT_MAX, JUICE_CAP, MAX_OPERATORS, MAX_VEHICLES, opponent, type MatchState, type Seat, type SeatState } from './model'
+import { HEAT_MAX, MAX_OPERATORS, MAX_VEHICLES, opponent, type MatchState, type Seat, type SeatState } from './model'
 
 /** Per-frame render inputs beyond the board state itself. */
 export interface RenderOptions {
@@ -125,7 +125,9 @@ export class BoardRenderer {
     const meterW = w - 28
     this.drawMeter(innerX, cursorY, meterW, `Boss HP ${s.bossHp}`, s.bossHp, 30, COLORS.boss)
     this.drawMeter(innerX, cursorY + 26, meterW, `Heat ${s.heat}/${HEAT_MAX}`, s.heat, HEAT_MAX, COLORS.heat)
-    this.drawMeter(innerX, cursorY + 52, meterW, `Juice ${s.juice}/${JUICE_CAP}`, s.juice, JUICE_CAP, COLORS.juice)
+    // The denominator is the seat's Juice crystal (what the pool refills to),
+    // not the static hard cap — so the grown crystal is visible to the player.
+    this.drawMeter(innerX, cursorY + 52, meterW, `Juice ${s.juice}/${s.maxJuice}`, s.juice, s.maxJuice, COLORS.juice)
 
     // Board: operator + vehicle slots.
     this.drawBoard(s, innerX, cursorY + 74, meterW, y + h - (cursorY + 74) - 10)

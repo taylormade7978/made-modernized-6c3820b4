@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, ApiError } from '../api'
 import type { Card, CardClass, CollectionResponse, Deck, OwnedCard } from '../api/types'
+import { subscribe } from '../api/realtime'
 import {
   checkLegality,
   countCards,
@@ -125,6 +126,18 @@ export function useDeckbuilder(playerId: string): DeckbuilderController {
   // A monotonically bumped nonce to force a reload on demand.
   const [reloadNonce, setReloadNonce] = useState(0)
   const reload = useCallback(() => setReloadNonce((n) => n + 1), [])
+
+  // Live updates: subscribe to the player's collection and re-pull on any
+  // server-pushed change (a deck save from this or another device). The trigger
+  // is the push, not a timer — no polling.
+  useEffect(() => {
+    if (!playerId) return
+    return subscribe<{ collectionChanged: unknown }>(
+      `subscription($p:ID!){ collectionChanged(playerId:$p){ playerId } }`,
+      { p: playerId },
+      () => reload(),
+    )
+  }, [playerId, reload])
 
   // Load owned collection + card catalog together.
   useEffect(() => {

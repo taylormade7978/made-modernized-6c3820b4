@@ -22,9 +22,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { MatchConnection, type ConnectionStatus } from './connection'
 import { Reconciler } from './reconciler'
 import { BoardRenderer } from './renderer'
-import { startMatch } from './rules'
+import { aiTurn, startMatch } from './rules'
 import { loadRulesWasm, type RulesWasm } from './wasm'
-import type { CommandName, MatchAction, MatchState, Seat } from './model'
+import { opponent, type CommandName, type MatchAction, type MatchState, type Seat } from './model'
 
 /** How the view is playing: against the server, or fully offline. */
 export type MatchMode = 'online' | 'practice'
@@ -42,7 +42,8 @@ export interface MatchController {
   /** Reason for the most recent rollback, or `null` (drives the banner). */
   readonly correction: string | null
   readonly canvasRef: React.RefObject<HTMLCanvasElement>
-  readonly playCard: () => void
+  readonly playCard: (cardInstanceId: string, targetRef?: string) => void
+  readonly attack: (attackerId: string, targetRef: string) => void
   readonly heroPower: () => void
   readonly endTurn: () => void
   readonly concede: () => void
@@ -61,8 +62,11 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const rendererRef = useRef<BoardRenderer | null>(null)
 
-  const [mode, setModeState] = useState<MatchMode>('online')
-  const [status, setStatus] = useState<ConnectionStatus | 'practice'>('connecting')
+  // Default to Practice: the local rules WASM is a self-contained authority, so
+  // the board is immediately playable with no server. Online attaches the
+  // authoritative socket when a backend is available.
+  const [mode, setModeState] = useState<MatchMode>('practice')
+  const [status, setStatus] = useState<ConnectionStatus | 'practice'>('practice')
   const [correction, setCorrection] = useState<string | null>(null)
   // Bumped whenever the board changes, to re-render the React chrome (the canvas
   // itself redraws on its own rAF loop from refs).
@@ -94,6 +98,11 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
       return
     }
 
+    // The local player's identity is the name of the Outfit it is seated as —
+    // `<matchId>-a` for seat A — matching the domain's `OutfitConfig` naming
+    // (`startMatch` above) and what the server's `seat_for_player` resolves.
+    const selfPlayerId = `${matchId}-${SELF_SEAT.toLowerCase()}`
+
     const conn = new MatchConnection(
       {
         onStatus: setStatus,
@@ -121,13 +130,17 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
           rerender()
         },
       },
+      // The match this connection acts on; rides in every action envelope.
+      matchId,
+      // The local player's identity; the server requires it on every action.
+      selfPlayerId,
       // A mission launch joins the AI-opponent's authoritative match via its ticket.
       ticket,
     )
     connection.current = conn
     conn.connect()
     return () => conn.close()
-  }, [mode, ticket, raiseCorrection, rerender])
+  }, [mode, matchId, ticket, raiseCorrection, rerender])
 
   // Canvas renderer + animation loop. Redraws from refs each frame and decays the
   // correction flash; a ResizeObserver keeps the backing store matched to the box.
@@ -162,8 +175,12 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
    */
   const dispatch = useCallback(
     (action: MatchAction) => {
-      // Stage 1: authoritative rules-WASM name-gate (when the crate is loaded).
-      if (wasmGate.current && !wasmGate.current.recognizes(action.kind as CommandName)) {
+      // Stage 1: authoritative rules-WASM name-gate. Only meaningful ONLINE,
+      // where it proves the browser and server share one rules binary. In
+      // practice the local TS mirror is the sole authority (and stays current
+      // with the client's command set, e.g. AttackCmd), so the gate — which may
+      // be a stale compiled crate — must not veto a command the mirror handles.
+      if (mode === 'online' && wasmGate.current && !wasmGate.current.recognizes(action.kind as CommandName)) {
         raiseCorrection(`Rules engine does not recognize ${action.kind}`)
         rerender()
         return
@@ -187,16 +204,45 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
     [mode, raiseCorrection, rerender],
   )
 
-  const playCard = useCallback(() => {
-    cardSeq.current += 1
-    dispatch({ kind: 'PlayCardCmd', seat: SELF_SEAT, cardInstanceId: `card-${cardSeq.current}`, targetRef: 'boss:B', juiceCost: 1 })
-  }, [dispatch])
+  // In practice, after the local player hands over the turn, run the opponent's
+  // whole turn through the same rules (aiTurn loops until it passes back or wins)
+  // and fold its authoritative-shaped deltas into the board.
+  const runAiTurn = useCallback(() => {
+    if (mode !== 'practice') return
+    let guard = 0
+    while (guard++ < 100) {
+      const view = reconciler.current.view()
+      if (view.phase !== 'active' || view.turn !== opponent(SELF_SEAT)) break
+      const { events } = aiTurn(view, opponent(SELF_SEAT))
+      if (!events.length) break
+      reconciler.current.applyAuthoritative(events)
+    }
+    rerender()
+  }, [mode, rerender])
+
+  const playCard = useCallback(
+    (cardInstanceId: string, targetRef = 'boss:B') => {
+      const card = reconciler.current.view().seats[SELF_SEAT].hand.find((c) => c.instanceId === cardInstanceId)
+      if (!card) return
+      dispatch({ kind: 'PlayCardCmd', seat: SELF_SEAT, cardInstanceId, targetRef, juiceCost: card.cost })
+    },
+    [dispatch],
+  )
+
+  const attack = useCallback(
+    (attackerId: string, targetRef: string) => dispatch({ kind: 'AttackCmd', seat: SELF_SEAT, attackerId, targetRef }),
+    [dispatch],
+  )
 
   const heroPower = useCallback(() => {
     dispatch({ kind: 'ActivateHeroPowerCmd', seat: SELF_SEAT, targetRef: 'boss:B', juiceCost: 2 })
   }, [dispatch])
 
-  const endTurn = useCallback(() => dispatch({ kind: 'EndTurnCmd', seat: SELF_SEAT }), [dispatch])
+  const endTurn = useCallback(() => {
+    dispatch({ kind: 'EndTurnCmd', seat: SELF_SEAT })
+    // Let the board paint the hand-off, then run the opponent's turn.
+    setTimeout(runAiTurn, 500)
+  }, [dispatch, runAiTurn])
   const concede = useCallback(() => dispatch({ kind: 'ConcedeMatchCmd', seat: SELF_SEAT }), [dispatch])
 
   const newMatch = useCallback(() => {
@@ -231,6 +277,7 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
       correction,
       canvasRef,
       playCard,
+      attack,
       heroPower,
       endTurn,
       concede,
@@ -238,6 +285,6 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
       newMatch,
       dismissCorrection,
     }),
-    [state, mode, status, correction, playCard, heroPower, endTurn, concede, setMode, newMatch, dismissCorrection],
+    [state, mode, status, correction, playCard, attack, heroPower, endTurn, concede, setMode, newMatch, dismissCorrection],
   )
 }

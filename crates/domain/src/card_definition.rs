@@ -41,13 +41,14 @@ pub const REGISTERED_EFFECTS: &[&str] = &[
     "effect.deal_damage",
     "effect.draw_card",
     "effect.gain_juice",
+    "effect.cool",
     "effect.steal_piece",
     "effect.recruit_operator",
     "effect.pull_heist",
 ];
 
 /// The five card types every card is exactly one of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CardType {
     Operator,
     Job,
@@ -99,7 +100,7 @@ impl CardType {
 
 /// A card's class allegiance. A card belongs to exactly one class, or is
 /// [`CardClass::Neutral`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CardClass {
     Neutral,
     Boss,
@@ -208,6 +209,16 @@ pub struct DefineCardCmd {
     /// [`Rarity::Legendary`]; defaults to `0` when omitted.
     #[serde(default)]
     pub copy_cap: u32,
+    /// Board attack power. 0 for non-unit (spell-like) types.
+    #[serde(default)]
+    pub atk: u8,
+    /// Board health. Must be >= 1 for Operator/Vehicle; 0 for Job/Piece/Heist.
+    #[serde(default)]
+    pub hp: u8,
+    /// If `Some(boss_id)`, only that Boss's Outfit may deck this card. A
+    /// boss-locked card must be of class [`CardClass::Boss`] (Task 8).
+    #[serde(default)]
+    pub boss_lock: Option<String>,
 }
 
 impl DefineCardCmd {
@@ -253,6 +264,16 @@ pub struct ReviseCardCmd {
     /// `1` for [`Rarity::Legendary`]; defaults to `0` when omitted.
     #[serde(default)]
     pub copy_cap: u32,
+    /// Revised board attack power. 0 for non-unit (spell-like) types.
+    #[serde(default)]
+    pub atk: u8,
+    /// Revised board health. Must be >= 1 for Operator/Vehicle; 0 for Job/Piece/Heist.
+    #[serde(default)]
+    pub hp: u8,
+    /// If `Some(boss_id)`, only that Boss's Outfit may deck this card. A
+    /// boss-locked card must be of class [`CardClass::Boss`] (Task 8).
+    #[serde(default)]
+    pub boss_lock: Option<String>,
 }
 
 impl ReviseCardCmd {
@@ -282,6 +303,7 @@ struct ValidatedCardFields {
 /// [`CardDefinition::define_card`] (cataloging a new card) and
 /// [`CardDefinition::revise_card`] (amending an existing one) run it, so a
 /// revision is held to exactly the same schema as the original definition.
+#[allow(clippy::too_many_arguments)]
 fn validate_card_fields(
     name: &str,
     raw_card_type: &str,
@@ -290,6 +312,9 @@ fn validate_card_fields(
     cost: i64,
     effect_script_ref: &str,
     copy_cap: u32,
+    atk: u8,
+    hp: u8,
+    boss_lock: &Option<String>,
 ) -> Result<ValidatedCardFields, DomainError> {
     if name.trim().is_empty() {
         return Err(DomainError::InvariantViolation(
@@ -302,6 +327,13 @@ fn validate_card_fields(
     // Invariant: exactly one class, or Neutral.
     let class = CardClass::parse(raw_class)?;
     let rarity = Rarity::parse(raw_rarity)?;
+
+    // Invariant: a boss-locked card must be a Boss-class card.
+    if boss_lock.is_some() && class != CardClass::Boss {
+        return Err(DomainError::InvariantViolation(
+            "a boss-locked card must be of class Boss".to_string(),
+        ));
+    }
 
     // Invariant: Juice cost within the legal range for the card's type.
     let (min, max) = card_type.legal_cost_range();
@@ -317,6 +349,27 @@ fn validate_card_fields(
         return Err(DomainError::InvariantViolation(format!(
             "effect-script reference '{effect_script_ref}' does not resolve to a registered effect"
         )));
+    }
+
+    // Invariant: Operators and Vehicles are board units and need a body;
+    // Job/Piece/Heist are spell-like and carry no board stats.
+    match card_type {
+        CardType::Operator | CardType::Vehicle => {
+            if hp < 1 {
+                return Err(DomainError::InvariantViolation(format!(
+                    "a {} is a board unit and must have hp >= 1; got hp {hp}",
+                    card_type.as_str(),
+                )));
+            }
+        }
+        CardType::Job | CardType::Piece | CardType::Heist => {
+            if atk != 0 || hp != 0 {
+                return Err(DomainError::InvariantViolation(format!(
+                    "a {} is spell-like and must have atk == 0 && hp == 0; got {atk}/{hp}",
+                    card_type.as_str(),
+                )));
+            }
+        }
     }
 
     // Invariant: Legendary rarity carries a per-Outfit copy cap of 1.
@@ -347,6 +400,9 @@ pub struct CardDefined {
     pub keywords: Vec<String>,
     pub effect_script_ref: String,
     pub copy_cap: u32,
+    pub atk: u8,
+    pub hp: u8,
+    pub boss_lock: Option<String>,
 }
 
 /// A validated card revision, produced once every invariant has been re-checked
@@ -363,6 +419,9 @@ pub struct CardRevised {
     pub keywords: Vec<String>,
     pub effect_script_ref: String,
     pub copy_cap: u32,
+    pub atk: u8,
+    pub hp: u8,
+    pub boss_lock: Option<String>,
 }
 
 /// Domain events emitted by [`CardDefinition`].
@@ -438,6 +497,9 @@ impl CardDefinition {
             cmd.cost,
             &cmd.effect_script_ref,
             cmd.copy_cap,
+            cmd.atk,
+            cmd.hp,
+            &cmd.boss_lock,
         )?;
 
         let event = Event::CardDefined(CardDefined {
@@ -450,6 +512,9 @@ impl CardDefinition {
             keywords: cmd.keywords,
             effect_script_ref: cmd.effect_script_ref,
             copy_cap: cmd.copy_cap,
+            atk: cmd.atk,
+            hp: cmd.hp,
+            boss_lock: cmd.boss_lock,
         });
 
         self.root.record(Box::new(event.clone()));
@@ -477,6 +542,9 @@ impl CardDefinition {
             cmd.cost,
             &cmd.effect_script_ref,
             cmd.copy_cap,
+            cmd.atk,
+            cmd.hp,
+            &cmd.boss_lock,
         )?;
 
         let event = Event::CardRevised(CardRevised {
@@ -489,6 +557,9 @@ impl CardDefinition {
             keywords: cmd.keywords,
             effect_script_ref: cmd.effect_script_ref,
             copy_cap: cmd.copy_cap,
+            atk: cmd.atk,
+            hp: cmd.hp,
+            boss_lock: cmd.boss_lock,
         });
 
         self.root.record(Box::new(event.clone()));
@@ -543,6 +614,9 @@ mod tests {
             keywords: vec!["Fast".to_string()],
             effect_script_ref: "effect.draw_card".to_string(),
             copy_cap: 0,
+            atk: 2,
+            hp: 2,
+            boss_lock: None,
         }
     }
 
@@ -650,6 +724,9 @@ mod tests {
             keywords: vec!["Fast".to_string(), "Nimble".to_string()],
             effect_script_ref: "effect.draw_card".to_string(),
             copy_cap: 0,
+            atk: 2,
+            hp: 2,
+            boss_lock: None,
         }
     }
 
@@ -743,6 +820,100 @@ mod tests {
             ..valid_revise_cmd()
         };
         assert!(agg.execute(cmd.into_command()).is_ok());
+    }
+
+    #[test]
+    fn operator_requires_positive_hp() {
+        let mut agg = CardDefinition::new("card-op");
+        // Operator with hp 0 is illegal — a unit needs a body.
+        let cmd = DefineCardCmd {
+            card_type: "Operator".to_string(),
+            atk: 2,
+            hp: 0,
+            ..valid_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+        assert_eq!(agg.version(), 0);
+    }
+
+    #[test]
+    fn operator_with_hp_is_accepted() {
+        let mut agg = CardDefinition::new("card-op");
+        let cmd = DefineCardCmd {
+            card_type: "Operator".to_string(),
+            atk: 2,
+            hp: 3,
+            ..valid_cmd()
+        };
+        let events = agg
+            .execute(cmd.into_command())
+            .expect("a 2/3 Operator is legal");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::CardDefined(d) => {
+                assert_eq!(d.atk, 2);
+                assert_eq!(d.hp, 3);
+            }
+            other => panic!("expected CardDefined, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spell_type_rejects_body_stats() {
+        let mut agg = CardDefinition::new("card-job");
+        // A Job is spell-like: it must have no board body (atk == 0 && hp == 0).
+        let cmd = DefineCardCmd {
+            card_type: "Job".to_string(),
+            atk: 3,
+            hp: 0,
+            effect_script_ref: "effect.deal_damage".to_string(),
+            ..valid_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+    }
+
+    // Scenario: DefineCardCmd rejected — a boss-locked card must be of class
+    // Boss (Task 8).
+    #[test]
+    fn define_card_rejects_boss_lock_on_non_boss_class() {
+        let mut agg = CardDefinition::new("card-001");
+        // valid_cmd() is class "Driver"; locking it to a Boss is illegal.
+        let cmd = DefineCardCmd {
+            boss_lock: Some("boss-solomon".to_string()),
+            ..valid_cmd()
+        };
+        assert!(matches!(
+            agg.execute(cmd.into_command()),
+            Err(DomainError::InvariantViolation(_))
+        ));
+        assert_eq!(agg.version(), 0);
+    }
+
+    // Scenario: a boss-locked card of class Boss is accepted.
+    #[test]
+    fn boss_locked_card_of_boss_class_is_accepted() {
+        let mut agg = CardDefinition::new("card-boss");
+        let cmd = DefineCardCmd {
+            class: "Boss".to_string(),
+            boss_lock: Some("boss-solomon".to_string()),
+            ..valid_cmd()
+        };
+        let events = agg
+            .execute(cmd.into_command())
+            .expect("a Boss-class boss-locked card is legal");
+        match &events[0] {
+            Event::CardDefined(d) => {
+                assert_eq!(d.boss_lock, Some("boss-solomon".to_string()));
+                assert_eq!(d.class, CardClass::Boss);
+            }
+            other => panic!("expected CardDefined, got {other:?}"),
+        }
     }
 
     #[test]

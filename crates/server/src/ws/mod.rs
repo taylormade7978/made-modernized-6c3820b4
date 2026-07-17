@@ -164,10 +164,10 @@ async fn handle_frame(
         } => handle_join(state, &match_id, &player_id, session, forwarder).await,
         ClientMessage::Action {
             match_id,
-            player_id: _,
+            player_id,
             command,
             payload,
-        } => handle_action(state, &match_id, &command, &payload, session).await,
+        } => handle_action(state, &match_id, &player_id, &command, &payload, session).await,
     }
 }
 
@@ -217,14 +217,23 @@ async fn handle_join(
 }
 
 /// Dispatch a client command to the hub and perform the durable side effects.
+///
+/// `player_id` is the acting identity from the authenticated envelope; the hub
+/// stamps it (and `match_id`) onto the command body so the client only needs to
+/// send the action-specific fields and cannot spoof another player through the
+/// payload.
 async fn handle_action(
     state: &WsState,
     match_id: &str,
+    player_id: &str,
     command: &str,
     payload: &serde_json::Value,
     session: &mut actix_ws::Session,
 ) {
-    match state.hub.apply_action(match_id, command, payload) {
+    match state
+        .hub
+        .apply_action(match_id, command, player_id, payload)
+    {
         ApplyOutcome::Applied(applied) => persist_applied(state, match_id, applied).await,
         // A rejection (optimistic-state correction) or unknown-match error goes
         // only to the acting client; the deltas of an accepted command reach it

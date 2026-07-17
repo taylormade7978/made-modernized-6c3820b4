@@ -13,6 +13,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 shared = { workspace = true }
+# Read-only: game-session iterates domain::card_definition::REGISTERED_EFFECTS
+# for its CardEffect coverage test. domain compiles to wasm32 (it only decodes
+# serde payloads like game-session does), so this keeps the dual native/WASM
+# build working; verified via `cargo build -p game-session --features wasm`.
+domain = { workspace = true }
 # serde/serde_json decode the typed StartMatch command payload. Both compile to
 # wasm32, so they keep the dual native/WASM build working (mirrors the domain
 # aggregates, which decode their command payloads the same way).
@@ -21,8 +26,18 @@ serde_json = "1"
 # wasm-bindgen is optional and only pulled in for the `wasm` feature, so the
 # host build (`cargo build --workspace`) stays free of wasm-only dependencies.
 wasm-bindgen = { workspace = true, optional = true }
+# serde-wasm-bindgen serializes the emitted event-type sequence into a JsValue
+# for the browser prediction engine. Optional and wasm-only, mirroring
+# wasm-bindgen, so the native host build never pulls it in.
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[dev-dependencies]
+# Drives the WasmGameSession parity test (`wasm-pack test --node`). Only used by
+# the `target_arch = "wasm32"`-gated test module, so it never touches the native
+# suite; it compiles natively as an ordinary crate regardless.
+wasm-bindgen-test = "0.3"
 
 [features]
 default = []
 # Enabled by wasm-pack: `wasm-pack build crates/game-session -- --features wasm`
-wasm = ["dep:wasm-bindgen"]
+wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen"]

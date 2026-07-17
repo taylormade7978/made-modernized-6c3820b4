@@ -9,7 +9,9 @@
       "type": "Operator",
       "rarity": "Common",
       "keywords": ["Recruit", "Wheels"],
-      "effectScriptRef": "effect.recruit_operator"
+      "effectScriptRef": "effect.recruit_operator",
+      "atk": 2,
+      "hp": 3
     },
     {
       "cardId": "card.job.casino_heist",
@@ -39,7 +41,9 @@
       "type": "Vehicle",
       "rarity": "Epic",
       "keywords": ["Shielded"],
-      "effectScriptRef": "effect.deal_damage"
+      "effectScriptRef": "effect.deal_damage",
+      "atk": 3,
+      "hp": 6
     },
     {
       "cardId": "card.heist.mainframe_breach",
