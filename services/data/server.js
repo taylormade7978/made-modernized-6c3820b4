@@ -76,6 +76,53 @@ const SHOP_ITEMS = [
   { sku: 'exp.heist', name: 'Neon Heist (expansion)', description: 'Unlock the full Neon Heist set', kind: 'expansion', settlement: 'fiat', priceMinor: 2999, currency: 'USD' },
 ]
 
+// ── Story: single-player campaign (missions = boss encounters) ────────────────
+// Each mission binds a boss to a difficulty tier + its AI profile. Unlock is a
+// linear chain: a mission is playable once its predecessor is cleared. Shapes
+// mirror the frontend Mission/Boss/AIProfile (web/src/api/types.ts).
+const MISSIONS = [
+  {
+    missionId: 'mission.prologue', name: 'The Setup',
+    description: 'Learn the ropes against a scripted fence in the back alley.',
+    difficultyTier: 'Prologue',
+    boss: { bossId: 'boss.fence', name: 'The Fence', startingHp: 20, heroPower: 'Appraise', trademark: 'Buys low, sells you out.', signatureCardIds: ['card.smoke_bomb', 'card.tripwire'] },
+    aiProfile: { profileId: 'ai.prologue', difficultyTier: 'Prologue', strategyKind: 'Scripted', mctsBudget: 0 },
+    firstClearRewardClaimed: true, unlocked: true,
+  },
+  {
+    missionId: 'mission.vault', name: 'Cracking the Vault',
+    description: 'Outplay the security chief guarding the downtown vault.',
+    difficultyTier: 'Standard',
+    boss: { bossId: 'boss.warden', name: 'Warden Kessler', startingHp: 25, heroPower: 'Lockdown', trademark: 'Every turn, a door slams shut.', signatureCardIds: ['card.armored_van', 'card.tripwire', 'card.hacker'] },
+    aiProfile: { profileId: 'ai.standard', difficultyTier: 'Standard', strategyKind: 'Mcts', mctsBudget: 800 },
+    firstClearRewardClaimed: false, unlocked: true,
+  },
+  {
+    missionId: 'mission.rival', name: 'Double Cross',
+    description: 'Your old partner turned rival — no scripts, all pressure.',
+    difficultyTier: 'Brutal',
+    boss: { bossId: 'boss.rival', name: 'Silas "Ghost" Marrow', startingHp: 28, heroPower: 'Vanish', trademark: 'Slips your best play every time.', signatureCardIds: ['card.hacker', 'card.overclock', 'card.smoke_bomb'] },
+    aiProfile: { profileId: 'ai.brutal', difficultyTier: 'Brutal', strategyKind: 'Mcts', mctsBudget: 2400 },
+    firstClearRewardClaimed: false, unlocked: false,
+  },
+  {
+    missionId: 'mission.kingpin', name: 'The Kingpin',
+    description: 'The final score — beat the boss of bosses at his own table.',
+    difficultyTier: 'Legendary',
+    boss: { bossId: 'boss.kingpin', name: 'The Kingpin', startingHp: 32, heroPower: 'Command', trademark: 'Commands the board; punishes greed.', signatureCardIds: ['card.kingpin', 'card.muscle', 'card.armored_van'] },
+    aiProfile: { profileId: 'ai.legendary', difficultyTier: 'Legendary', strategyKind: 'Mcts', mctsBudget: 6000 },
+    firstClearRewardClaimed: false, unlocked: false,
+  },
+]
+
+// Per-player campaign view. Demo: 'guest' keeps the seeded progress above; any
+// other player starts fresh with only the prologue unlocked.
+function storyFor(playerId) {
+  if (playerId === 'guest') return { playerId, missions: MISSIONS }
+  const missions = MISSIONS.map((m, i) => ({ ...m, firstClearRewardClaimed: false, unlocked: i === 0 }))
+  return { playerId, missions }
+}
+
 // ── Schema: queries (searchable) + subscriptions (push) ───────────────────────
 const typeDefs = /* GraphQL */ `
   type Card { cardId: ID!, name: String!, cost: Int!, cardClass: String!, cardType: String!, rarity: String!, keywords: [String!]!, effectScriptRef: String!, copyCap: Int! }
@@ -167,7 +214,8 @@ const server = createServer(async (req, res) => {
     if (col) return rjson(COLLECTIONS[col[1]] || { playerId: col[1], ownedCards: [], decks: [] })
     if (url.pathname === '/v1/leaderboard') return rjson(LEADERBOARD)
     if (url.pathname === '/v1/shop/items') return rjson(SHOP_ITEMS)
-    if (url.pathname.startsWith('/v1/story/')) return rjson({ playerId: 'guest', missions: [] })
+    const story = url.pathname.match(/^\/v1\/story\/([^/]+)\/missions$/)
+    if (story) return rjson(storyFor(decodeURIComponent(story[1])))
     if (url.pathname.startsWith('/v1/')) return rjson([])
   }
 
@@ -183,6 +231,26 @@ const server = createServer(async (req, res) => {
     publishCollection(playerId) // ← live push, no polling
     res.writeHead(200, { 'Content-Type': 'application/json' })
     return res.end(JSON.stringify(deck))
+  }
+  // Launch a mission attempt: seats the player vs the mission's AI opponent and
+  // hands back a match ticket the realtime WS uses to play it. Mirrors the
+  // frontend MissionAttempt (web/src/api/types.ts).
+  const attempt = req.method === 'POST' && url.pathname.match(/^\/v1\/story\/([^/]+)\/missions\/([^/]+)\/attempts$/)
+  if (attempt) {
+    const playerId = decodeURIComponent(attempt[1])
+    const missionId = decodeURIComponent(attempt[2])
+    const mission = MISSIONS.find((m) => m.missionId === missionId)
+    if (!mission) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'unknown mission', missionId })) }
+    const attemptId = 'att.' + Math.abs(hash(`${playerId}:${missionId}:${Date.now()}`)).toString(36)
+    const result = {
+      attemptId, missionId, playerId,
+      difficultyTier: mission.difficultyTier,
+      matchTicket: 'ticket.' + Math.abs(hash(attemptId)).toString(36),
+      scriptedStateStep: 0,
+      missionCompleted: false,
+    }
+    res.writeHead(201, { 'Content-Type': 'application/json' })
+    return res.end(JSON.stringify(result))
   }
   if (req.method === 'POST' && url.pathname === '/v1/shop/orders') {
     const body = await readJson(req)
