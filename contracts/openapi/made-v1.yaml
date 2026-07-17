@@ -1,0 +1,483 @@
+openapi: 3.1.0
+info:
+  title: MADE `/v1` REST API — canonical contract
+  version: 1.0.0
+  description: >-
+    The single source of truth for the MADE `/v1` HTTP contract, reconciling the
+    PWA client (`web/src/api/`) and the Rust `crates/server` REST adapter after
+    issue #106 (frontend and backend shipped divergent `/v1` shapes and the data
+    screens 404'd).
+
+    Design alignment (PR #109, "one canonical Rust engine"): reads and writes are
+    served **directly by `crates/server` over REST** — there is no GraphQL surface
+    and no separate Node data service. The transitional `services/data` shim is
+    retired once every client resource is migrated onto the routes below.
+
+    Field-naming decision: DTOs use the client's `camelCase` shapes, which already
+    mirror the Rust domain aggregates (see the `mirrors …` comments in
+    `web/src/api/types.ts`). The server DTOs conform **to this document**; the
+    server serialises with `#[serde(rename_all = "camelCase")]`.
+
+    Identity: every route is gated by the Kong/OPA gateway sidecars upstream; the
+    trusted player identity arrives in gateway headers (see
+    `crates/server/src/http/identity.rs`). There is no auth scheme in-band.
+
+    Envelope (see `crates/server/src/http/envelope.rs`): **every** 2xx body is
+    wrapped `{ "data": <payload> }`, and every error is
+    `{ "error": { "code": <machine-code>, "message": <human>, "details": [ … ] } }`
+    where `details` (per-field `{field, message}`) is present only for validation
+    `400`s and omitted otherwise. In the paths below, the schema shown for each
+    response is the **payload** — the shape carried under `data` (2xx) — so a
+    generated client must unwrap `data`. Error responses reference `ApiError`,
+    which models the full `{error:{…}}` wrapper.
+servers:
+  - url: https://api.made.vforce360.ai/v1
+    description: production
+  - url: https://api.dev.made.vforce360.ai/v1
+    description: dev
+  - url: /v1
+    description: same-origin (client `dev` default)
+
+tags:
+  - name: catalog
+  - name: collection
+  - name: leaderboard
+  - name: shop
+  - name: story
+
+paths:
+  # ── Catalog ────────────────────────────────────────────────────────────────
+  /catalog/cards:
+    get:
+      tags: [catalog]
+      operationId: listCards
+      summary: All published card definitions.
+      responses:
+        '200':
+          description: The published card pool.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Card' }
+  /catalog/cards/{cardId}:
+    get:
+      tags: [catalog]
+      operationId: getCard
+      parameters:
+        - { name: cardId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: A single card definition.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /catalog/expansions:
+    get:
+      tags: [catalog]
+      operationId: listExpansions
+      summary: Released expansion sets.
+      responses:
+        '200':
+          description: The released expansion sets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ExpansionSet' }
+
+  # ── Collection ─────────────────────────────────────────────────────────────
+  /collection/{playerId}:
+    get:
+      tags: [collection]
+      operationId: getCollection
+      parameters:
+        - { name: playerId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The player's owned cards and decks.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CollectionResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /collection/{playerId}/decks/{deckId}:
+    put:
+      tags: [collection]
+      operationId: saveDeck
+      description: Create or update a deck (idempotent on `deckId`).
+      parameters:
+        - { name: playerId, in: path, required: true, schema: { type: string } }
+        - { name: deckId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SaveDeckRequest' }
+      responses:
+        '200':
+          description: The saved deck.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Deck' }
+        '400': { $ref: '#/components/responses/Validation' }
+
+  # ── Leaderboard ────────────────────────────────────────────────────────────
+  /leaderboard:
+    get:
+      tags: [leaderboard]
+      operationId: getLeaderboard
+      summary: A page of ranked standings for a season (defaults to the current season).
+      parameters:
+        - { name: seasonId, in: query, required: false, schema: { type: string } }
+        - { name: page, in: query, required: false, schema: { type: integer, minimum: 0 } }
+        - { name: pageSize, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
+      responses:
+        '200':
+          description: A page of leaderboard entries.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeaderboardPage' }
+
+  # ── Shop ───────────────────────────────────────────────────────────────────
+  /shop/items:
+    get:
+      tags: [shop]
+      operationId: listShopItems
+      summary: Purchasable items (card packs, battle passes, cosmetics, expansions).
+      responses:
+        '200':
+          description: The purchasable catalogue.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ShopItem' }
+  /shop/orders:
+    post:
+      tags: [shop]
+      operationId: createOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrderRequest' }
+      responses:
+        '201':
+          description: The created order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400': { $ref: '#/components/responses/Validation' }
+  /shop/orders/{orderId}:
+    get:
+      tags: [shop]
+      operationId: getOrder
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: An order's current state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Story ──────────────────────────────────────────────────────────────────
+  /story/{playerId}/missions:
+    get:
+      tags: [story]
+      operationId: listMissions
+      summary: The player's single-player campaign (missions + bosses + AI profiles).
+      parameters:
+        - { name: playerId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The player's campaign.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StoryResponse' }
+  /story/{playerId}/missions/{missionId}/attempts:
+    post:
+      tags: [story]
+      operationId: launchAttempt
+      description: >-
+        Launch a mission attempt against the AI-opponent service; returns the
+        attempt and the match ticket that joins the authoritative match.
+      parameters:
+        - { name: playerId, in: path, required: true, schema: { type: string } }
+        - { name: missionId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LaunchMissionRequest' }
+      responses:
+        '201':
+          description: The launched attempt.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MissionAttempt' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  responses:
+    NotFound:
+      description: The resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Validation:
+      description: The request body failed shape/field validation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+  schemas:
+    # ── Catalog ──
+    CardType:
+      type: string
+      enum: [unit, spell, trap, leader]
+      description: Mirrors `card_definition::CardType`.
+    CardClass:
+      type: string
+      enum: [neutral, aggression, control, tempo, combo]
+    Rarity:
+      type: string
+      enum: [common, uncommon, rare, epic, legendary]
+    ReleaseChannel:
+      type: string
+      enum: [alpha, beta, live]
+    Card:
+      type: object
+      required: [cardId, name, cost, cardClass, cardType, rarity, keywords, effectScriptRef, copyCap]
+      properties:
+        cardId: { type: string }
+        name: { type: string }
+        cost: { type: integer }
+        cardClass: { $ref: '#/components/schemas/CardClass' }
+        cardType: { $ref: '#/components/schemas/CardType' }
+        rarity: { $ref: '#/components/schemas/Rarity' }
+        keywords:
+          type: array
+          items: { type: string }
+        effectScriptRef: { type: string }
+        copyCap: { type: integer }
+        art: { type: [string, 'null'] }
+        text: { type: [string, 'null'] }
+        heat: { type: [integer, 'null'] }
+        atk: { type: [integer, 'null'], description: 0/absent for non-unit cards }
+        hp: { type: [integer, 'null'], description: 0/absent for non-unit cards }
+        artTint: { type: [integer, 'null'] }
+    ExpansionSet:
+      type: object
+      required: [setCode, name, releaseChannel, cardIds]
+      properties:
+        setCode: { type: string }
+        name: { type: string }
+        releaseChannel: { $ref: '#/components/schemas/ReleaseChannel' }
+        cardIds:
+          type: array
+          items: { type: string }
+
+    # ── Collection ──
+    OwnedCard:
+      type: object
+      required: [cardId, quantity]
+      properties:
+        cardId: { type: string }
+        quantity: { type: integer }
+        cosmeticSkinRef: { type: [string, 'null'] }
+    Deck:
+      type: object
+      required: [deckId, name, cardIds, active]
+      properties:
+        deckId: { type: string }
+        name: { type: string }
+        cardIds:
+          type: array
+          items: { type: string }
+        active: { type: boolean }
+    CollectionResponse:
+      type: object
+      required: [playerId, ownedCards, decks]
+      properties:
+        playerId: { type: string }
+        ownedCards:
+          type: array
+          items: { $ref: '#/components/schemas/OwnedCard' }
+        decks:
+          type: array
+          items: { $ref: '#/components/schemas/Deck' }
+    SaveDeckRequest:
+      type: object
+      required: [name, cardIds]
+      properties:
+        name: { type: string }
+        cardIds:
+          type: array
+          items: { type: string }
+        active: { type: boolean }
+
+    # ── Leaderboard ──
+    LeaderboardEntry:
+      type: object
+      required: [rank, playerId, displayName, rating, stars]
+      properties:
+        rank: { type: integer }
+        playerId: { type: string }
+        displayName: { type: string }
+        rating: { type: integer }
+        stars: { type: integer }
+    LeaderboardPage:
+      type: object
+      required: [seasonId, entries, total, page, pageSize]
+      properties:
+        seasonId: { type: string }
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/LeaderboardEntry' }
+        total: { type: integer }
+        page: { type: integer }
+        pageSize: { type: integer }
+
+    # ── Shop ──
+    ShopItemKind:
+      type: string
+      enum: [pack, battlePass, cosmetic, expansion]
+    ShopSettlement:
+      type: string
+      enum: [fiat, token]
+    ShopItem:
+      type: object
+      required: [sku, name, description, kind, settlement, priceMinor, currency]
+      properties:
+        sku: { type: string }
+        name: { type: string }
+        description: { type: string }
+        kind: { $ref: '#/components/schemas/ShopItemKind' }
+        settlement: { $ref: '#/components/schemas/ShopSettlement' }
+        priceMinor: { type: integer }
+        currency: { type: string }
+    OrderStatus:
+      type: string
+      enum: [created, paid, fulfilled, refunded]
+    Order:
+      type: object
+      required: [orderId, playerId, lineItems, currency, status]
+      properties:
+        orderId: { type: string }
+        playerId: { type: string }
+        lineItems:
+          type: array
+          items: { type: string }
+        currency: { type: string }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        checkoutUrl: { type: [string, 'null'] }
+    CreateOrderRequest:
+      type: object
+      required: [playerId, lineItems, currency]
+      properties:
+        playerId: { type: string }
+        lineItems:
+          type: array
+          items: { type: string }
+        currency: { type: string }
+
+    # ── Story ──
+    DifficultyTier:
+      type: string
+      enum: [Prologue, Standard, Brutal, Legendary]
+      description: Mirrors `ai_profile::DifficultyTier`.
+    StrategyKind:
+      type: string
+      enum: [Scripted, Mcts]
+    Boss:
+      type: object
+      required: [bossId, name, startingHp, heroPower, trademark, signatureCardIds]
+      properties:
+        bossId: { type: string }
+        name: { type: string }
+        startingHp: { type: integer }
+        heroPower: { type: string }
+        trademark: { type: string }
+        signatureCardIds:
+          type: array
+          items: { type: string }
+    AIProfile:
+      type: object
+      required: [profileId, difficultyTier, strategyKind, mctsBudget]
+      properties:
+        profileId: { type: string }
+        difficultyTier: { $ref: '#/components/schemas/DifficultyTier' }
+        strategyKind: { $ref: '#/components/schemas/StrategyKind' }
+        mctsBudget: { type: integer }
+    Mission:
+      type: object
+      required: [missionId, name, description, difficultyTier, boss, aiProfile, firstClearRewardClaimed, unlocked]
+      properties:
+        missionId: { type: string }
+        name: { type: string }
+        description: { type: string }
+        difficultyTier: { $ref: '#/components/schemas/DifficultyTier' }
+        boss: { $ref: '#/components/schemas/Boss' }
+        aiProfile: { $ref: '#/components/schemas/AIProfile' }
+        firstClearRewardClaimed: { type: boolean }
+        unlocked: { type: boolean }
+    StoryResponse:
+      type: object
+      required: [playerId, missions]
+      properties:
+        playerId: { type: string }
+        missions:
+          type: array
+          items: { $ref: '#/components/schemas/Mission' }
+    LaunchMissionRequest:
+      type: object
+      required: [playerId, missionId]
+      properties:
+        playerId: { type: string }
+        missionId: { type: string }
+    MissionAttempt:
+      type: object
+      required: [attemptId, missionId, playerId, difficultyTier, matchTicket, scriptedStateStep, missionCompleted]
+      properties:
+        attemptId: { type: string }
+        missionId: { type: string }
+        playerId: { type: string }
+        difficultyTier: { $ref: '#/components/schemas/DifficultyTier' }
+        matchTicket: { type: string }
+        scriptedStateStep: { type: integer }
+        missionCompleted: { type: boolean }
+
+    # ── Shared error envelope ──
+    ApiError:
+      type: object
+      required: [error]
+      description: >-
+        The error envelope rendered by `envelope.rs`. `details` is serialised
+        only when non-empty (validation failures).
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - validation_error
+                - unauthenticated
+                - forbidden
+                - not_found
+                - conflict
+                - unprocessable_entity
+                - internal_error
+            message: { type: string }
+            details:
+              type: array
+              description: Present only for `validation_error`.
+              items:
+                type: object
+                required: [field, message]
+                properties:
+                  field: { type: string }
+                  message: { type: string }
